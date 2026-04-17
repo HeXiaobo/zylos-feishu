@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Fork-only `@mention` resolution module (`src/lib/mention.js`): outgoing
+  `@name` references can be resolved from a paginated source-group member sync
+  plus a config-driven override map. The cache is written atomically and has a
+  configurable TTL (six hours by default).
+- Unit coverage for mention matching, longest-prefix handling, snapshot
+  isolation, override priority, and unknown/empty-ID fallbacks.
+
+### Changed
+- Plain-text sends use Feishu rich-text `post` content when configured names
+  resolve successfully; markdown-card sends use the verified interactive-card
+  `<at id=ou_xxx></at>` form. Existing structured `<at user_id="...">` input
+  still passes through the separate card-syntax converter.
+
 ## [0.3.6] - 2026-08-10
 
 ### Fixed
@@ -184,7 +200,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`_legacy_whitelist`, `_legacy_group_whitelist`,
   `_legacy_message_max_length`) in favor of whole-file backups; the
   original config schema is preserved (#29)
-
 ## [0.2.6] - 2026-03-02
 
 ### Security
