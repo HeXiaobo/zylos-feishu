@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-08-03
+
+### Changed
+- **Bundled lark-cli install target**: `larkCli.version` bumped 1.0.69 → 1.0.81.
+  Minimum-version semantics unchanged: machines already at or above the pin
+  are untouched; machines below it (or without lark-cli) are brought to
+  1.0.81. Checked upstream's v1.0.70–v1.0.81 changelog for new sub-skill
+  categories — none added, so `EXPECTED_SUB_SKILLS` stays at the same 27
+  entries (identical list to zylos-lark) and sub-skill docs are re-fetched
+  to the matching v1.0.81 tag via the version marker.
+
 ## [0.3.3] - 2026-07-23
 
 ### Fixed

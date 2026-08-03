@@ -1,6 +1,6 @@
 {
   "name": "zylos-feishu",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Feishu communication channel",
   "type": "module",
   "main": "src/index.js",
@@ -10,7 +10,7 @@
     "test": "node --test"
   },
   "larkCli": {
-    "version": "1.0.69"
+    "version": "1.0.81"
   },
   "homepage": "https://github.com/zylos-ai/zylos-feishu#readme",
   "bugs": {
