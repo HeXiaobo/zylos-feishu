@@ -23,6 +23,8 @@ import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermis
 import { getUserInfo } from './lib/contact.js';
 import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
+import { extractInteractiveText } from './lib/card-text.js';
+import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -819,6 +821,71 @@ function buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId
   return endpoint;
 }
 
+// Params shared by every `im.message.get` call.
+//
+// user_id_type: 'open_id' — NOT 'user_id'. This app holds no user_id-class
+//   scope (`contact:user.employee_id:readonly`), which Feishu documents as the
+//   gate on the `user_id` field of this endpoint's response, so asking for
+//   user_id yields nothing to resolve a name from. It also matches the id
+//   namespace used everywhere else here: inbound events carry
+//   `sender_id.user_id = null`, and preloadGroupMembers seeds the name cache
+//   with open_ids (listChatMembers defaults to member_id_type 'open_id').
+// card_msg_content_type: request the ORIGINAL Schema 2.0 card JSON (with
+//   body.elements) for interactive/card messages; without it the API returns
+//   the transformed form whose top-level elements[] has dropped the markdown
+//   body, and a card degrades to the generic "[interactive message]".
+const MESSAGE_GET_PARAMS = { user_id_type: 'open_id', card_msg_content_type: 'user_card_content' };
+
+/**
+ * Parse the msg_type/body.content of a single Feishu message item (as returned
+ * by `im.message.get`) into display text, resolving mentions if present.
+ *
+ * NOTE on resource keys: image/file/audio keys are rendered as inert text
+ * markers only. For merge-forward children they are NOT downloadable at all —
+ * Feishu returns error 234043 for the wrapper's id, a child's id, or a card
+ * message id (「获取消息中的资源文件」§使用限制) — so they must never be fed
+ * into the normal download path.
+ */
+function parseMessageItemText(msg, fallbackMessageId) {
+  const messageId = msg.message_id || fallbackMessageId;
+  // body.content is not guaranteed to be JSON for every msg_type — a nested
+  // forward-of-a-forward can come back as a bare "Merged and Forwarded
+  // Message" string rather than a JSON payload.
+  let content;
+  try {
+    content = JSON.parse(msg.body?.content || '{}');
+  } catch {
+    content = {};
+  }
+  let text;
+  if (msg.msg_type === 'text') {
+    text = content.text || '';
+  } else if (msg.msg_type === 'post') {
+    ({ text } = extractPostText(content.content || [], messageId));
+    if (content.title) text = `[${content.title}] ${text}`;
+  } else if (msg.msg_type === 'interactive') {
+    text = extractInteractiveText(content);
+  } else if (msg.msg_type === 'file') {
+    text = `[file: ${content.file_name || 'unknown'}, file_key: ${content.file_key}, msg_id: ${messageId}]`;
+  } else if (msg.msg_type === 'image') {
+    text = `[image, image_key: ${content.image_key}, msg_id: ${messageId}]`;
+  } else if (msg.msg_type === 'audio') {
+    text = `[audio, file_key: ${content.file_key}, msg_id: ${messageId}]`;
+  } else if (msg.msg_type === 'media') {
+    text = `[media: ${content.file_name || 'video'}, file_key: ${content.file_key}, msg_id: ${messageId}]`;
+  } else if (msg.msg_type === 'sticker') {
+    text = `[sticker, file_key: ${content.file_key || 'unknown'}]`;
+  } else if (msg.msg_type === 'merge_forward') {
+    text = '[nested merge_forward message]';
+  } else {
+    text = `[${msg.msg_type} message]`;
+  }
+  if (msg.mentions && msg.mentions.length > 0) {
+    text = resolveMentions(text, msg.mentions);
+  }
+  return text;
+}
+
 /**
  * Fetch content of a quoted/replied message (best-effort).
  * Returns { sender, text } with resolved sender name.
@@ -829,30 +896,67 @@ async function fetchQuotedMessage(messageId) {
     const client = getClient();
     const res = await client.im.message.get({
       path: { message_id: messageId },
+      params: MESSAGE_GET_PARAMS,
     });
     if (res.code === 0 && res.data?.items?.[0]) {
       const msg = res.data.items[0];
-      const senderId = msg.sender?.id;
-      const senderName = await resolveUserName(senderId);
-      const content = JSON.parse(msg.body?.content || '{}');
-      let text;
-      if (msg.msg_type === 'text') {
-        text = content.text || '';
-      } else if (msg.msg_type === 'post') {
-        ({ text } = extractPostText(JSON.parse(msg.body?.content || '{}').content || [], messageId));
-      } else {
-        text = `[${msg.msg_type} message]`;
-      }
-      // Resolve @mentions in quoted message
-      if (msg.mentions && msg.mentions.length > 0) {
-        text = resolveMentions(text, msg.mentions);
-      }
-      return { sender: senderName, text };
+      const senderName = await resolveUserName(null, msg.sender?.id);
+      return { sender: senderName, text: parseMessageItemText(msg, messageId) };
     }
   } catch (err) {
     console.log(`[feishu] Failed to fetch quoted message ${messageId}: ${err.message}`);
   }
   return null;
+}
+
+/**
+ * Fetch a merge_forward message's items via `im.message.get`.
+ * Returns the raw items array (wrapper + children). THROWS on a failed call —
+ * see itemsFromResponse: a failure must not degrade into "no child messages".
+ */
+async function fetchMessageItems(messageId) {
+  const { getClient } = await import('./lib/client.js');
+  const client = getClient();
+  const res = await client.im.message.get({
+    path: { message_id: messageId },
+    params: MESSAGE_GET_PARAMS,
+  });
+  return itemsFromResponse(res, messageId);
+}
+
+/**
+ * Fetch and render a merge_forward (合并转发 /「聊天记录」) message's content.
+ *
+ * The inbound event carries no content for these — Feishu fixes it to the
+ * literal string `Merged and Forwarded Message` (「接收消息内容」§合并转发) — so
+ * the child messages must be read back with `im.message.get`. The tree
+ * assembly (including the undocumented nested-forward case) lives in
+ * lib/merge-forward.js so it can be unit-tested without the network.
+ */
+async function fetchMergeForwardContent(messageId) {
+  try {
+    return await renderMergeForward({
+      items: await fetchMessageItems(messageId),
+      rootId: messageId,
+      parseItemText: (item) => parseMessageItemText(item, item.message_id),
+      resolveSenderName: (item) => resolveUserName(null, item.sender?.id),
+      fetchItems: fetchMessageItems,
+      log: (msg) => console.log(`[feishu] ${msg}`),
+    });
+  } catch (err) {
+    console.log(`[feishu] Failed to fetch merge_forward content ${messageId}: ${err.message}`);
+    return '[merge_forward message, failed to fetch content]';
+  }
+}
+
+/**
+ * Resolve a merge_forward's deferred remote fetch. Call only after the message
+ * has passed its DM/group access gate — see extractMessageContent's
+ * 'merge_forward' case for why the fetch is deferred that far.
+ */
+async function resolveMergeForwardText(extracted) {
+  if (!extracted.deferredMergeForwardId) return extracted.text;
+  return fetchMergeForwardContent(extracted.deferredMergeForwardId);
 }
 
 /**
@@ -1023,6 +1127,22 @@ function extractMessageContent(message) {
       return { text: '', imageKeys: content.image_key ? [content.image_key] : [], fileKey: null, fileName: null };
     case 'file':
       return { text: '', imageKeys: [], fileKey: content.file_key, fileName: content.file_name || 'unknown' };
+    case 'audio':
+      return { text: `[audio, file_key: ${content.file_key || 'unknown'}, msg_id: ${message.message_id}]`, imageKeys: [], fileKey: null, fileName: null };
+    case 'media':
+      return { text: `[media: ${content.file_name || 'video'}, file_key: ${content.file_key || 'unknown'}, msg_id: ${message.message_id}]`, imageKeys: [], fileKey: null, fileName: null };
+    case 'sticker':
+      return { text: `[sticker, file_key: ${content.file_key || 'unknown'}]`, imageKeys: [], fileKey: null, fileName: null };
+    case 'interactive':
+      return { text: extractInteractiveText(content), imageKeys: [], fileKey: null, fileName: null };
+    case 'merge_forward':
+      // Deliberately no remote fetch here: this runs before any DM/group access
+      // gate in handleMessageEvent, and fetchMergeForwardContent is a live
+      // im.message.get call that would otherwise fire (and log its result) for
+      // a sender/chat that ends up rejected anyway. The caller resolves
+      // deferredMergeForwardId via resolveMergeForwardText() only after the
+      // relevant gate has passed.
+      return { text: null, imageKeys: [], fileKey: null, fileName: null, deferredMergeForwardId: message.message_id };
     default:
       return { text: `[${msgType} message]`, imageKeys: [], fileKey: null, fileName: null };
   }
@@ -1117,8 +1237,13 @@ async function handleMessage(data) {
   // Unified dedup check (both websocket and webhook modes)
   if (isDuplicate(messageId)) return;
 
-  const { text, imageKeys, fileKey, fileName } = extractMessageContent(message);
-  console.log(`[feishu] ${chatType} message from ${senderUserId}: ${(text || '').substring(0, 50) || '[media]'}...`);
+  const extracted = extractMessageContent(message);
+  let { text } = extracted;
+  const { imageKeys, fileKey, fileName } = extracted;
+  // A pending merge_forward has no text yet (deliberately not fetched until the
+  // DM/group access gate passes below) — log a fixed marker instead of real
+  // content from a sender/chat that may end up rejected anyway.
+  console.log(`[feishu] ${chatType} message from ${senderUserId}: ${extracted.deferredMergeForwardId ? '[merge_forward, pending access check]' : ((text || '').substring(0, 50) || '[media]')}...`);
 
   // Build log text with file/image metadata
   let logText = text;
@@ -1150,6 +1275,11 @@ async function handleMessage(data) {
       console.log(`[feishu] Private message from non-allowed user ${senderUserId} (dmPolicy=${config.dmPolicy || 'owner'}), rejecting`);
       sendMessage(chatId, "Sorry, I'm not available for private messages. Please ask my owner to grant you access.").catch(() => {});
       return;
+    }
+
+    if (extracted.deferredMergeForwardId) {
+      text = await resolveMergeForwardText(extracted);
+      logText = text;
     }
 
     await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
@@ -1259,6 +1389,11 @@ async function handleMessage(data) {
         console.log(`[feishu] Sender ${senderUserId} not in group ${chatId} allowFrom, ignoring`);
       }
       return;
+    }
+
+    if (extracted.deferredMergeForwardId) {
+      text = await resolveMergeForwardText(extracted);
+      logText = text;
     }
 
     if (!smart && !mentioned) {

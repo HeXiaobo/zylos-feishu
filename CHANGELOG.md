@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-08-06
+
+### Added
+- **Merge-forward (合并转发 /「聊天记录」) content reading**: forwarded chat
+  records were delivered as a bare `[merge_forward message]` placeholder.
+  Feishu fixes such an event's content to the literal string
+  `Merged and Forwarded Message` (「接收消息内容」§合并转发), so the child
+  messages are now read back with `im.message.get` and rendered as a
+  `[Forwarded conversation]` transcript.
+  - `im.message.get` is called with `user_id_type: 'open_id'` — **not**
+    `user_id` as the equivalent zylos-lark change uses. This app holds no
+    user_id-class scope (`contact:user.employee_id:readonly`, which Feishu
+    documents as the gate on that response field), inbound events carry
+    `sender_id.user_id = null`, and `preloadGroupMembers` seeds the name cache
+    with open_ids. Asking for `user_id` would resolve no sender names at all.
+  - Nested forwards are handled adaptively: Feishu documents neither whether a
+    forward-of-a-forward's children arrive flattened in the same `items[]` nor
+    an example response. An inner forward whose children are already present is
+    rendered inline; one whose children are absent gets its own fetch. Both API
+    behaviours yield the same output, with no duplicated or dropped level, and
+    both are bounded (depth 3, 12 nested fetches).
+    Live testing on a real tenant established the actual behaviour, which the
+    docs do not state: Feishu **does** create nested `merge_forward` levels
+    (multi-selecting a forward together with another message produces one), but
+    it returns **every descendant flattened into a single `items[]`**, using
+    `upper_message_id` to encode the hierarchy. The inline branch is therefore
+    the one that fires; the separate-fetch branch is retained as insurance,
+    since nothing in the API contract guarantees this.
+  - Resource files inside a forward are surfaced as inert text markers only.
+    Feishu returns error `234043` for the wrapper's id, a child's id, or a card
+    message id (「获取消息中的资源文件」§使用限制), so these keys must never
+    enter the normal download path.
+  - The remote fetch is deferred until after the DM/group access gate, so a
+    message from a rejected sender or chat never triggers an API call.
+- **Message types the parser previously dropped**: `audio`, `media`, `sticker`
+  and `interactive` (cards) were all rendering as `[<type> message]`. Cards now
+  read through a new `lib/card-text.js`, which walks Schema 2.0 `body.elements`,
+  the original `user_dsl`, and legacy top-level `elements[]` including the `div`
+  component's `fields[]`. Verified against real forwarded cards from the live
+  API: all extracted real text, none fell back to a placeholder.
+
+### Fixed
+- A failed `im.message.get` read-back of a merge-forward no longer degrades
+  into `[merge_forward message, no child messages]`. `itemsFromResponse`
+  rejects a resolved response carrying a non-zero `code` so the caller emits
+  `[merge_forward message, failed to fetch content]` instead — a fetch failure
+  must not be reported as a genuinely empty forward, which would silently drop
+  the transcript. (Feishu returns HTTP 400 for the error classes observed in
+  practice — malformed id, nonexistent id, and `230002` bot-not-in-chat — which
+  the SDK already surfaces as a throw; this guards the remaining shape.)
+
+### Changed
+- `fetchQuotedMessage` now shares the message-item parser instead of inlining
+  its own text/post-only branches, so quoted cards, stickers, audio and media
+  read correctly too, and it requests the original card JSON
+  (`card_msg_content_type: 'user_card_content'`).
+
 ## [0.3.4] - 2026-08-03
 
 ### Changed
