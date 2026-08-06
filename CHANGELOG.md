@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.5] - 2026-08-06
 
 ### Added
 - **Merge-forward (合并转发 /「聊天记录」) content reading**: forwarded chat
@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rendered inline; one whose children are absent gets its own fetch. Both API
     behaviours yield the same output, with no duplicated or dropped level, and
     both are bounded (depth 3, 12 nested fetches).
+    Live testing on a real tenant established the actual behaviour, which the
+    docs do not state: Feishu **does** create nested `merge_forward` levels
+    (multi-selecting a forward together with another message produces one), but
+    it returns **every descendant flattened into a single `items[]`**, using
+    `upper_message_id` to encode the hierarchy. The inline branch is therefore
+    the one that fires; the separate-fetch branch is retained as insurance,
+    since nothing in the API contract guarantees this.
   - Resource files inside a forward are surfaced as inert text markers only.
     Feishu returns error `234043` for the wrapper's id, a child's id, or a card
     message id (「获取消息中的资源文件」§使用限制), so these keys must never
