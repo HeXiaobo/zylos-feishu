@@ -24,7 +24,7 @@ import { getUserInfo } from './lib/contact.js';
 import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
-import { renderMergeForward } from './lib/merge-forward.js';
+import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -911,7 +911,8 @@ async function fetchQuotedMessage(messageId) {
 
 /**
  * Fetch a merge_forward message's items via `im.message.get`.
- * Returns the raw items array (wrapper + children), or [] on failure.
+ * Returns the raw items array (wrapper + children). THROWS on a failed call —
+ * see itemsFromResponse: a failure must not degrade into "no child messages".
  */
 async function fetchMessageItems(messageId) {
   const { getClient } = await import('./lib/client.js');
@@ -920,7 +921,7 @@ async function fetchMessageItems(messageId) {
     path: { message_id: messageId },
     params: MESSAGE_GET_PARAMS,
   });
-  return res.data?.items || [];
+  return itemsFromResponse(res, messageId);
 }
 
 /**

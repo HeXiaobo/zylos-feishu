@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   groupByUpperMessageId,
   renderMergeForward,
+  itemsFromResponse,
   MAX_MERGE_FORWARD_FETCHES,
 } from '../src/lib/merge-forward.js';
 
@@ -198,6 +199,37 @@ test('multi-line child text is indented to its own level (real forwarded cards a
     '    line two',
     '    line three',
   ].join('\n'));
+});
+
+test('itemsFromResponse: a non-zero code THROWS rather than degrading to "no child messages"', () => {
+  // Regression guard. If a failed read-back returned [] instead, renderMergeForward
+  // would emit "[merge_forward message, no child messages]" — reporting a fetch
+  // failure as a genuinely empty forward and silently dropping the transcript.
+  // The caller's catch must see an error so the failed-content marker wins.
+  assert.throws(
+    () => itemsFromResponse({ code: 230002, msg: 'Bot/User can NOT be out of the chat.' }, 'om_x'),
+    /code=230002/,
+    'permission-class failure must throw',
+  );
+  assert.throws(() => itemsFromResponse({ code: 99991672, msg: 'no permission' }, 'om_x'), /code=99991672/);
+  assert.throws(() => itemsFromResponse(undefined, 'om_x'), /code=missing/, 'absent response must throw');
+  assert.throws(() => itemsFromResponse({}, 'om_x'), /code=missing/, 'response without code must throw');
+});
+
+test('itemsFromResponse: a successful response yields items, and an empty one is a real empty', () => {
+  const items = [{ message_id: 'om_1' }];
+  assert.deepEqual(itemsFromResponse({ code: 0, data: { items } }, 'om_x'), items);
+  // code=0 with no items is a genuinely empty result, not a failure — it may
+  // legitimately degrade to the no-children marker.
+  assert.deepEqual(itemsFromResponse({ code: 0, data: {} }, 'om_x'), []);
+  assert.deepEqual(itemsFromResponse({ code: 0 }, 'om_x'), []);
+});
+
+test('a failed top-level fetch surfaces as failed-content, never as an empty forward', async () => {
+  // End-to-end of the guard: renderMergeForward is never even reached, because
+  // the throw propagates to fetchMergeForwardContent's catch in index.js.
+  const boom = () => itemsFromResponse({ code: 230002, msg: 'Bot/User can NOT be out of the chat.' }, 'om_root');
+  assert.throws(boom, /im\.message\.get failed for om_root/);
 });
 
 test('groupByUpperMessageId excludes the wrapper and keeps child order', () => {

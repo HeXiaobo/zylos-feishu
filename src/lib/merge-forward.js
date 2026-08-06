@@ -14,6 +14,30 @@ export const MAX_MERGE_FORWARD_DEPTH = 3;
 export const MAX_MERGE_FORWARD_FETCHES = 12;
 
 /**
+ * Unwrap an `im.message.get` response into its items[], rejecting a failed call.
+ *
+ * The SDK surfaces the Feishu error classes observed in practice (malformed id,
+ * nonexistent id, `230002` bot-not-in-chat) as a thrown AxiosError on HTTP 400,
+ * so those already reach the caller's catch. This guards the remaining shape —
+ * a resolved response carrying a non-zero `code` — because silently treating it
+ * as `[]` would render a failed read-back as "no child messages", i.e. report a
+ * fetch failure as a genuinely empty forward and drop the transcript. Callers
+ * must let this propagate so the failed-content marker is used instead.
+ *
+ * @param {object} res raw `im.message.get` response
+ * @param {string} messageId id being read, for the error message
+ * @returns {Array<object>} `data.items` (possibly empty)
+ */
+export function itemsFromResponse(res, messageId) {
+  if (!res || res.code !== 0) {
+    throw new Error(
+      `im.message.get failed for ${messageId}: code=${res?.code ?? 'missing'} msg=${res?.msg ?? 'none'}`
+    );
+  }
+  return res.data?.items || [];
+}
+
+/**
  * Group a `im.message.get` items[] payload by `upper_message_id` (the id of the
  * forward each item sits directly inside).
  *

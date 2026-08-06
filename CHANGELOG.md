@@ -46,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   component's `fields[]`. Verified against real forwarded cards from the live
   API: all extracted real text, none fell back to a placeholder.
 
+### Fixed
+- A failed `im.message.get` read-back of a merge-forward no longer degrades
+  into `[merge_forward message, no child messages]`. `itemsFromResponse`
+  rejects a resolved response carrying a non-zero `code` so the caller emits
+  `[merge_forward message, failed to fetch content]` instead — a fetch failure
+  must not be reported as a genuinely empty forward, which would silently drop
+  the transcript. (Feishu returns HTTP 400 for the error classes observed in
+  practice — malformed id, nonexistent id, and `230002` bot-not-in-chat — which
+  the SDK already surfaces as a throw; this guards the remaining shape.)
+
 ### Changed
 - `fetchQuotedMessage` now shares the message-item parser instead of inlining
   its own text/post-only branches, so quoted cards, stickers, audio and media
