@@ -19,6 +19,7 @@ dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
 import { getConfig, DATA_DIR } from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
+import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
@@ -182,22 +183,28 @@ const CARD_MAX_LENGTH = 4000;
  */
 async function sendCardChunk(chunk, isFirstChunk) {
   const { chatId } = parsedEndpoint;
+  // The card API speaks a different @-mention syntax than text messages do
+  // (<at id=x></at> vs <at user_id="x">Name</at>). Callers write the text form —
+  // it is the only one documented for c4-send and the one that works on the
+  // text path — so convert here, or every mention in a markdown-bearing message
+  // renders as literal text and notifies nobody. See src/lib/at-mention.js.
+  const cardChunk = convertAtMentionsForCard(chunk);
   // p2p DMs never reply-to (invisible in the 1:1 view); only groups reply.
   const replyTarget = chooseReplyTarget(parsedEndpoint, { isFirstChunk });
   let result;
 
   if (replyTarget) {
     try {
-      result = await replyMarkdownCard(replyTarget, chunk);
+      result = await replyMarkdownCard(replyTarget, cardChunk);
     } catch (err) {
       console.log('[feishu] Card reply threw, falling back:', err.message);
       result = { success: false };
     }
     if (!result.success) {
-      result = await sendMarkdownCard(chatId, chunk);
+      result = await sendMarkdownCard(chatId, cardChunk);
     }
   } else {
-    result = await sendMarkdownCard(chatId, chunk);
+    result = await sendMarkdownCard(chatId, cardChunk);
   }
 
   return result;
