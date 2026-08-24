@@ -42,10 +42,9 @@ test('provides a callable local sender seam backed by the existing Feishu messag
   assert.equal(receiveId, 'oc_task_chat');
   assert.equal(receiveIdType, 'chat_id');
   assert.equal(messageType, 'interactive');
-  const context = card.elements
-    .find((element) => element.tag === 'action')
-    .actions[0]
-    .value.context;
+  const context = card.body.elements
+    .find((element) => element.tag === 'button')
+    .behaviors[0].value.context;
   const verifier = createTaskActionContextSigner({
     secret: SECRET,
     clock: () => NOW,

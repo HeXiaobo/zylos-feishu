@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { createFeishuProjectionRuntime } from '../src/lib/feishu-projection-runtime.js';
 
@@ -63,4 +68,47 @@ test('fails closed when the dedicated task context secret is missing', async () 
     }),
     /secret must contain at least 32 bytes/,
   );
+});
+
+test('zero-argument production factory loads Feishu credentials from ~/zylos/.env', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-runtime-'));
+  const zylosDir = path.join(home, 'zylos');
+  fs.mkdirSync(zylosDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(zylosDir, '.env'),
+    [
+      'FEISHU_APP_ID=cli_test_app',
+      'FEISHU_APP_SECRET=cli_test_secret',
+      `FEISHU_TASK_CONTEXT_SECRET=${SECRET}`,
+      '',
+    ].join('\n'),
+    { mode: 0o600 },
+  );
+  try {
+    const childEnv = { ...process.env, HOME: home };
+    delete childEnv.FEISHU_APP_ID;
+    delete childEnv.FEISHU_APP_SECRET;
+    delete childEnv.FEISHU_TASK_CONTEXT_SECRET;
+    const runtimePath = fileURLToPath(
+      new URL('../src/lib/feishu-projection-runtime.js', import.meta.url),
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '--eval',
+        `const runtime = await import(${JSON.stringify(runtimePath)});`
+          + 'const value = await runtime.createFeishuProjectionRuntime();'
+          + 'process.stdout.write(JSON.stringify(Object.keys(value)));',
+      ],
+      {
+        encoding: 'utf8',
+        env: childEnv,
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim().split('\n').at(-1)), ['publisher']);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

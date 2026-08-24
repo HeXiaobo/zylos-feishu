@@ -60,6 +60,8 @@ test('creates one task card with a stable Feishu UUID and returns its external l
     'interactive',
   ]);
   assert.equal(sends[0][1].header.title.content, '任务待验收');
+  assert.equal(sends[0][1].schema, '2.0');
+  assert.equal(Array.isArray(sends[0][1].body.elements), true);
   assert.match(sends[0][4].uuid, /^ztc_[a-f0-9]{40}$/);
   assert.equal(sends[1][4].uuid, sends[0][4].uuid);
 });
@@ -178,6 +180,7 @@ test('SDK publisher converts a message ID and performs one CardKit full update',
   assert.match(updates[0].data.uuid, /^ztc_[a-f0-9]{40}$/);
   assert.equal(updates[0].data.card.type, 'card_json');
   assert.equal(JSON.parse(updates[0].data.card.data).header.title.content, '任务执行中');
+  assert.equal(JSON.parse(updates[0].data.card.data).schema, '2.0');
 });
 
 test('fails closed on ambiguous request fields and unbounded identities', async () => {

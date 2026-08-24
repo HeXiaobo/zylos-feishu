@@ -213,10 +213,13 @@ function actionButton(definition, context) {
     tag: 'button',
     text: { tag: 'plain_text', content: definition.label },
     type: definition.type,
-    value: {
-      action: definition.action,
-      context,
-    },
+    behaviors: [{
+      type: 'callback',
+      value: {
+        action: definition.action,
+        context,
+      },
+    }],
   };
 }
 
@@ -275,15 +278,16 @@ export function createTaskReviewCardRenderer(input) {
           ].join('\n'),
         },
       });
-      if (actions.length > 0) elements.push({ tag: 'action', actions });
+      elements.push(...actions);
 
       const card = {
-        config: { wide_screen_mode: true },
+        schema: '2.0',
+        config: { update_multi: true, width_mode: 'fill' },
         header: {
           template: presentation.template,
           title: { tag: 'plain_text', content: presentation.title },
         },
-        elements,
+        body: { elements },
       };
       if (Buffer.byteLength(JSON.stringify(card), 'utf8') > MAX_CARD_BYTES) {
         throw new TypeError('rendered task card exceeds the size limit');

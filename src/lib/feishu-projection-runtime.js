@@ -1,3 +1,7 @@
+import path from 'node:path';
+
+import dotenv from 'dotenv';
+
 import { createTaskActionContextSigner } from './task-action-context.js';
 import { createSdkTaskCardProjectionPublisher } from './task-card-projection-publisher.js';
 import { getClient } from './client.js';
@@ -12,6 +16,11 @@ function requireRecord(value, field) {
   return value;
 }
 
+function loadDefaultEnvironment() {
+  dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
+  return process.env;
+}
+
 /**
  * Component-owned production assembly for Commitment Core's projection worker.
  * Core imports this factory by an explicit local module path, so credentials,
@@ -23,7 +32,7 @@ export async function createFeishuProjectionRuntime(options = {}) {
     throw new TypeError('Feishu projection runtime options contain unsupported fields');
   }
   const env = requireRecord(
-    runtime.env ?? process.env,
+    runtime.env ?? loadDefaultEnvironment(),
     'Feishu projection runtime environment',
   );
   const clock = runtime.clock ?? Date.now;

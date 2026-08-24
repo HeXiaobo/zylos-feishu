@@ -40,21 +40,25 @@ test('renders review tasks with signed accept and request-changes actions', () =
   });
 
   const card = renderer.render(task());
-  const actionElement = card.elements.at(-1);
+  const buttons = card.body.elements.filter((element) => element.tag === 'button');
 
+  assert.equal(card.schema, '2.0');
+  assert.equal(card.config.update_multi, true);
+  assert.equal(Object.hasOwn(card.config, 'wide_screen_mode'), false);
+  assert.equal(card.body.elements.some((element) => element.tag === 'action'), false);
   assert.equal(card.header.title.tag, 'plain_text');
-  assert.equal(actionElement.tag, 'action');
   assert.deepEqual(
-    actionElement.actions.map((button) => button.value.action),
+    buttons.map((button) => button.behaviors[0].value.action),
     ['accept', 'request_changes'],
   );
-  for (const button of actionElement.actions) {
-    assert.deepEqual(contexts.verify(button.value.context), {
+  for (const button of buttons) {
+    assert.deepEqual(button.behaviors.map(({ type }) => type), ['callback']);
+    assert.deepEqual(contexts.verify(button.behaviors[0].value.context), {
       taskId: 'task-123',
       expectedVersion: 4,
       expiresAt: EXPIRES_AT,
     });
-    assert.equal(Object.hasOwn(button.value, 'actorId'), false);
+    assert.equal(Object.hasOwn(button.behaviors[0].value, 'actorId'), false);
   }
 });
 
@@ -78,10 +82,9 @@ test('renders only the allowed action semantics for each Core task state', () =>
 
   for (const [state, expected] of Object.entries(expectedActions)) {
     const card = renderer.render(task({ state }));
-    const actionElements = card.elements.filter((element) => element.tag === 'action');
-    const actual = actionElements.flatMap((element) => (
-      element.actions.map((button) => button.value.action)
-    ));
+    const actual = card.body.elements
+      .filter((element) => element.tag === 'button')
+      .map((button) => button.behaviors[0].value.action);
 
     assert.deepEqual(actual, expected, state);
     assert.equal(actual.includes('complete'), false, state);
@@ -156,15 +159,13 @@ test('uses state-specific headers and plain-text fields for untrusted task conte
     assert.equal(serialized.includes('lark_md'), false);
     assert.equal(serialized.includes(hostileTitle), true);
     assert.equal(
-      card.elements.some((element) => element.text?.content.includes(hostileDescription)),
+      card.body.elements.some((element) => element.text?.content.includes(hostileDescription)),
       true,
     );
     assert.equal(Buffer.byteLength(serialized, 'utf8') <= 30_000, true);
-    for (const element of card.elements) {
+    for (const element of card.body.elements) {
       if (element.text) assert.equal(element.text.tag, 'plain_text');
-      for (const button of element.actions ?? []) {
-        assert.equal(button.text.tag, 'plain_text');
-      }
+      if (element.tag === 'button') assert.equal(element.text.tag, 'plain_text');
     }
   }
 });
@@ -228,10 +229,12 @@ test('maps a signed card action to the existing Core route with the trusted call
     actionContextTtlMs: 10 * 60_000,
   });
   const card = renderer.render(task({ state: 'ready' }));
-  const startValue = card.elements
-    .find((element) => element.tag === 'action')
-    .actions.find((button) => button.value.action === 'start')
-    .value;
+  const startValue = card.body.elements
+    .find((element) => (
+      element.tag === 'button'
+      && element.behaviors[0].value.action === 'start'
+    ))
+    .behaviors[0].value;
 
   const route = parseTaskReviewCardAction({
     eventId: 'card-action-event-1',

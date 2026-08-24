@@ -58,15 +58,16 @@ test('sends a trusted Core task snapshot through the existing interactive messag
   assert.equal(msgType, 'interactive');
   assert.equal(card.header.title.content, '任务待验收');
 
-  const accept = card.elements
-    .find((element) => element.tag === 'action')
-    .actions.find((button) => button.value.action === 'accept');
-  assert.deepEqual(contexts.verify(accept.value.context), {
+  const accept = card.body.elements.find((element) => (
+    element.tag === 'button'
+    && element.behaviors[0].value.action === 'accept'
+  ));
+  assert.deepEqual(contexts.verify(accept.behaviors[0].value.context), {
     taskId: 'task-runtime-1',
     expectedVersion: 7,
     expiresAt: NOW + 10 * 60_000,
   });
-  assert.equal(Object.hasOwn(accept.value, 'actorId'), false);
+  assert.equal(Object.hasOwn(accept.behaviors[0].value, 'actorId'), false);
 });
 
 test('routes a real v2 card.action.trigger payload with the trusted Feishu operator', async () => {
