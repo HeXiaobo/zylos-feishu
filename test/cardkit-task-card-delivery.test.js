@@ -82,7 +82,11 @@ test('creates one CardKit entity, streams append-only progress, and finalizes th
   assert.equal(initial.config.streaming_mode, true);
   assert.equal(initial.config.update_multi, true);
   assert.equal(initial.body.elements[0].tag, 'markdown');
-  assert.equal(initial.body.elements[0].element_id, 'zylos_task_stream_progress');
+  assert.equal(initial.body.elements[0].element_id, 'zylos_task_progress');
+  assert.ok(
+    initial.body.elements[0].element_id.length <= 20,
+    'Feishu CardKit element_id must not exceed 20 characters',
+  );
 
   assert.equal(calls[0][1].params.receive_id_type, 'open_id');
   assert.equal(calls[0][1].data.receive_id, 'ou_acceptor');
@@ -96,8 +100,8 @@ test('creates one CardKit entity, streams append-only progress, and finalizes th
   assert.deepEqual(progress.map(item => item.data.sequence), [11, 12]);
   assert.equal(progress[1].data.content.startsWith(progress[0].data.content), true);
   assert.deepEqual(progress.map(item => item.path), [
-    { card_id: 'AA-streamed-task', element_id: 'zylos_task_stream_progress' },
-    { card_id: 'AA-streamed-task', element_id: 'zylos_task_stream_progress' },
+    { card_id: 'AA-streamed-task', element_id: 'zylos_task_progress' },
+    { card_id: 'AA-streamed-task', element_id: 'zylos_task_progress' },
   ]);
 
   assert.equal(calls[4][1].data.sequence, 13);
