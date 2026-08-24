@@ -66,7 +66,7 @@ test('creates one task card with a stable Feishu UUID and returns its external l
   assert.equal(sends[1][4].uuid, sends[0][4].uuid);
 });
 
-test('updates the linked card in place using Core task version as the CardKit sequence', async () => {
+test('updates the linked card in place using a version-scoped CardKit sequence', async () => {
   const signer = createTaskActionContextSigner({ secret: SECRET, clock: () => NOW });
   const updates = [];
   const publisher = createTaskCardProjectionPublisher({
@@ -96,14 +96,15 @@ test('updates the linked card in place using Core task version as the CardKit se
   assert.equal(updates[0][1].header.title.content, '任务已完成');
   assert.deepEqual(updates[0][2], {
     uuid: updates[0][2].uuid,
-    sequence: 8,
+    sequence: 89,
   });
   assert.match(updates[0][2].uuid, /^ztc_[a-f0-9]{40}$/);
 });
 
-test('SDK publisher forwards the stable create UUID to Feishu message.create', async () => {
+test('SDK publisher forwards the stable create UUID to the placeholder message', async () => {
   const signer = createTaskActionContextSigner({ secret: SECRET, clock: () => NOW });
   const creates = [];
+  const patches = [];
   const client = {
     im: {
       message: {
@@ -112,8 +113,24 @@ test('SDK publisher forwards the stable create UUID to Feishu message.create', a
           return { code: 0, data: { message_id: 'om_sdk_projected_task' } };
         },
       },
+      v1: {
+        message: {
+          async patch(payload) {
+            patches.push(payload);
+            return { code: 0, data: {} };
+          },
+        },
+      },
     },
-    cardkit: { v1: { card: {} } },
+    cardkit: {
+      v1: {
+        card: {
+          async idConvert() {
+            return { code: 230001, msg: 'CardKit unavailable' };
+          },
+        },
+      },
+    },
   };
   const publisher = createSdkTaskCardProjectionPublisher({
     client,
@@ -134,7 +151,75 @@ test('SDK publisher forwards the stable create UUID to Feishu message.create', a
   assert.equal(creates[0].data.receive_id, 'ou_acceptor');
   assert.equal(creates[0].data.msg_type, 'interactive');
   assert.match(creates[0].data.uuid, /^ztc_[a-f0-9]{40}$/);
-  assert.equal(JSON.parse(creates[0].data.content).header.title.content, '任务待验收');
+  assert.equal(JSON.parse(creates[0].data.content).config.streaming_mode, true);
+  assert.equal(JSON.parse(patches[0].data.content).header.title.content, '任务待验收');
+});
+
+test('SDK publisher uses native CardKit streaming for task-card creation', async () => {
+  const signer = createTaskActionContextSigner({ secret: SECRET, clock: () => NOW });
+  const calls = [];
+  const client = {
+    im: {
+      message: {
+        async create(payload) {
+          calls.push(['send', payload]);
+          return { code: 0, data: { message_id: 'om_sdk_streamed_task' } };
+        },
+      },
+    },
+    cardkit: {
+      v1: {
+        card: {
+          async idConvert(payload) {
+            calls.push(['id-convert', payload]);
+            return { code: 0, data: { card_id: 'AA-sdk-streamed-task' } };
+          },
+          async update(payload) {
+            calls.push(['final-card', payload]);
+            return { code: 0, data: {} };
+          },
+          async settings(payload) {
+            calls.push(['finish', payload]);
+            return { code: 0, data: {} };
+          },
+        },
+        cardElement: {
+          async content(payload) {
+            calls.push(['progress', payload]);
+            return { code: 0, data: {} };
+          },
+        },
+      },
+    },
+  };
+  const publisher = createSdkTaskCardProjectionPublisher({
+    client,
+    issueTaskActionContext: claims => signer.issue(claims),
+    clock: () => NOW,
+    actionContextTtlMs: 10 * 60_000,
+  });
+
+  const result = await publisher.createTask({
+    target: { receiveId: 'ou_acceptor', receiveIdType: 'open_id' },
+    task: task(),
+    idempotencyKey: 'feishu:create:task-projection-streamed',
+  });
+
+  assert.deepEqual(result, { externalId: 'om_sdk_streamed_task' });
+  assert.deepEqual(calls.map(([name]) => name), [
+    'send',
+    'id-convert',
+    'progress',
+    'progress',
+    'final-card',
+    'finish',
+  ]);
+  assert.deepEqual(
+    calls.filter(([name]) => name === 'progress').map(([, payload]) => payload.data.sequence),
+    [71, 72],
+  );
+  assert.equal(calls.at(-2)[1].data.sequence, 73);
+  assert.equal(calls.at(-1)[1].data.sequence, 74);
 });
 
 test('SDK publisher converts a message ID and performs one CardKit full update', async () => {
@@ -176,7 +261,7 @@ test('SDK publisher converts a message ID and performs one CardKit full update',
   assert.deepEqual(converts, [{ data: { message_id: 'om_sdk_projected_task' } }]);
   assert.equal(updates.length, 1);
   assert.equal(updates[0].path.card_id, 'AAqbc-card-instance');
-  assert.equal(updates[0].data.sequence, 9);
+  assert.equal(updates[0].data.sequence, 99);
   assert.match(updates[0].data.uuid, /^ztc_[a-f0-9]{40}$/);
   assert.equal(updates[0].data.card.type, 'card_json');
   assert.equal(JSON.parse(updates[0].data.card.data).header.title.content, '任务执行中');
@@ -210,4 +295,30 @@ test('fails closed on ambiguous request fields and unbounded identities', async 
     }),
     /exceeds 512 characters/,
   );
+});
+
+test('rejects task versions outside the Feishu int32 sequence range before updating', async () => {
+  const signer = createTaskActionContextSigner({ secret: SECRET, clock: () => NOW });
+  let updates = 0;
+  const publisher = createTaskCardProjectionPublisher({
+    sendMessage: async () => ({ success: true, messageId: 'om_unused' }),
+    updateInteractiveCard: async () => {
+      updates += 1;
+      return { success: true };
+    },
+    issueTaskActionContext: claims => signer.issue(claims),
+    clock: () => NOW,
+    actionContextTtlMs: 10 * 60_000,
+  });
+
+  await assert.rejects(
+    publisher.updateTask({
+      target: { receiveId: 'ou_acceptor', receiveIdType: 'open_id' },
+      externalId: 'om_sequence_too_large',
+      task: task({ version: 214_748_365 }),
+      idempotencyKey: 'feishu:update:task-sequence-too-large',
+    }),
+    /32-bit CardKit sequence/,
+  );
+  assert.equal(updates, 0);
 });

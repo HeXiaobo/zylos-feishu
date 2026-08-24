@@ -237,11 +237,19 @@ without affecting ordinary messages.
 `src/lib/feishu-projection-runtime.js` is the component-owned production
 assembly imported by Commitment Core's projection worker through an explicit
 local module path. It returns only the narrow `{ publisher }` Interface:
-`createTask(...)` sends one idempotent interactive message and returns its
-message ID; `updateTask(...)` converts that message ID to a CardKit card ID and
-updates it in place using the Core task version as the sequence. Credentials,
-the Feishu SDK, card rendering, and the dedicated HMAC secret remain in this
-component. Core owns durable Outbox delivery and `ExternalLink` state.
+`createTask(...)` sends one idempotent, content-stable streaming placeholder,
+resolves the actual Card Entity from the returned message ID, streams a short
+native CardKit creation progress, then replaces and closes that same card with
+the canonical task card. Explicit CardKit conversion failure patches the same
+message to an ordinary interactive card. Terminal failures remain retryable by
+the durable projection worker without creating another message.
+`updateTask(...)` converts the linked message ID to a CardKit card ID and
+updates it in place. CardKit sequences reserve `taskVersion * 10 + 1..4` for
+creation and `taskVersion * 10 + 9` for ordinary state updates, remaining
+strictly monotonic even when create and update observe the same current task
+version. Credentials, the Feishu SDK, card rendering, and the dedicated HMAC
+secret remain in this component. Core owns durable Outbox delivery and
+`ExternalLink` state.
 `ecosystem.task-projection.config.cjs` is a separate, explicit opt-in supervisor
 for this seam. It is deliberately absent from the ordinary
 `ecosystem.config.cjs`, so an install or normal Feishu service start cannot
