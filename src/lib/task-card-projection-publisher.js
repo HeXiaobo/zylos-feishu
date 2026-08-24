@@ -1,0 +1,187 @@
+import { createHash } from 'node:crypto';
+
+import { createTaskReviewCardRenderer } from './task-review-card.js';
+
+const RECEIVE_ID_TYPES = new Set(['chat_id', 'open_id', 'user_id', 'union_id']);
+const PUBLISHER_OPTION_FIELDS = Object.freeze([
+  'sendMessage',
+  'updateInteractiveCard',
+  'issueTaskActionContext',
+  'clock',
+  'actionContextTtlMs',
+]);
+const SDK_OPTION_FIELDS = Object.freeze([
+  'client',
+  'issueTaskActionContext',
+  'clock',
+  'actionContextTtlMs',
+]);
+const CREATE_REQUEST_FIELDS = Object.freeze(['target', 'task', 'idempotencyKey']);
+const UPDATE_REQUEST_FIELDS = Object.freeze([
+  'target',
+  'externalId',
+  'task',
+  'idempotencyKey',
+]);
+const TARGET_FIELDS = Object.freeze(['receiveId', 'receiveIdType']);
+const MAX_ID_LENGTH = 512;
+
+function requireRecord(value, field) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${field} must be an object`);
+  }
+  return value;
+}
+
+function requireText(value, field) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new TypeError(`${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requireExactFields(value, fields, field) {
+  const keys = Object.keys(value);
+  if (keys.length !== fields.length || !fields.every(key => Object.hasOwn(value, key))) {
+    throw new TypeError(`${field} contains unsupported or missing fields`);
+  }
+}
+
+function requireBoundedText(value, field, maxLength = MAX_ID_LENGTH) {
+  const text = requireText(value, field);
+  if (Array.from(text).length > maxLength) {
+    throw new TypeError(`${field} exceeds ${maxLength} characters`);
+  }
+  return text;
+}
+
+function stableFeishuUuid(idempotencyKey) {
+  const key = requireBoundedText(idempotencyKey, 'idempotencyKey');
+  return `ztc_${createHash('sha256').update(key).digest('hex').slice(0, 40)}`;
+}
+
+function normalizeTarget(value) {
+  const target = requireRecord(value, 'target');
+  requireExactFields(target, TARGET_FIELDS, 'target');
+  const receiveId = requireBoundedText(target.receiveId, 'target.receiveId');
+  if (!RECEIVE_ID_TYPES.has(target.receiveIdType)) {
+    throw new TypeError('target.receiveIdType is unsupported');
+  }
+  return { receiveId, receiveIdType: target.receiveIdType };
+}
+
+export function createTaskCardProjectionPublisher(input) {
+  const options = requireRecord(input, 'task card projection publisher options');
+  requireExactFields(options, PUBLISHER_OPTION_FIELDS, 'task card projection publisher options');
+  if (typeof options.sendMessage !== 'function') {
+    throw new TypeError('sendMessage must be a function');
+  }
+  if (typeof options.updateInteractiveCard !== 'function') {
+    throw new TypeError('updateInteractiveCard must be a function');
+  }
+  const renderer = createTaskReviewCardRenderer({
+    issueTaskActionContext: options.issueTaskActionContext,
+    clock: options.clock,
+    actionContextTtlMs: options.actionContextTtlMs,
+  });
+
+  return Object.freeze({
+    async createTask(input) {
+      const request = requireRecord(input, 'create task projection request');
+      requireExactFields(request, CREATE_REQUEST_FIELDS, 'create task projection request');
+      const target = normalizeTarget(request.target);
+      const card = renderer.render(request.task);
+      const result = await options.sendMessage(
+        target.receiveId,
+        card,
+        target.receiveIdType,
+        'interactive',
+        { uuid: stableFeishuUuid(request.idempotencyKey) },
+      );
+      if (!result?.success) {
+        throw new Error(result?.message || 'Feishu task card create failed');
+      }
+      return {
+        externalId: requireText(result.messageId, 'Feishu task card messageId'),
+      };
+    },
+    async updateTask(input) {
+      const request = requireRecord(input, 'update task projection request');
+      requireExactFields(request, UPDATE_REQUEST_FIELDS, 'update task projection request');
+      normalizeTarget(request.target);
+      const externalId = requireBoundedText(request.externalId, 'externalId');
+      const card = renderer.render(request.task);
+      const result = await options.updateInteractiveCard(externalId, card, {
+        uuid: stableFeishuUuid(request.idempotencyKey),
+        sequence: request.task.version,
+      });
+      if (!result?.success) {
+        throw new Error(result?.message || 'Feishu task card update failed');
+      }
+      return { externalId };
+    },
+  });
+}
+
+export function createSdkTaskCardProjectionPublisher(input) {
+  const options = requireRecord(input, 'SDK task card projection publisher options');
+  requireExactFields(options, SDK_OPTION_FIELDS, 'SDK task card projection publisher options');
+  const client = requireRecord(options.client, 'client');
+  const sendMessage = async (receiveId, content, receiveIdType, msgType, sendOptions) => {
+    const response = await client.im.message.create({
+      params: { receive_id_type: receiveIdType },
+      data: {
+        receive_id: receiveId,
+        msg_type: msgType,
+        content: JSON.stringify(content),
+        uuid: sendOptions.uuid,
+      },
+    });
+    if (response?.code !== 0) {
+      return {
+        success: false,
+        message: response?.msg || 'Feishu task card create failed',
+        code: response?.code,
+      };
+    }
+    return {
+      success: true,
+      messageId: response.data?.message_id,
+    };
+  };
+  const updateInteractiveCard = async (messageId, card, updateOptions) => {
+    const conversion = await client.cardkit.v1.card.idConvert({
+      data: { message_id: messageId },
+    });
+    if (conversion?.code !== 0 || !conversion.data?.card_id) {
+      return {
+        success: false,
+        message: conversion?.msg || 'Feishu card ID conversion failed',
+        code: conversion?.code,
+      };
+    }
+    const response = await client.cardkit.v1.card.update({
+      path: { card_id: conversion.data.card_id },
+      data: {
+        card: { type: 'card_json', data: JSON.stringify(card) },
+        uuid: updateOptions.uuid,
+        sequence: updateOptions.sequence,
+      },
+    });
+    if (response?.code !== 0) {
+      return {
+        success: false,
+        message: response?.msg || 'Feishu task card update failed',
+        code: response?.code,
+      };
+    }
+    return { success: true };
+  };
+  return createTaskCardProjectionPublisher({
+    sendMessage,
+    updateInteractiveCard,
+    issueTaskActionContext: options.issueTaskActionContext,
+    clock: options.clock,
+    actionContextTtlMs: options.actionContextTtlMs,
+  });
+}

@@ -224,12 +224,14 @@ existing token check and optional decrypt step. If
 `FEISHU_TASK_CONTEXT_SECRET` is absent or invalid, task-card actions fail closed
 without affecting ordinary messages.
 
-This is a runtime seam, not a complete external projection. A Commitment Core
-Outbox Adapter plus durable Feishu `ExternalLink`/target mapping is still needed
-to invoke the sender with the correct chat, decide which task snapshot is sent,
-and determine whether a later event creates or updates a card. This batch wires
-the callback into the running transport and provides the callable sender; it
-does not auto-publish Core Outbox events.
+`src/lib/feishu-projection-runtime.js` is the component-owned production
+assembly imported by Commitment Core's projection worker through an explicit
+local module path. It returns only the narrow `{ publisher }` Interface:
+`createTask(...)` sends one idempotent interactive message and returns its
+message ID; `updateTask(...)` converts that message ID to a CardKit card ID and
+updates it in place using the Core task version as the sequence. Credentials,
+the Feishu SDK, card rendering, and the dedicated HMAC secret remain in this
+component. Core owns durable Outbox delivery and `ExternalLink` state.
 
 ---
 
