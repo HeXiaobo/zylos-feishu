@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-const ELEMENT_ID = 'zylos_task_stream_progress';
+const ELEMENT_ID = 'zylos_task_progress';
 const DEFAULT_PHASE_DELAY_MS = 450;
 const MAX_CARDKIT_SEQUENCE = 2_147_483_647;
 const MAX_ID_LENGTH = 512;
