@@ -191,8 +191,10 @@ supply it. `complete` maps to `SubmitForReview`, never `AcceptTask`. Explicit
 Commitment Core. Set `FEISHU_TASK_CONTEXT_SECRET` to a dedicated secret of at
 least 32 bytes to enable signed actions; missing or invalid configuration
 disables actions without affecting task creation or ordinary chat. The CLI
-path defaults to `~/.local/bin/zylos` and may be overridden with
-`ZYLOS_CLI_PATH`.
+resolver first honors an absolute, executable `ZYLOS_CLI_PATH`, then checks
+`~/zylos/bin/zylos`, `~/.npm-global/bin/zylos`, and absolute directories in
+`PATH`. Missing, relative, or non-executable candidates fail the card action
+closed; the resolved path is passed directly to `execFile` without a shell.
 
 ### 3.5 Task Review Card Runtime
 

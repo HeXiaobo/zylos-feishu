@@ -26,6 +26,7 @@ import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { createTaskActionContextSigner } from './lib/task-action-context.js';
+import { resolveZylosCli } from './lib/zylos-cli-resolver.js';
 import {
   createTaskCardActionRuntime,
   createTaskCardEventHandlers,
@@ -40,8 +41,6 @@ import {
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
-const ZYLOS_CLI = process.env.ZYLOS_CLI_PATH
-  || path.join(process.env.HOME, '.local/bin/zylos');
 
 let taskActionContextSigner = null;
 if (process.env.FEISHU_TASK_CONTEXT_SECRET) {
@@ -832,8 +831,9 @@ function verifyTaskActionContext(token) {
 
 function executeTaskAction(taskAction) {
   const args = buildZylosTaskCommandArgs(taskAction);
+  const zylosCli = resolveZylosCli({ env: process.env });
   return new Promise((resolve, reject) => {
-    execFile(ZYLOS_CLI, args, {
+    execFile(zylosCli, args, {
       encoding: 'utf8',
       timeout: 35000,
       env: process.env,
