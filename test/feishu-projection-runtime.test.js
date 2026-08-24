@@ -28,6 +28,7 @@ function task() {
 
 test('exports the narrow Core projection runtime without credentials in Core', async () => {
   const creates = [];
+  const patches = [];
   const runtime = await createFeishuProjectionRuntime({
     env: { FEISHU_TASK_CONTEXT_SECRET: SECRET },
     client: {
@@ -38,8 +39,24 @@ test('exports the narrow Core projection runtime without credentials in Core', a
             return { code: 0, data: { message_id: 'om_runtime_card' } };
           },
         },
+        v1: {
+          message: {
+            async patch(payload) {
+              patches.push(payload);
+              return { code: 0, data: {} };
+            },
+          },
+        },
       },
-      cardkit: { v1: { card: {} } },
+      cardkit: {
+        v1: {
+          card: {
+            async idConvert() {
+              return { code: 230001, msg: 'CardKit unavailable' };
+            },
+          },
+        },
+      },
     },
     clock: () => NOW,
   });
@@ -57,6 +74,7 @@ test('exports the narrow Core projection runtime without credentials in Core', a
   assert.deepEqual(result, { externalId: 'om_runtime_card' });
   assert.equal(creates.length, 1);
   assert.equal(creates[0].data.receive_id, 'ou_acceptor');
+  assert.equal(patches.length, 1);
 });
 
 test('fails closed when the dedicated task context secret is missing', async () => {

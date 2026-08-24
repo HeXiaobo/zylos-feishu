@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import { createCardKitTaskCardDelivery } from './cardkit-task-card-delivery.js';
 import { createTaskReviewCardRenderer } from './task-review-card.js';
 
 const RECEIVE_ID_TYPES = new Set(['chat_id', 'open_id', 'user_id', 'union_id']);
@@ -25,6 +26,7 @@ const UPDATE_REQUEST_FIELDS = Object.freeze([
 ]);
 const TARGET_FIELDS = Object.freeze(['receiveId', 'receiveIdType']);
 const MAX_ID_LENGTH = 512;
+const MAX_CARDKIT_SEQUENCE = 2_147_483_647;
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -58,6 +60,17 @@ function requireBoundedText(value, field, maxLength = MAX_ID_LENGTH) {
 function stableFeishuUuid(idempotencyKey) {
   const key = requireBoundedText(idempotencyKey, 'idempotencyKey');
   return `ztc_${createHash('sha256').update(key).digest('hex').slice(0, 40)}`;
+}
+
+function taskVersionSequence(version) {
+  if (
+    !Number.isSafeInteger(version)
+    || version < 1
+    || version > Math.floor((MAX_CARDKIT_SEQUENCE - 9) / 10)
+  ) {
+    throw new TypeError('task.version cannot produce a positive 32-bit CardKit sequence');
+  }
+  return version * 10 + 9;
 }
 
 function normalizeTarget(value) {
@@ -96,7 +109,11 @@ export function createTaskCardProjectionPublisher(input) {
         card,
         target.receiveIdType,
         'interactive',
-        { uuid: stableFeishuUuid(request.idempotencyKey) },
+        {
+          uuid: stableFeishuUuid(request.idempotencyKey),
+          idempotencyKey: request.idempotencyKey,
+          taskVersion: request.task.version,
+        },
       );
       if (!result?.success) {
         throw new Error(result?.message || 'Feishu task card create failed');
@@ -113,7 +130,7 @@ export function createTaskCardProjectionPublisher(input) {
       const card = renderer.render(request.task);
       const result = await options.updateInteractiveCard(externalId, card, {
         uuid: stableFeishuUuid(request.idempotencyKey),
-        sequence: request.task.version,
+        sequence: taskVersionSequence(request.task.version),
       });
       if (!result?.success) {
         throw new Error(result?.message || 'Feishu task card update failed');
@@ -127,27 +144,17 @@ export function createSdkTaskCardProjectionPublisher(input) {
   const options = requireRecord(input, 'SDK task card projection publisher options');
   requireExactFields(options, SDK_OPTION_FIELDS, 'SDK task card projection publisher options');
   const client = requireRecord(options.client, 'client');
+  const delivery = createCardKitTaskCardDelivery({ client });
   const sendMessage = async (receiveId, content, receiveIdType, msgType, sendOptions) => {
-    const response = await client.im.message.create({
-      params: { receive_id_type: receiveIdType },
-      data: {
-        receive_id: receiveId,
-        msg_type: msgType,
-        content: JSON.stringify(content),
-        uuid: sendOptions.uuid,
-      },
-    });
-    if (response?.code !== 0) {
-      return {
-        success: false,
-        message: response?.msg || 'Feishu task card create failed',
-        code: response?.code,
-      };
+    if (msgType !== 'interactive') {
+      throw new TypeError('task card message type must be interactive');
     }
-    return {
-      success: true,
-      messageId: response.data?.message_id,
-    };
+    return delivery.send({
+      target: { receiveId, receiveIdType },
+      card: content,
+      idempotencyKey: sendOptions.idempotencyKey,
+      taskVersion: sendOptions.taskVersion,
+    });
   };
   const updateInteractiveCard = async (messageId, card, updateOptions) => {
     const conversion = await client.cardkit.v1.card.idConvert({
