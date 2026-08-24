@@ -55,6 +55,7 @@ const CARD_ACTIONS = new Set(
     .flat()
     .map((definition) => definition.action),
 );
+const EXECUTION_ACTIONS = new Set(['start', 'submit']);
 const PRESENTATION_BY_STATE = Object.freeze({
   ready: Object.freeze({ title: '任务待开始', template: 'blue', label: '待开始' }),
   in_progress: Object.freeze({ title: '任务执行中', template: 'blue', label: '执行中' }),
@@ -223,6 +224,14 @@ function actionButton(definition, context) {
   };
 }
 
+function actionsForAcceptorDm(task) {
+  const definitions = ACTIONS_BY_STATE[task.state];
+  const executionActorId = task.assigneeId ?? task.ownerId;
+  return definitions.filter((definition) => (
+    !EXECUTION_ACTIONS.has(definition.action) || task.acceptorId === executionActorId
+  ));
+}
+
 /**
  * Create a side-effect-free Feishu card renderer for strict Commitment Core
  * task snapshots. Visible actions are interaction hints only: the trusted
@@ -239,7 +248,7 @@ export function createTaskReviewCardRenderer(input) {
     render(input) {
       const task = normalizeTask(input);
       const expiresAt = readNow(clock, actionContextTtlMs) + actionContextTtlMs;
-      const actions = ACTIONS_BY_STATE[task.state].map((definition) => {
+      const actions = actionsForAcceptorDm(task).map((definition) => {
         const context = requireActionContext(
           issueTaskActionContext({
             taskId: task.id,

@@ -204,6 +204,14 @@ the existing Feishu runtime seams without creating another SDK client:
 - `createTaskCardSender(...)` accepts a Feishu `receiveId`, `receiveIdType`, and
   an exact Commitment Core task snapshot. It renders signed controls and calls
   the injected existing `sendMessage(..., 'interactive')` Interface.
+- Projection cards are delivered to the task `acceptorId` DM, so execution
+  controls are filtered for that recipient. `StartTask` and `SubmitForReview`
+  are shown only when the acceptor is the assigned executor, or when no
+  assignee exists and the acceptor is also the owner selected by Core's
+  assignee fallback. `CancelTask` remains available to the acceptor on active
+  work, and review-state accept or request-changes controls retain the acceptor
+  role. These controls are hints; Commitment Core remains the authorization
+  authority.
 - `scripts/send-task-card.js <receive_id> <receive_id_type> <task_json>` is the
   callable local production seam. It loads the dedicated context secret,
   constructs the sender with the existing Feishu client, and returns a JSON

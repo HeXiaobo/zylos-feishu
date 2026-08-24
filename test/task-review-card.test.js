@@ -81,7 +81,12 @@ test('renders only the allowed action semantics for each Core task state', () =>
   };
 
   for (const [state, expected] of Object.entries(expectedActions)) {
-    const card = renderer.render(task({ state }));
+    const card = renderer.render(task({
+      state,
+      ...(['ready', 'in_progress'].includes(state)
+        ? { assigneeId: 'ou_acceptor' }
+        : {}),
+    }));
     const actual = card.body.elements
       .filter((element) => element.tag === 'button')
       .map((button) => button.behaviors[0].value.action);
@@ -91,6 +96,83 @@ test('renders only the allowed action semantics for each Core task state', () =>
     assert.equal(actual.includes('done'), false, state);
     assert.equal(actual.includes('reopen'), false, state);
   }
+});
+
+test('hides Start from the acceptor DM when another assignee owns execution', () => {
+  const contexts = createTaskActionContextSigner({
+    secret: SECRET,
+    clock: () => NOW,
+  });
+  const renderer = createTaskReviewCardRenderer({
+    issueTaskActionContext: (claims) => contexts.issue(claims),
+    clock: () => NOW,
+    actionContextTtlMs: 10 * 60_000,
+  });
+
+  const card = renderer.render(task({
+    state: 'ready',
+    acceptorId: 'ou_human_acceptor',
+    assigneeId: 'agent:yueran',
+  }));
+  const actions = card.body.elements
+    .filter((element) => element.tag === 'button')
+    .map((button) => button.behaviors[0].value.action);
+
+  assert.deepEqual(actions, ['cancel']);
+});
+
+test('hides Submit from the acceptor DM when another assignee owns execution', () => {
+  const contexts = createTaskActionContextSigner({
+    secret: SECRET,
+    clock: () => NOW,
+  });
+  const renderer = createTaskReviewCardRenderer({
+    issueTaskActionContext: (claims) => contexts.issue(claims),
+    clock: () => NOW,
+    actionContextTtlMs: 10 * 60_000,
+  });
+
+  const card = renderer.render(task({
+    state: 'in_progress',
+    acceptorId: 'ou_human_acceptor',
+    assigneeId: 'agent:yueran',
+  }));
+  const actions = card.body.elements
+    .filter((element) => element.tag === 'button')
+    .map((button) => button.behaviors[0].value.action);
+
+  assert.deepEqual(actions, ['cancel']);
+});
+
+test('shows execution actions through Core owner fallback only when owner is the acceptor', () => {
+  const contexts = createTaskActionContextSigner({
+    secret: SECRET,
+    clock: () => NOW,
+  });
+  const renderer = createTaskReviewCardRenderer({
+    issueTaskActionContext: (claims) => contexts.issue(claims),
+    clock: () => NOW,
+    actionContextTtlMs: 10 * 60_000,
+  });
+  const actions = (state, ownerId, acceptorId) => renderer.render(task({
+    state,
+    ownerId,
+    acceptorId,
+    assigneeId: null,
+  })).body.elements
+    .filter((element) => element.tag === 'button')
+    .map((button) => button.behaviors[0].value.action);
+
+  assert.deepEqual(
+    actions('ready', 'ou_same_person', 'ou_same_person'),
+    ['start', 'cancel'],
+  );
+  assert.deepEqual(actions('ready', 'ou_owner', 'ou_acceptor'), ['cancel']);
+  assert.deepEqual(
+    actions('in_progress', 'ou_same_person', 'ou_same_person'),
+    ['submit', 'cancel'],
+  );
+  assert.deepEqual(actions('in_progress', 'ou_owner', 'ou_acceptor'), ['cancel']);
 });
 
 test('fails closed for unknown states, extra fields, and malformed Core snapshots', () => {
@@ -228,7 +310,11 @@ test('maps a signed card action to the existing Core route with the trusted call
     clock: () => NOW,
     actionContextTtlMs: 10 * 60_000,
   });
-  const card = renderer.render(task({ state: 'ready' }));
+  const card = renderer.render(task({
+    state: 'ready',
+    acceptorId: 'ou_trusted_callback_actor',
+    assigneeId: 'ou_trusted_callback_actor',
+  }));
   const startValue = card.body.elements
     .find((element) => (
       element.tag === 'button'
