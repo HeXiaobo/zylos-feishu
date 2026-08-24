@@ -21,6 +21,7 @@ import { getConfig, DATA_DIR } from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
+import { initMention, buildMentionContent, buildMentionMarkdown } from '../src/lib/mention.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -188,7 +189,7 @@ async function sendCardChunk(chunk, isFirstChunk) {
   // it is the only one documented for c4-send and the one that works on the
   // text path — so convert here, or every mention in a markdown-bearing message
   // renders as literal text and notifies nobody. See src/lib/at-mention.js.
-  const cardChunk = convertAtMentionsForCard(chunk);
+  const cardChunk = convertAtMentionsForCard(buildMentionMarkdown(chunk));
   // p2p DMs never reply-to (invisible in the 1:1 view); only groups reply.
   const replyTarget = chooseReplyTarget(parsedEndpoint, { isFirstChunk });
   let result;
@@ -233,7 +234,9 @@ async function sendText(endpoint, text) {
     const isFirstChunk = i === 0;
 
     if (useCard) {
-      result = await sendCardChunk(chunks[i], isFirstChunk);
+      // Apply @mention conversion for markdown card path
+      const cardChunk = buildMentionMarkdown(chunks[i]);
+      result = await sendCardChunk(cardChunk, isFirstChunk);
       // Fall back to plain text if card sending fails
       if (!result.success) {
         console.log('[feishu] Card send failed, falling back to text:', result.message);
@@ -262,6 +265,9 @@ async function sendText(endpoint, text) {
   }
 }
 
+// Initialize mention system (loads cache + override_map, starts periodic sync)
+initMention();
+
 /**
  * Send a single chunk as plain text with routing logic.
  */
@@ -270,11 +276,14 @@ async function sendPlainTextChunk(endpoint, chunk, isFirstChunk) {
   const isDM = type === 'p2p';
   // p2p DMs never reply-to (invisible in the 1:1 view); only groups reply.
   const replyTarget = chooseReplyTarget(parsedEndpoint, { isFirstChunk });
+  // Resolve configured @names before choosing the transport. Plain text stays
+  // `text`; resolved mentions use Feishu's rich-text `post` representation.
+  const { msgType, content } = buildMentionContent(chunk);
   let result;
 
   if (replyTarget) {
     try {
-      result = await replyToMessage(replyTarget, chunk);
+      result = await replyToMessage(replyTarget, content, msgType);
     } catch (err) {
       console.log('[feishu] Reply threw, falling back:', err.message);
       result = { success: false };
@@ -282,13 +291,13 @@ async function sendPlainTextChunk(endpoint, chunk, isFirstChunk) {
     if (!result.success) {
       console.log('[feishu] Reply failed, falling back:', result.message);
       result = isDM
-        ? await sendMessage(chatId, chunk, 'chat_id', 'text')
-        : await sendToGroup(endpoint, chunk);
+        ? await sendMessage(chatId, content, 'chat_id', msgType)
+        : await sendToGroup(endpoint, content, msgType);
     }
   } else if (isDM) {
-    result = await sendMessage(chatId, chunk, 'chat_id', 'text');
+    result = await sendMessage(chatId, content, 'chat_id', msgType);
   } else {
-    result = await sendToGroup(endpoint, chunk);
+    result = await sendToGroup(endpoint, content, msgType);
   }
 
   return result;
