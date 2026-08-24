@@ -165,6 +165,35 @@ tokens are capped at 4096 characters. Verified claims contain exactly `taskId`,
 actor from the verified Feishu event. Any malformed, forged, expired, or
 unsupported-version token fails closed before reaching Core.
 
+### 3.4 Explicit Task Production Entry
+
+`src/lib/task-entry.js` owns the transport-neutral production seam used by
+`src/index.js`. Task routing happens only after the existing DM owner/allowlist
+gate or all group policy, sender, and mention/smart-group gates have passed.
+The only recognized inputs are text messages using one of these exact forms:
+
+```text
+/zylos-task create {"title":"...","description":"...","acceptorId":"...","assigneeId":"..."}
+/zylos-task action {"action":"...","context":"<signed v1 token>"}
+```
+
+A create input is normalized to a Core `SourceEnvelope` and passed to C4 with
+the original channel, endpoint, and content plus `--task-envelope-json`.
+Ordinary chat remains on the existing C4 path. A recognized but malformed
+task input fails closed and is never treated as ordinary chat.
+
+A signed action is verified locally and dispatched through the narrow
+`zylos task` CLI Interface with its task ID, optimistic version, actor, and
+stable Feishu-message idempotency key. The actor is always bound from the
+authorized Feishu event; neither the JSON payload nor the signed token may
+supply it. `complete` maps to `SubmitForReview`, never `AcceptTask`. Explicit
+`accept` remains a separate Core command whose authorization is enforced by
+Commitment Core. Set `FEISHU_TASK_CONTEXT_SECRET` to a dedicated secret of at
+least 32 bytes to enable signed actions; missing or invalid configuration
+disables actions without affecting task creation or ordinary chat. The CLI
+path defaults to `~/.local/bin/zylos` and may be overridden with
+`ZYLOS_CLI_PATH`.
+
 ---
 
 ## 4. C4 Integration

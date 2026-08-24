@@ -120,6 +120,7 @@ test('mapFeishuTaskAction maps every supported Feishu action to its Core command
   const mappings = {
     start: 'StartTask',
     submit: 'SubmitForReview',
+    complete: 'SubmitForReview',
     accept: 'AcceptTask',
     request_changes: 'RequestChanges',
     cancel: 'CancelTask',
@@ -153,7 +154,7 @@ test('mapFeishuTaskAction rejects unknown actions and missing or blank fields wi
     {},
     { ...valid, eventId: '' },
     { ...valid, action: '' },
-    { ...valid, action: 'complete' },
+    { ...valid, action: 'completed' },
     { ...valid, taskId: '' },
     { ...valid, actorId: '   ' },
     {

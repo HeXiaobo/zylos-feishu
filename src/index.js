@@ -25,9 +25,30 @@ import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
+import { createTaskActionContextSigner } from './lib/task-action-context.js';
+import {
+  buildC4ReceiveArgs,
+  buildZylosTaskCommandArgs,
+  isExplicitTaskProtocolMessage,
+  parseExplicitTaskMessage,
+} from './lib/task-entry.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
+const ZYLOS_CLI = process.env.ZYLOS_CLI_PATH
+  || path.join(process.env.HOME, '.local/bin/zylos');
+
+let taskActionContextSigner = null;
+if (process.env.FEISHU_TASK_CONTEXT_SECRET) {
+  try {
+    taskActionContextSigner = createTaskActionContextSigner({
+      secret: process.env.FEISHU_TASK_CONTEXT_SECRET,
+      clock: Date.now,
+    });
+  } catch (error) {
+    console.error(`[feishu] Signed task actions disabled: ${error.message}`);
+  }
+}
 
 // Bot identity (fetched at startup)
 let botOpenId = '';
@@ -750,21 +771,22 @@ function parseC4Response(stdout) {
 }
 
 /**
- * Send message to Claude via C4 (with 1 retry on unexpected failure)
+ * Send message to Claude via C4 (with 1 retry on unexpected failure).
+ * Explicit task intents atomically carry their normalized envelope.
  */
-function sendToC4(source, endpoint, content, onReject) {
+function sendToC4(source, endpoint, content, onReject, { taskEnvelope } = {}) {
   if (!content) {
     console.error('[feishu] sendToC4 called with empty content');
     return;
   }
   const childEnv = { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET };
-  const args = [
-    C4_RECEIVE,
-    '--channel', source,
-    '--endpoint', endpoint,
-    '--json',
-    '--content', content
-  ];
+  const args = buildC4ReceiveArgs({
+    receiverPath: C4_RECEIVE,
+    source,
+    endpoint,
+    content,
+    taskEnvelope,
+  });
 
   execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
     if (!error) {
@@ -794,6 +816,101 @@ function sendToC4(source, endpoint, content, onReject) {
       });
     }, 2000);
   });
+}
+
+function verifyTaskActionContext(token) {
+  if (!taskActionContextSigner) {
+    throw new Error('signed task actions are not configured');
+  }
+  return taskActionContextSigner.verify(token);
+}
+
+function executeTaskAction(taskAction) {
+  const args = buildZylosTaskCommandArgs(taskAction);
+  return new Promise((resolve, reject) => {
+    execFile(ZYLOS_CLI, args, {
+      encoding: 'utf8',
+      timeout: 35000,
+      env: process.env,
+    }, (error, stdout) => {
+      if (!error) {
+        resolve(parseC4Response(stdout) || { ok: true });
+        return;
+      }
+      const response = parseC4Response(error.stdout || stdout);
+      const message = response?.error?.message || error.message;
+      reject(new Error(message));
+    });
+  });
+}
+
+function parseAuthorizedTaskMessage(message, text, actorId) {
+  return parseExplicitTaskMessage({
+    messageType: message.message_type,
+    text,
+    messageId: message.message_id,
+    actorId,
+  }, {
+    verifyTaskActionContext,
+  });
+}
+
+async function handleAuthorizedTaskInput({
+  message,
+  text,
+  actorId,
+  chatType,
+  chatId,
+  senderUserId,
+  senderOpenId,
+  messageId,
+  timestamp,
+  mentions,
+  threadId,
+  rootId,
+  parentId,
+}) {
+  let route;
+  try {
+    route = parseAuthorizedTaskMessage(message, text, actorId);
+  } catch (error) {
+    console.warn(`[feishu] Explicit task input rejected: ${error.message}`);
+    sendThreadAwareMessage(
+      chatId,
+      'Task input rejected. Check the explicit command and signed context.',
+      { chatType, rootId, parentId, messageId },
+    ).catch(e => console.error('[feishu] task input reject reply failed:', e.message));
+    return { handled: true, route: null };
+  }
+
+  if (route?.kind !== 'task-action') {
+    return { handled: false, route };
+  }
+
+  await logMessage(
+    chatType,
+    chatId,
+    senderUserId,
+    senderOpenId,
+    `[signed task action: ${route.command.type}]`,
+    messageId,
+    timestamp,
+    mentions,
+    threadId,
+  );
+  addTypingIndicator(messageId);
+  executeTaskAction(route)
+    .then(() => console.log(`[feishu] Applied ${route.command.type} to ${route.command.taskId}`))
+    .catch((error) => {
+      console.error(`[feishu] Task action failed: ${error.message}`);
+      sendThreadAwareMessage(
+        chatId,
+        'Task action rejected. Refresh the task state and try again.',
+        { chatType, rootId, parentId, messageId },
+      ).catch(e => console.error('[feishu] task action reject reply failed:', e.message));
+    })
+    .finally(() => removeTypingIndicator(messageId));
+  return { handled: true, route };
 }
 
 /**
@@ -1240,10 +1357,23 @@ async function handleMessage(data) {
   const extracted = extractMessageContent(message);
   let { text } = extracted;
   const { imageKeys, fileKey, fileName } = extracted;
+  const explicitTaskText = resolveMentions(text, mentions, {
+    stripBot: true,
+    botOpenId,
+  });
+  const hasExplicitTaskProtocol = isExplicitTaskProtocolMessage({
+    messageType: message.message_type,
+    text: explicitTaskText,
+  });
   // A pending merge_forward has no text yet (deliberately not fetched until the
   // DM/group access gate passes below) — log a fixed marker instead of real
   // content from a sender/chat that may end up rejected anyway.
-  console.log(`[feishu] ${chatType} message from ${senderUserId}: ${extracted.deferredMergeForwardId ? '[merge_forward, pending access check]' : ((text || '').substring(0, 50) || '[media]')}...`);
+  const messagePreview = extracted.deferredMergeForwardId
+    ? '[merge_forward, pending access check]'
+    : hasExplicitTaskProtocol
+      ? '[explicit task protocol]'
+      : ((text || '').substring(0, 50) || '[media]');
+  console.log(`[feishu] ${chatType} message from ${senderUserId}: ${messagePreview}...`);
 
   // Build log text with file/image metadata
   let logText = text;
@@ -1254,6 +1384,9 @@ async function handleMessage(data) {
   if (fileKey) {
     const fileInfo = `[file: ${fileName}, file_key: ${fileKey}, msg_id: ${messageId}]`;
     logText = logText ? `${logText}\n${fileInfo}` : fileInfo;
+  }
+  if (hasExplicitTaskProtocol) {
+    logText = '[explicit task protocol]';
   }
 
   // Build structured endpoint with routing metadata
@@ -1280,6 +1413,28 @@ async function handleMessage(data) {
     if (extracted.deferredMergeForwardId) {
       text = await resolveMergeForwardText(extracted);
       logText = text;
+    }
+
+    const taskInput = await handleAuthorizedTaskInput({
+      message,
+      text: explicitTaskText,
+      actorId: senderOpenId || senderUserId,
+      chatType,
+      chatId,
+      senderUserId,
+      senderOpenId,
+      messageId,
+      timestamp: data._timestamp || null,
+      mentions,
+      threadId,
+      rootId,
+      parentId,
+    });
+    if (taskInput.handled) return;
+    const taskRoute = taskInput.route;
+
+    if (taskRoute?.kind === 'task-intent') {
+      logText = `[task intent] ${taskRoute.taskEnvelope.task.title}`;
     }
 
     await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
@@ -1351,7 +1506,11 @@ async function handleMessage(data) {
     }
 
     const msg = formatMessage('p2p', senderName, cleanText, [], null, { quotedContent, threadContext, threadRootId });
-    sendToC4('feishu', endpoint, msg, rejectReply);
+    sendToC4('feishu', endpoint, msg, rejectReply, {
+      taskEnvelope: taskRoute?.kind === 'task-intent'
+        ? taskRoute.taskEnvelope
+        : undefined,
+    });
     return;
   }
 
@@ -1406,6 +1565,28 @@ async function handleMessage(data) {
 
     // Group user access is controlled by groupPolicy + groups config + per-group allowFrom.
     // No separate user-level whitelist for groups (dmPolicy/dmAllowFrom only applies to DMs).
+
+    const taskInput = await handleAuthorizedTaskInput({
+      message,
+      text: explicitTaskText,
+      actorId: senderOpenId || senderUserId,
+      chatType,
+      chatId,
+      senderUserId,
+      senderOpenId,
+      messageId,
+      timestamp: data._timestamp || null,
+      mentions,
+      threadId,
+      rootId,
+      parentId,
+    });
+    if (taskInput.handled) return;
+    const taskRoute = taskInput.route;
+
+    if (taskRoute?.kind === 'task-intent') {
+      logText = `[task intent] ${taskRoute.taskEnvelope.task.title}`;
+    }
 
     await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
 
@@ -1498,7 +1679,11 @@ async function handleMessage(data) {
     }
 
     const msg = formatMessage('group', senderName, cleanText || text, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: smartNoMention });
-    sendToC4('feishu', endpoint, msg, groupRejectReply);
+    sendToC4('feishu', endpoint, msg, groupRejectReply, {
+      taskEnvelope: taskRoute?.kind === 'task-intent'
+        ? taskRoute.taskEnvelope
+        : undefined,
+    });
   }
 }
 

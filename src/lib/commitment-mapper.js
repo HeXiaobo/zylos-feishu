@@ -27,6 +27,7 @@ function requirePositiveInteger(value, field) {
 const COMMAND_TYPE_BY_ACTION = Object.freeze({
   start: 'StartTask',
   submit: 'SubmitForReview',
+  complete: 'SubmitForReview',
   accept: 'AcceptTask',
   request_changes: 'RequestChanges',
   cancel: 'CancelTask',
