@@ -25,6 +25,7 @@ module.exports = {
     env: {
       NODE_ENV: 'production',
       ZYLOS_DIR,
+      COMMITMENT_FEISHU_PROJECTION_AUTOSTART: '1',
     },
     autorestart: true,
     max_restarts: 10,

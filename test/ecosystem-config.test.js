@@ -8,8 +8,13 @@ const require = createRequire(import.meta.url);
 
 test('ordinary Feishu ecosystem cannot implicitly start task projection', () => {
   const ecosystem = require('../ecosystem.config.cjs');
+  const [ordinaryFeishu] = ecosystem.apps;
 
   assert.deepEqual(ecosystem.apps.map(({ name }) => name), ['zylos-feishu']);
+  assert.equal(
+    Object.hasOwn(ordinaryFeishu.env, 'COMMITMENT_FEISHU_PROJECTION_AUTOSTART'),
+    false,
+  );
 });
 
 test('ships a separate opt-in PM2 process for the durable Core projection worker', () => {
@@ -36,4 +41,5 @@ test('ships a separate opt-in PM2 process for the durable Core projection worker
   assert.equal(projection.instances, 1);
   assert.equal(projection.exec_mode, 'fork');
   assert.equal(projection.env.ZYLOS_DIR, path.join(os.homedir(), 'zylos'));
+  assert.equal(projection.env.COMMITMENT_FEISHU_PROJECTION_AUTOSTART, '1');
 });

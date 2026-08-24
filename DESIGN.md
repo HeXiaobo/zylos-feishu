@@ -247,7 +247,9 @@ for this seam. It is deliberately absent from the ordinary
 `ecosystem.config.cjs`, so an install or normal Feishu service start cannot
 activate projection. The operator must first choose `from_now` or
 `from_beginning`, run one `--once` canary, and then start this separate PM2
-ecosystem.
+ecosystem. Only that dedicated app sets
+`COMMITMENT_FEISHU_PROJECTION_AUTOSTART=1`; the ordinary Feishu ecosystem never
+receives this worker-start capability.
 
 ---
 
