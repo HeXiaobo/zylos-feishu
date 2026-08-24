@@ -137,6 +137,24 @@ zylos-feishu is a Zylos communication component that enables bidirectional messa
 | Admin | src/admin.js | CLI for managing config (groups, whitelist, owner) |
 | CLI | src/cli.js | Feishu API command-line tool |
 
+### 3.3 Commitment Core Adapter Seam
+
+`src/lib/commitment-mapper.js` is a pure Adapter between normalized Feishu
+events and Commitment Core. It accepts only events that have already passed
+permission checks and intent classification; it performs no LLM inference,
+configuration lookup, or network I/O.
+
+- Task intents become Core `SourceEnvelope` values with a stable idempotency
+  key derived from the Feishu message ID.
+- Task interactions become `{ command, expectedVersion }`, ready for
+  `core.command(command, expectedVersion)`. The task ID and version must come
+  from card context signed by us. The actor ID must come from the verified
+  Feishu event, never from actor data embedded in a button payload.
+- `submit` means `SubmitForReview`. `accept` means `AcceptTask` only after an
+  explicit, authorized acceptance action. An ordinary Feishu "complete"
+  signal is only an external projection signal and must never directly make a
+  Core task done or map to `AcceptTask`.
+
 ---
 
 ## 4. C4 Integration
