@@ -232,6 +232,11 @@ message ID; `updateTask(...)` converts that message ID to a CardKit card ID and
 updates it in place using the Core task version as the sequence. Credentials,
 the Feishu SDK, card rendering, and the dedicated HMAC secret remain in this
 component. Core owns durable Outbox delivery and `ExternalLink` state.
+The second app in `ecosystem.config.cjs`, `zylos-feishu-task-projection`, is an
+explicit opt-in supervisor for this seam. Install/upgrade does not register the
+Outbox history policy or start it automatically: the operator must first choose
+`from_now` or `from_beginning`, run one `--once` canary, and then start only
+that named PM2 app.
 
 ---
 
