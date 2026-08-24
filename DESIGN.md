@@ -155,6 +155,16 @@ configuration lookup, or network I/O.
   signal is only an external projection signal and must never directly make a
   Core task done or map to `AcceptTask`.
 
+`src/lib/task-action-context.js` owns the signed card-context seam. Its
+`createTaskActionContextSigner({ secret, clock })` Interface issues and verifies
+versioned `v1` HMAC-SHA256 tokens. The dedicated secret must contain at least
+32 bytes, `expiresAt` is an exclusive Unix epoch millisecond, and encoded
+tokens are capped at 4096 characters. Verified claims contain exactly `taskId`,
+`expectedVersion`, and `expiresAt`, so they can be spread into
+`mapFeishuTaskAction`. They never contain `actorId`: the caller must add the
+actor from the verified Feishu event. Any malformed, forged, expired, or
+unsupported-version token fails closed before reaching Core.
+
 ---
 
 ## 4. C4 Integration
