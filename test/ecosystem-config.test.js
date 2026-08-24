@@ -6,13 +6,18 @@ import test from 'node:test';
 
 const require = createRequire(import.meta.url);
 
-test('ships an explicit opt-in PM2 process for the durable Core projection worker', () => {
+test('ordinary Feishu ecosystem cannot implicitly start task projection', () => {
   const ecosystem = require('../ecosystem.config.cjs');
-  const projection = ecosystem.apps.find(
-    ({ name }) => name === 'zylos-feishu-task-projection',
-  );
+
+  assert.deepEqual(ecosystem.apps.map(({ name }) => name), ['zylos-feishu']);
+});
+
+test('ships a separate opt-in PM2 process for the durable Core projection worker', () => {
+  const ecosystem = require('../ecosystem.task-projection.config.cjs');
+  const [projection] = ecosystem.apps;
 
   assert.ok(projection);
+  assert.equal(ecosystem.apps.length, 1);
   assert.equal(
     projection.script,
     path.join(

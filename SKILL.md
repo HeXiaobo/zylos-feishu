@@ -190,8 +190,8 @@ After the canary card and callback are accepted, start the packaged supervisor
 explicitly and persist it:
 
 ```sh
-pm2 start ~/zylos/.claude/skills/feishu/ecosystem.config.cjs \
-  --only zylos-feishu-task-projection
+pm2 start \
+  ~/zylos/.claude/skills/feishu/ecosystem.task-projection.config.cjs
 pm2 save
 ```
 
