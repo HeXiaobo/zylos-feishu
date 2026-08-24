@@ -27,6 +27,11 @@ import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { createTaskActionContextSigner } from './lib/task-action-context.js';
 import {
+  createTaskCardActionRuntime,
+  createTaskCardEventHandlers,
+  routeVerifiedWebhookEvent,
+} from './lib/task-card-runtime.js';
+import {
   buildC4ReceiveArgs,
   buildZylosTaskCommandArgs,
   isExplicitTaskProtocolMessage,
@@ -843,6 +848,32 @@ function executeTaskAction(taskAction) {
     });
   });
 }
+
+let taskCardActionRuntime = null;
+
+function getTaskCardActionRuntime() {
+  if (!taskActionContextSigner) {
+    throw new Error('signed task actions are not configured');
+  }
+  if (!taskCardActionRuntime) {
+    taskCardActionRuntime = createTaskCardActionRuntime({
+      verifyTaskActionContext,
+      executeTaskAction,
+    });
+  }
+  return taskCardActionRuntime;
+}
+
+async function handleTaskCardAction(event) {
+  return getTaskCardActionRuntime().handle(event);
+}
+
+const taskCardEventHandlers = createTaskCardEventHandlers({
+  handleTaskCardAction,
+  onError(error) {
+    console.error(`[feishu] Task card action rejected: ${error.message}`);
+  },
+});
 
 function parseAuthorizedTaskMessage(message, text, actorId) {
   return parseExplicitTaskMessage({
@@ -1710,7 +1741,8 @@ function startWebSocket(creds) {
         } catch (err) {
           console.error(`[feishu] Error handling message: ${err.message}`);
         }
-      }
+      },
+      ...taskCardEventHandlers,
     })
   });
 }
@@ -1727,7 +1759,7 @@ function startWebhook(creds) {
   const app = express();
   app.use(express.json());
 
-  app.post('/webhook', (req, res) => {
+  app.post('/webhook', async (req, res) => {
     console.log('[feishu] Received webhook request');
 
     let event = req.body;
@@ -1760,11 +1792,31 @@ function startWebhook(creds) {
       return res.json({ challenge: event.challenge });
     }
 
-    // Respond immediately to prevent Feishu retry (timeout ~15s)
-    res.json({ code: 0 });
+    const eventType = event.header?.event_type;
+    let callback;
+    try {
+      callback = await routeVerifiedWebhookEvent(
+        event,
+        taskCardEventHandlers['card.action.trigger'],
+      );
+    } catch (error) {
+      console.error(`[feishu] Task card callback failed: ${error.message}`);
+      return res.status(503).json({ error: 'Task card action unavailable' });
+    }
+
+    if (eventType === 'card.action.trigger') {
+      if (callback.statusCode === 200) {
+        console.log('[feishu] Applied task card action');
+      }
+      return res.status(callback.statusCode).json(callback.body);
+    }
+
+    // routeVerifiedWebhookEvent immediately resolves ordinary callbacks so
+    // message processing continues after the acknowledgement is sent.
+    res.status(callback.statusCode).json(callback.body);
 
     // Handle message event asynchronously
-    if (event.header?.event_type === 'im.message.receive_v1') {
+    if (eventType === 'im.message.receive_v1') {
       // Validate required payload shape
       if (!event.event?.message || !event.event?.sender) {
         console.warn('[feishu] Malformed message event: missing event.message or event.sender');
@@ -1781,6 +1833,7 @@ function startWebhook(creds) {
       handleMessage(data).catch(err => {
         console.error(`[feishu] Error handling message: ${err.message}`);
       });
+      return;
     }
   });
 

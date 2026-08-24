@@ -40,7 +40,7 @@ zylos-feishu is a Zylos communication component that enables bidirectional messa
 - Voice message handling
 - Video processing
 - Feishu approval/calendar creation (handled via CLI)
-- Feishu interactive card messages
+- General-purpose interactive forms beyond Commitment Core task review cards
 
 ---
 
@@ -193,6 +193,43 @@ least 32 bytes to enable signed actions; missing or invalid configuration
 disables actions without affecting task creation or ordinary chat. The CLI
 path defaults to `~/.local/bin/zylos` and may be overridden with
 `ZYLOS_CLI_PATH`.
+
+### 3.5 Task Review Card Runtime
+
+`src/lib/task-card-runtime.js` connects the strict task-card renderer/parser to
+the existing Feishu runtime seams without creating another SDK client:
+
+- `createTaskCardSender(...)` accepts a Feishu `receiveId`, `receiveIdType`, and
+  an exact Commitment Core task snapshot. It renders signed controls and calls
+  the injected existing `sendMessage(..., 'interactive')` Interface.
+- `scripts/send-task-card.js <receive_id> <receive_id_type> <task_json>` is the
+  callable local production seam. It loads the dedicated context secret,
+  constructs the sender with the existing Feishu client, and returns a JSON
+  result. External Adapters must invoke it with `execFile`-style arguments, not
+  a shell-interpolated command.
+- `createTaskCardActionRuntime(...)` accepts only an authenticated
+  `card.action.trigger` body. The actor comes from Feishu's trusted
+  `operator.open_id` (or the SDK's verified legacy `open_id`), while task ID and
+  expected version come from the signed context. Button values cannot supply
+  an actor.
+- Re-delivered clicks derive the same Core idempotency key from the message,
+  trusted actor, and canonical action value. Webhook mode waits for the local
+  idempotent Core command before acknowledging a card callback; failures return
+  a non-success response so Feishu can retry. Ordinary message callbacks keep
+  their existing immediate-ack behavior.
+
+WebSocket mode registers `card.action.trigger` on the existing
+`EventDispatcher`. Webhook mode recognizes the same event only after the
+existing token check and optional decrypt step. If
+`FEISHU_TASK_CONTEXT_SECRET` is absent or invalid, task-card actions fail closed
+without affecting ordinary messages.
+
+This is a runtime seam, not a complete external projection. A Commitment Core
+Outbox Adapter plus durable Feishu `ExternalLink`/target mapping is still needed
+to invoke the sender with the correct chat, decide which task snapshot is sent,
+and determine whether a later event creates or updates a card. This batch wires
+the callback into the running transport and provides the callable sender; it
+does not auto-publish Core Outbox events.
 
 ---
 
