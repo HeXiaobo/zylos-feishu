@@ -40,7 +40,7 @@ zylos-feishu is a Zylos communication component that enables bidirectional messa
 - Voice message handling
 - Video processing
 - Feishu approval/calendar creation (handled via CLI)
-- Feishu interactive card messages
+- General-purpose interactive forms beyond Commitment Core task review cards
 
 ---
 
@@ -136,6 +136,120 @@ zylos-feishu is a Zylos communication component that enables bidirectional messa
 | Send | scripts/send.js | C4 standard interface for sending text and media |
 | Admin | src/admin.js | CLI for managing config (groups, whitelist, owner) |
 | CLI | src/cli.js | Feishu API command-line tool |
+
+### 3.3 Commitment Core Adapter Seam
+
+`src/lib/commitment-mapper.js` is a pure Adapter between normalized Feishu
+events and Commitment Core. It accepts only events that have already passed
+permission checks and intent classification; it performs no LLM inference,
+configuration lookup, or network I/O.
+
+- Task intents become Core `SourceEnvelope` values with a stable idempotency
+  key derived from the Feishu message ID.
+- Task interactions become `{ command, expectedVersion }`, ready for
+  `core.command(command, expectedVersion)`. The task ID and version must come
+  from card context signed by us. The actor ID must come from the verified
+  Feishu event, never from actor data embedded in a button payload.
+- `submit` means `SubmitForReview`. `accept` means `AcceptTask` only after an
+  explicit, authorized acceptance action. An ordinary Feishu "complete"
+  signal is only an external projection signal and must never directly make a
+  Core task done or map to `AcceptTask`.
+
+`src/lib/task-action-context.js` owns the signed card-context seam. Its
+`createTaskActionContextSigner({ secret, clock })` Interface issues and verifies
+versioned `v1` HMAC-SHA256 tokens. The dedicated secret must contain at least
+32 bytes, `expiresAt` is an exclusive Unix epoch millisecond, and encoded
+tokens are capped at 4096 characters. Verified claims contain exactly `taskId`,
+`expectedVersion`, and `expiresAt`, so they can be spread into
+`mapFeishuTaskAction`. They never contain `actorId`: the caller must add the
+actor from the verified Feishu event. Any malformed, forged, expired, or
+unsupported-version token fails closed before reaching Core.
+
+### 3.4 Explicit Task Production Entry
+
+`src/lib/task-entry.js` owns the transport-neutral production seam used by
+`src/index.js`. Task routing happens only after the existing DM owner/allowlist
+gate or all group policy, sender, and mention/smart-group gates have passed.
+The only recognized inputs are text messages using one of these exact forms:
+
+```text
+/zylos-task create {"title":"...","description":"...","acceptorId":"...","assigneeId":"..."}
+/zylos-task action {"action":"...","context":"<signed v1 token>"}
+```
+
+A create input is normalized to a Core `SourceEnvelope` and passed to C4 with
+the original channel, endpoint, and content plus `--task-envelope-json`.
+Ordinary chat remains on the existing C4 path. A recognized but malformed
+task input fails closed and is never treated as ordinary chat.
+
+A signed action is verified locally and dispatched through the narrow
+`zylos task` CLI Interface with its task ID, optimistic version, actor, and
+stable Feishu-message idempotency key. The actor is always bound from the
+authorized Feishu event; neither the JSON payload nor the signed token may
+supply it. `complete` maps to `SubmitForReview`, never `AcceptTask`. Explicit
+`accept` remains a separate Core command whose authorization is enforced by
+Commitment Core. Set `FEISHU_TASK_CONTEXT_SECRET` to a dedicated secret of at
+least 32 bytes to enable signed actions; missing or invalid configuration
+disables actions without affecting task creation or ordinary chat. The CLI
+resolver first honors an absolute, executable `ZYLOS_CLI_PATH`, then checks
+`~/zylos/bin/zylos`, `~/.npm-global/bin/zylos`, and absolute directories in
+`PATH`. Missing, relative, or non-executable candidates fail the card action
+closed; the resolved path is passed directly to `execFile` without a shell.
+
+### 3.5 Task Review Card Runtime
+
+`src/lib/task-card-runtime.js` connects the strict task-card renderer/parser to
+the existing Feishu runtime seams without creating another SDK client:
+
+- `createTaskCardSender(...)` accepts a Feishu `receiveId`, `receiveIdType`, and
+  an exact Commitment Core task snapshot. It renders signed controls and calls
+  the injected existing `sendMessage(..., 'interactive')` Interface.
+- Projection cards are delivered to the task `acceptorId` DM, so execution
+  controls are filtered for that recipient. `StartTask` and `SubmitForReview`
+  are shown only when the acceptor is the assigned executor, or when no
+  assignee exists and the acceptor is also the owner selected by Core's
+  assignee fallback. `CancelTask` remains available to the acceptor on active
+  work, and review-state accept or request-changes controls retain the acceptor
+  role. These controls are hints; Commitment Core remains the authorization
+  authority.
+- `scripts/send-task-card.js <receive_id> <receive_id_type> <task_json>` is the
+  callable local production seam. It loads the dedicated context secret,
+  constructs the sender with the existing Feishu client, and returns a JSON
+  result. External Adapters must invoke it with `execFile`-style arguments, not
+  a shell-interpolated command.
+- `createTaskCardActionRuntime(...)` accepts only an authenticated
+  `card.action.trigger` body. The actor comes from Feishu's trusted
+  `operator.open_id` (or the SDK's verified legacy `open_id`), while task ID and
+  expected version come from the signed context. Button values cannot supply
+  an actor.
+- Re-delivered clicks derive the same Core idempotency key from the message,
+  trusted actor, and canonical action value. Webhook mode waits for the local
+  idempotent Core command before acknowledging a card callback; failures return
+  a non-success response so Feishu can retry. Ordinary message callbacks keep
+  their existing immediate-ack behavior.
+
+WebSocket mode registers `card.action.trigger` on the existing
+`EventDispatcher`. Webhook mode recognizes the same event only after the
+existing token check and optional decrypt step. If
+`FEISHU_TASK_CONTEXT_SECRET` is absent or invalid, task-card actions fail closed
+without affecting ordinary messages.
+
+`src/lib/feishu-projection-runtime.js` is the component-owned production
+assembly imported by Commitment Core's projection worker through an explicit
+local module path. It returns only the narrow `{ publisher }` Interface:
+`createTask(...)` sends one idempotent interactive message and returns its
+message ID; `updateTask(...)` converts that message ID to a CardKit card ID and
+updates it in place using the Core task version as the sequence. Credentials,
+the Feishu SDK, card rendering, and the dedicated HMAC secret remain in this
+component. Core owns durable Outbox delivery and `ExternalLink` state.
+`ecosystem.task-projection.config.cjs` is a separate, explicit opt-in supervisor
+for this seam. It is deliberately absent from the ordinary
+`ecosystem.config.cjs`, so an install or normal Feishu service start cannot
+activate projection. The operator must first choose `from_now` or
+`from_beginning`, run one `--once` canary, and then start this separate PM2
+ecosystem. Only that dedicated app sets
+`COMMITMENT_FEISHU_PROJECTION_AUTOSTART=1`; the ordinary Feishu ecosystem never
+receives this worker-start capability.
 
 ---
 

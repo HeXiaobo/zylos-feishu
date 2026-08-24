@@ -163,6 +163,42 @@ Skipping step 1 risks calling wrong subcommand names or missing required flags â
 
 ## Sending Messages
 
+## Commitment Core task projection (opt-in)
+
+Task cards require a dedicated `FEISHU_TASK_CONTEXT_SECRET` of at least 32
+bytes in `~/zylos/.env`. The projection runtime loads Feishu credentials and
+this signing secret inside the component; Commitment Core receives only the
+narrow publisher Interface. Cards use Card JSON 2.0, stable create UUIDs, Core
+task versions as CardKit update sequences, and signed callback contexts.
+
+Do not start projection implicitly. An operator must first register one
+history policy in Commitment Core (`from_now` for a new business canary;
+`from_beginning` only after reviewing all existing tasks), then run one bounded
+cycle:
+
+```sh
+node ~/zylos/.claude/skills/commitment-core/scripts/feishu-projection-worker.js \
+  register --bootstrap-policy from_now
+
+node ~/zylos/.claude/skills/commitment-core/scripts/feishu-projection-worker.js \
+  run \
+  --runtime-module ~/zylos/.claude/skills/feishu/src/lib/feishu-projection-runtime.js \
+  --once
+```
+
+After the canary card and callback are accepted, start the packaged supervisor
+explicitly and persist it:
+
+```sh
+pm2 start \
+  ~/zylos/.claude/skills/feishu/ecosystem.task-projection.config.cjs
+pm2 save
+```
+
+The ordinary `zylos-feishu` service and the task projection process are
+separate. Stopping the projection does not stop ordinary Feishu messaging or
+change Commitment Core task state.
+
 ```bash
 # Via C4 bridge (standard path â€” always use stdin form)
 cat <<'EOF' | node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js "feishu" "<chat_id>"
