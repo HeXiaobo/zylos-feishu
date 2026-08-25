@@ -206,9 +206,9 @@ export function createTaskCardEventHandlers(input) {
   return Object.freeze({
     'card.action.trigger': async (event) => {
       try {
-        const result = await options.handleTaskCardAction(event);
+        await options.handleTaskCardAction(event);
         return {
-          toast: result?.toast || { type: 'success', content: '任务操作已处理' },
+          toast: { type: 'success', content: '任务操作已处理' },
         };
       } catch (error) {
         options.onError(error);

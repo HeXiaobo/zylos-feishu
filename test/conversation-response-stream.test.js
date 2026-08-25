@@ -164,7 +164,7 @@ test('phase events stay visible while running and disappear when completion supp
   assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
 }));
 
-test('offers an on-demand copy action on long completed answers', () => withState(async stateDirectory => {
+test('keeps long completed answers free of extra copy actions', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
   await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
@@ -179,21 +179,8 @@ test('offers an on-demand copy action on long completed answers', () => withStat
   });
 
   const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  const copyButton = card.body.elements.find(element => element.element_id === 'zylos_copy');
-  assert.deepEqual(copyButton, {
-    tag: 'button',
-    element_id: 'zylos_copy',
-    text: { tag: 'plain_text', content: '获取可复制文本' },
-    type: 'default',
-    width: 'fill',
-    behaviors: [{
-      type: 'callback',
-      value: {
-        action: 'assistant_response_copy',
-        requestId: 'assistant.feishu.om_1',
-      },
-    }],
-  });
+  assert.equal(card.body.elements.some(element => element.element_id === 'zylos_copy'), false);
+  assert.deepEqual(card.body.elements.map(element => element.tag), ['markdown', 'markdown']);
 }));
 
 test('sends proactive text as the same completed response card without a placeholder', () => withState(async stateDirectory => {
