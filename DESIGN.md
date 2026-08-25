@@ -259,6 +259,56 @@ ecosystem. Only that dedicated app sets
 `COMMITMENT_FEISHU_PROJECTION_AUTOSTART=1`; the ordinary Feishu ecosystem never
 receives this worker-start capability.
 
+### 3.8 Native Task v2 projection
+
+`src/lib/task-v2-projection.js` is a second, Card-independent projection. Core
+is its only source of truth. It stores exactly one `feishu-task-v2` ExternalLink
+per Core task while leaving the existing `feishu` Card message link untouched.
+The SDK Adapter always uses the configured Zylos/Yueran App tenant identity;
+there is no user OAuth path and therefore no user refresh-token lifecycle.
+
+The member mapping is deliberately narrow: Core Owner is a follower, a distinct
+Acceptor is another follower, and an explicit human or mapped Agent is the
+assignee. `agent:yueran` maps to `FEISHU_APP_ID`; additional logical agents can
+be configured as a JSON object in `FEISHU_TASK_V2_AGENT_APP_IDS`.
+
+Native completion means "submitted by the executor": `ready` is first started
+and then moved to `review`, while `in_progress` moves directly to `review`.
+The reverse Adapter never emits `AcceptTask`. Core `review`, `done`, and
+`cancelled` project as completed; `RequestChanges` returns Core to `ready` and
+the next projection reopens the native Task.
+
+Remote create uses a stable `client_token` only for Feishu's short deduplication
+window. Durable identity is the Core ExternalLink plus its receipt. If create
+succeeds but link persistence is interrupted, a retry searches for the exact
+Core marker in the App-owned Task and adopts the GUID. Multiple matching GUIDs
+are a permanent error. Core's projection worker owns retry, max-attempt
+dead-lettering, redrive, and delivery receipts; a Feishu failure never rolls
+back the Core Task.
+
+The projection remains explicit opt-in and is not part of the ordinary Feishu
+PM2 app:
+
+```bash
+node src/lib/task-v2-projection-worker.js register --bootstrap-policy from_now
+node src/lib/task-v2-projection-worker.js run --once
+node src/lib/task-v2-projection-worker.js reconcile
+pm2 start ecosystem.task-v2-projection.config.cjs
+```
+
+Each `run --once` result and supervisor cycle includes projection receipts with
+the native `url`, GUID, and create/recovery flags. Core's generic worker stays
+platform-neutral and does not know the Task v2 response shape.
+
+Choose `from_beginning` instead of `from_now` only for an intentional rebuild.
+`reconcile` combines the platform snapshot with Core's generic reconciliation
+and reports missing, duplicate, state-drift, missing-link, and link-mismatch
+records without changing either system.
+
+The Feishu App needs `task:task:read` and `task:task:write`, plus the
+`task.task.updated_v1` event subscription. F3 does not call comment APIs;
+`task:comment:read` and `task:comment:write` belong to the later comment slice.
+
 ---
 
 ## 4. C4 Integration

@@ -24,6 +24,7 @@ const TASK_FIELDS = Object.freeze([
   'ownerId',
   'acceptorId',
   'assigneeId',
+  'dueAt',
   'version',
   'createdAt',
   'updatedAt',
@@ -81,6 +82,16 @@ function requireExactFields(value, allowedFields, field) {
   }
 }
 
+function requireFieldsWithOptional(value, requiredFields, optionalFields, field) {
+  const keys = Object.keys(value);
+  if (
+    requiredFields.some((key) => !Object.hasOwn(value, key))
+    || keys.some((key) => !requiredFields.includes(key) && !optionalFields.includes(key))
+  ) {
+    throw new TypeError(`${field} contains unsupported or missing fields`);
+  }
+}
+
 function requireBoundedText(value, field, maxLength) {
   if (typeof value !== 'string' || value.trim() === '') {
     throw new TypeError(`${field} must be a non-empty string`);
@@ -108,7 +119,12 @@ function requireTimestamp(value, field) {
 
 function normalizeTask(input) {
   const task = requireRecord(input, 'task');
-  requireExactFields(task, TASK_FIELDS, 'task');
+  requireFieldsWithOptional(
+    task,
+    TASK_FIELDS.filter((field) => field !== 'dueAt'),
+    ['dueAt'],
+    'task',
+  );
   const state = requireBoundedText(task.state, 'task.state', 32);
   if (!Object.hasOwn(ACTIONS_BY_STATE, state)) {
     throw new TypeError('task.state is unsupported');
@@ -137,6 +153,9 @@ function normalizeTask(input) {
       'task.assigneeId',
       MAX_LENGTH.identifier,
     ),
+    dueAt: task.dueAt === undefined || task.dueAt === null
+      ? null
+      : requireTimestamp(task.dueAt, 'task.dueAt'),
     version: task.version,
     createdAt: requireTimestamp(task.createdAt, 'task.createdAt'),
     updatedAt: requireTimestamp(task.updatedAt, 'task.updatedAt'),
@@ -283,6 +302,7 @@ export function createTaskReviewCardRenderer(input) {
             `负责人：${task.ownerId}`,
             `验收人：${task.acceptorId}`,
             `执行人：${task.assigneeId ?? '未分配'}`,
+            `截止时间：${task.dueAt ?? '未设置'}`,
             `更新时间：${task.updatedAt}`,
           ].join('\n'),
         },

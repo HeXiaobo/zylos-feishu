@@ -16,6 +16,7 @@ const CREATE_PAYLOAD_FIELDS = Object.freeze([
   'description',
   'acceptorId',
   'assigneeId',
+  'dueAt',
 ]);
 const ACTION_PAYLOAD_FIELDS = Object.freeze(['action', 'context']);
 
@@ -91,6 +92,7 @@ export function parseExplicitTaskMessage(
         ownerId: actorId,
         acceptorId: payload.acceptorId,
         assigneeId: payload.assigneeId,
+        dueAt: payload.dueAt,
       }),
     };
   }
