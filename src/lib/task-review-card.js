@@ -39,6 +39,7 @@ const RENDERER_OPTION_FIELDS = Object.freeze([
   'clock',
   'actionContextTtlMs',
 ]);
+const IDENTITY_LABEL_FIELDS = Object.freeze(['owner', 'acceptor', 'assignee']);
 const MAX_ACTION_TTL_MS = 24 * 60 * 60_000;
 const MAX_CARD_BYTES = 30_000;
 const ACTION_CONTEXT_PATTERN = /^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
@@ -162,6 +163,31 @@ function normalizeTask(input) {
   };
 }
 
+function normalizeIdentityLabels(input, task) {
+  if (input === undefined) {
+    return {
+      owner: task.ownerId,
+      acceptor: task.acceptorId,
+      assignee: task.assigneeId ?? '未分配',
+    };
+  }
+  const labels = requireRecord(input, 'task identity labels');
+  requireExactFields(labels, IDENTITY_LABEL_FIELDS, 'task identity labels');
+  return {
+    owner: requireBoundedText(labels.owner, 'task identity labels.owner', MAX_LENGTH.identifier),
+    acceptor: requireBoundedText(
+      labels.acceptor,
+      'task identity labels.acceptor',
+      MAX_LENGTH.identifier,
+    ),
+    assignee: requireBoundedText(
+      labels.assignee,
+      'task identity labels.assignee',
+      MAX_LENGTH.identifier,
+    ),
+  };
+}
+
 function normalizeRendererOptions(input) {
   const options = requireRecord(input, 'renderer options');
   requireExactFields(options, RENDERER_OPTION_FIELDS, 'renderer options');
@@ -264,8 +290,9 @@ export function createTaskReviewCardRenderer(input) {
   } = normalizeRendererOptions(input);
 
   return Object.freeze({
-    render(input) {
+    render(input, identityInput) {
       const task = normalizeTask(input);
+      const identityLabels = normalizeIdentityLabels(identityInput, task);
       const expiresAt = readNow(clock, actionContextTtlMs) + actionContextTtlMs;
       const actions = actionsForAcceptorDm(task).map((definition) => {
         const context = requireActionContext(
@@ -299,9 +326,9 @@ export function createTaskReviewCardRenderer(input) {
             `状态：${presentation.label}`,
             `任务 ID：${task.id}`,
             `版本：${task.version}`,
-            `负责人：${task.ownerId}`,
-            `验收人：${task.acceptorId}`,
-            `执行人：${task.assigneeId ?? '未分配'}`,
+            `负责人：${identityLabels.owner}`,
+            `验收人：${identityLabels.acceptor}`,
+            `执行人：${identityLabels.assignee}`,
             `截止时间：${task.dueAt ?? '未设置'}`,
             `更新时间：${task.updatedAt}`,
           ].join('\n'),

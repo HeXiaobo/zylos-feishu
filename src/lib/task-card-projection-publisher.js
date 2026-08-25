@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { createCardKitTaskCardDelivery } from './cardkit-task-card-delivery.js';
+import { createTaskCardIdentityResolver } from './task-card-identity-resolver.js';
 import { createTaskReviewCardRenderer } from './task-review-card.js';
 
 const RECEIVE_ID_TYPES = new Set(['chat_id', 'open_id', 'user_id', 'union_id']);
@@ -10,6 +11,7 @@ const PUBLISHER_OPTION_FIELDS = Object.freeze([
   'issueTaskActionContext',
   'clock',
   'actionContextTtlMs',
+  'resolveIdentityLabels',
 ]);
 const SDK_OPTION_FIELDS = Object.freeze([
   'client',
@@ -45,6 +47,16 @@ function requireText(value, field) {
 function requireExactFields(value, fields, field) {
   const keys = Object.keys(value);
   if (keys.length !== fields.length || !fields.every(key => Object.hasOwn(value, key))) {
+    throw new TypeError(`${field} contains unsupported or missing fields`);
+  }
+}
+
+function requireFieldsWithOptional(value, requiredFields, optionalFields, field) {
+  const keys = Object.keys(value);
+  if (
+    requiredFields.some(key => !Object.hasOwn(value, key))
+    || keys.some(key => !requiredFields.includes(key) && !optionalFields.includes(key))
+  ) {
     throw new TypeError(`${field} contains unsupported or missing fields`);
   }
 }
@@ -85,12 +97,23 @@ function normalizeTarget(value) {
 
 export function createTaskCardProjectionPublisher(input) {
   const options = requireRecord(input, 'task card projection publisher options');
-  requireExactFields(options, PUBLISHER_OPTION_FIELDS, 'task card projection publisher options');
+  requireFieldsWithOptional(
+    options,
+    PUBLISHER_OPTION_FIELDS.filter(field => field !== 'resolveIdentityLabels'),
+    ['resolveIdentityLabels'],
+    'task card projection publisher options',
+  );
   if (typeof options.sendMessage !== 'function') {
     throw new TypeError('sendMessage must be a function');
   }
   if (typeof options.updateInteractiveCard !== 'function') {
     throw new TypeError('updateInteractiveCard must be a function');
+  }
+  if (
+    options.resolveIdentityLabels !== undefined
+    && typeof options.resolveIdentityLabels !== 'function'
+  ) {
+    throw new TypeError('resolveIdentityLabels must be a function');
   }
   const renderer = createTaskReviewCardRenderer({
     issueTaskActionContext: options.issueTaskActionContext,
@@ -103,7 +126,8 @@ export function createTaskCardProjectionPublisher(input) {
       const request = requireRecord(input, 'create task projection request');
       requireExactFields(request, CREATE_REQUEST_FIELDS, 'create task projection request');
       const target = normalizeTarget(request.target);
-      const card = renderer.render(request.task);
+      const identityLabels = await options.resolveIdentityLabels?.(request.task);
+      const card = renderer.render(request.task, identityLabels);
       const result = await options.sendMessage(
         target.receiveId,
         card,
@@ -127,7 +151,8 @@ export function createTaskCardProjectionPublisher(input) {
       requireExactFields(request, UPDATE_REQUEST_FIELDS, 'update task projection request');
       normalizeTarget(request.target);
       const externalId = requireBoundedText(request.externalId, 'externalId');
-      const card = renderer.render(request.task);
+      const identityLabels = await options.resolveIdentityLabels?.(request.task);
+      const card = renderer.render(request.task, identityLabels);
       const result = await options.updateInteractiveCard(externalId, card, {
         uuid: stableFeishuUuid(request.idempotencyKey),
         sequence: taskVersionSequence(request.task.version),
@@ -145,6 +170,7 @@ export function createSdkTaskCardProjectionPublisher(input) {
   requireExactFields(options, SDK_OPTION_FIELDS, 'SDK task card projection publisher options');
   const client = requireRecord(options.client, 'client');
   const delivery = createCardKitTaskCardDelivery({ client });
+  const identityResolver = createTaskCardIdentityResolver({ client });
   const sendMessage = async (receiveId, content, receiveIdType, msgType, sendOptions) => {
     if (msgType !== 'interactive') {
       throw new TypeError('task card message type must be interactive');
@@ -190,5 +216,6 @@ export function createSdkTaskCardProjectionPublisher(input) {
     issueTaskActionContext: options.issueTaskActionContext,
     clock: options.clock,
     actionContextTtlMs: options.actionContextTtlMs,
+    resolveIdentityLabels: task => identityResolver.resolve(task),
   });
 }
