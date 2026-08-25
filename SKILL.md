@@ -172,9 +172,11 @@ narrow publisher Interface. Cards use Card JSON 2.0, stable create UUIDs, Core
 task versions as CardKit update sequences, and signed callback contexts.
 
 The paired release's pre-install/pre-upgrade gate also requires Core's
-`c4.reply.argv-compat` capability and `c4.assistant-response-stream >= 2`.
-Protocol v2 is the turn-safe request-binding and stable-delivery contract; an
-older Core must fail the compatibility gate instead of starting this component.
+`c4.reply.argv-compat`, `c4.assistant-response-stream >= 2`, and
+`c4.outbound-delivery-id >= 1` capabilities. Response-stream v2 binds output to
+the exact runtime turn; the outbound-delivery capability separately guarantees
+the stable identity used by proactive cards. An older Core must fail the
+compatibility gate instead of starting this component.
 
 Configure deployment identity explicitly in `~/zylos/.env`; the universal
 component has no built-in Agent name or logical Agent-to-App mapping:

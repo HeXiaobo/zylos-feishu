@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - New deployments default ordinary assistant replies to the same completed-card format used by streaming replies.
-- Require `c4.assistant-response-stream >= 2`, which is supplied only by the paired turn-safe Core release.
+- Require `c4.assistant-response-stream >= 2` and `c4.outbound-delivery-id >= 1`, so install and upgrade reject a Core that cannot provide turn-safe streaming plus stable proactive card identity.
 
 ## [0.3.7-3ai.5] - 2026-08-26
 
