@@ -8,6 +8,8 @@ const PHASE_ELEMENT_ID = 'zylos_phase';
 const ANSWER_ELEMENT_ID = 'zylos_answer';
 const PROGRESS_ELEMENT_ID = 'zylos_progress';
 const MAX_PROGRESS_STEPS = 8;
+const MAX_PUBLIC_REASONING_BYTES = 12_000;
+const MAX_REASONING_DELTA_BYTES = 64 * 1024;
 const MAX_CARD_BYTES = 30_000;
 const DEFAULT_ANSWER_BYTES_PER_CARD = 12_000;
 const DEFAULT_THROTTLE_MS = 250;
@@ -20,6 +22,7 @@ const EVENT_TYPES = new Set([
   'RunQueued',
   'RunStarted',
   'ProgressUpdated',
+  'PublicReasoningDelta',
   'OutputDelta',
   'RunCompleted',
   'RunFailed',
@@ -134,6 +137,7 @@ function readState(filePath) {
     const state = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     if (state?.version !== 1) return null;
     if (!Array.isArray(state.progress)) state.progress = [];
+    if (typeof state.publicReasoning !== 'string') state.publicReasoning = '';
     return state;
   } catch {
     return null;
@@ -192,7 +196,27 @@ function appendProgress(state, step) {
   state.progress.push(step);
 }
 
-function renderCard({ phase, answer, progress = [], streaming, part, totalParts }) {
+function appendPublicReasoning(state, delta) {
+  const combined = `${state.publicReasoning || ''}${delta}`;
+  if (Buffer.byteLength(combined, 'utf8') <= MAX_PUBLIC_REASONING_BYTES) {
+    state.publicReasoning = combined;
+    return;
+  }
+  const omission = '_…较早思路已省略…_\n';
+  const budget = MAX_PUBLIC_REASONING_BYTES - Buffer.byteLength(omission, 'utf8');
+  const characters = Array.from(combined);
+  const kept = [];
+  let bytes = 0;
+  for (let index = characters.length - 1; index >= 0; index -= 1) {
+    const characterBytes = Buffer.byteLength(characters[index], 'utf8');
+    if (bytes + characterBytes > budget) break;
+    kept.push(characters[index]);
+    bytes += characterBytes;
+  }
+  state.publicReasoning = `${omission}${kept.reverse().join('')}`;
+}
+
+function renderCard({ phase, answer, progress = [], publicReasoning = '', streaming, part, totalParts }) {
   const continuation = part > 0
     ? `\n\n_续 ${part + 1}${totalParts > 1 ? ` / ${totalParts}` : ''}_`
     : '';
@@ -221,11 +245,13 @@ function renderCard({ phase, answer, progress = [], streaming, part, totalParts 
           element_id: ANSWER_ELEMENT_ID,
           content: `${answer || (streaming ? '_等待回答…_' : '_没有可显示的回答_')}${continuation}`,
         },
-        ...(progress.length > 0
+        ...(publicReasoning || progress.length > 0
           ? [{
               tag: 'markdown',
               element_id: PROGRESS_ELEMENT_ID,
-              content: `**公开推理摘要**\n_工作阶段摘要，不包含模型内部思维_\n${progress.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
+              content: publicReasoning
+                ? `**处理思路（实时）**\n_由模型公开输出的工作思路，不含系统隐藏思维_\n${publicReasoning.trim()}`
+                : `**公开推理摘要**\n_工作阶段摘要，不包含模型内部思维_\n${progress.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
             }]
           : []),
       ],
@@ -291,6 +317,14 @@ function validateEvent(event, requestId) {
   requireRecord(value.payload, 'assistant response event payload');
   if (value.type === 'OutputDelta' && typeof value.payload.delta !== 'string') {
     throw new TypeError('OutputDelta requires a real string delta');
+  }
+  if (value.type === 'PublicReasoningDelta') {
+    if (typeof value.payload.delta !== 'string' || value.payload.delta.length === 0) {
+      throw new TypeError('PublicReasoningDelta requires a real string delta');
+    }
+    if (Buffer.byteLength(value.payload.delta, 'utf8') > MAX_REASONING_DELTA_BYTES) {
+      throw new TypeError('PublicReasoningDelta exceeds the supported size');
+    }
   }
   if (value.type === 'RunCompleted' && typeof value.payload.output !== 'string') {
     throw new TypeError('RunCompleted requires canonical output');
@@ -415,6 +449,7 @@ export function createConversationResponseStream({
       phase: state.phase,
       answer: state.output,
       progress: state.progress,
+      publicReasoning: state.publicReasoning,
       streaming: false,
       part: 0,
       totalParts: 1,
@@ -469,6 +504,7 @@ export function createConversationResponseStream({
       phase: state.phase,
       answer,
       progress: state.progress,
+      publicReasoning: state.publicReasoning,
       streaming: !terminal,
       part,
       totalParts,
@@ -537,6 +573,7 @@ export function createConversationResponseStream({
         phase: state.phase,
         answer: segments[part],
         progress: state.progress,
+        publicReasoning: state.publicReasoning,
         streaming: state.mode === 'cardkit' && !terminal && part === segments.length - 1,
         part,
         totalParts: segments.length,
@@ -639,6 +676,7 @@ export function createConversationResponseStream({
             status: 'opening',
             phase: '正在接收消息…',
             progress: [],
+            publicReasoning: '',
             output: '',
             lastEventSequence: 0,
             lastRenderedAt: clock(),
@@ -657,6 +695,7 @@ export function createConversationResponseStream({
             status: 'opening',
             phase: '正在接收消息…',
             progress: [],
+            publicReasoning: '',
             output: '',
             lastEventSequence: 0,
             lastRenderedAt: clock(),
@@ -728,6 +767,10 @@ export function createConversationResponseStream({
           }
           const phase = phaseForEvent(event);
           appendProgress(state, progressForEvent(event));
+          if (event.type === 'PublicReasoningDelta') {
+            appendPublicReasoning(state, event.payload.delta);
+            containsDelta = true;
+          }
           if (compatibility) {
             if (phase) canonicalPhase = phase;
             if (event.type === 'AssistantRequestAccepted') canonicalStatus = 'accepted';

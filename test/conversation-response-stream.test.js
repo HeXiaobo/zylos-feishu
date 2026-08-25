@@ -165,6 +165,38 @@ test('phase events never fabricate answer deltas and completion may supply one f
   assert.match(finalCard.body.elements[2].content, /不包含模型内部思维/);
 }));
 
+test('streams public reasoning in its own card region without mixing it into the answer', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'AssistantRequestAccepted', { sourceId: 'om_1' }),
+      event(2, 'RunQueued'),
+      event(3, 'RunStarted'),
+      event(4, 'PublicReasoningDelta', { delta: '先核对任务边界。\n' }),
+      event(5, 'PublicReasoningDelta', { delta: '再验证关键数据。\n' }),
+      event(6, 'OutputDelta', { delta: '这是答案。' }),
+    ],
+  });
+
+  const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(card.body.elements[1].content, '这是答案。');
+  assert.match(card.body.elements[2].content, /处理思路（实时）/);
+  assert.match(card.body.elements[2].content, /先核对任务边界。[\s\S]*再验证关键数据。/);
+  assert.match(card.body.elements[2].content, /不含系统隐藏思维/);
+
+  const persisted = JSON.parse(fs.readFileSync(
+    fs.readdirSync(stateDirectory)
+      .filter(name => name.endsWith('.json'))
+      .map(name => path.join(stateDirectory, name))[0],
+    'utf8',
+  ));
+  assert.equal(persisted.output, '这是答案。');
+  assert.equal(persisted.publicReasoning, '先核对任务边界。\n再验证关键数据。\n');
+}));
+
 test('keeps a bounded, de-duplicated public progress trace across restart', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const first = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
