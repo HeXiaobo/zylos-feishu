@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.7-3ai.4
+version: 0.3.7-3ai.5
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),
@@ -34,7 +34,7 @@ lifecycle:
 
 upgrade:
   repo: HeXiaobo/zylos-feishu
-  branch: codex/mylos-capability-bundle-rc
+  branch: main
 
 config:
   required:

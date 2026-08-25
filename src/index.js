@@ -714,7 +714,7 @@ function resolveGroupConfig(chatId) {
 
 /**
  * Smart mode must be explicitly configured for the chat. Legacy smart_groups
- * remains supported so existing Mylos deployments do not silently stop
+ * remains supported so existing deployments do not silently stop
  * receiving their operational group traffic after the upgrade.
  */
 function isSmartGroup(chatId) {

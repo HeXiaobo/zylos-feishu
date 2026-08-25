@@ -174,6 +174,7 @@ function phaseForEvent(event) {
     case 'RunQueued': return '⏳ 排队中';
     case 'RunStarted': return '▶️ 已开始处理';
     case 'ProgressUpdated': return publicProgressText(event.payload);
+    case 'OutputDelta': return '✍️ 正在生成回答';
     case 'RunCompleted': return '✅ 已完成';
     case 'RunFailed': return event.payload?.retryable
       ? '⚠️ 本次处理未完成，可重试'
@@ -185,6 +186,7 @@ function phaseForEvent(event) {
 function progressForEvent(event) {
   if (event.type === 'RunStarted') return '正在分析问题';
   if (event.type === 'ProgressUpdated') return publicProgressText(event.payload);
+  if (event.type === 'OutputDelta') return '正在生成回答';
   return null;
 }
 
@@ -216,7 +218,31 @@ function appendPublicReasoning(state, delta) {
   state.publicReasoning = `${omission}${kept.reverse().join('')}`;
 }
 
-function renderCard({ phase, answer, progress = [], publicReasoning = '', streaming, part, totalParts }) {
+function renderProcessTrace(progress, publicReasoning) {
+  const stages = progress.map((step, index) => `${index + 1}. ${step}`).join('\n');
+  const reasoning = publicReasoning.trim();
+  return [
+    '**处理过程（实时）**',
+    '_仅展示可公开的阶段与工作摘要，不含模型隐藏思维；完成后自动收起_',
+    stages,
+    reasoning ? `\n**公开工作摘要**\n${reasoning}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function clearTransientProcess(state) {
+  state.progress = [];
+  state.publicReasoning = '';
+}
+
+function renderCard({
+  phase,
+  answer,
+  progress = [],
+  publicReasoning = '',
+  streaming,
+  part,
+  totalParts,
+}) {
   const continuation = part > 0
     ? `\n\n_续 ${part + 1}${totalParts > 1 ? ` / ${totalParts}` : ''}_`
     : '';
@@ -245,13 +271,11 @@ function renderCard({ phase, answer, progress = [], publicReasoning = '', stream
           element_id: ANSWER_ELEMENT_ID,
           content: `${answer || (streaming ? '_等待回答…_' : '_没有可显示的回答_')}${continuation}`,
         },
-        ...(publicReasoning || progress.length > 0
+        ...(streaming && (publicReasoning || progress.length > 0)
           ? [{
               tag: 'markdown',
               element_id: PROGRESS_ELEMENT_ID,
-              content: publicReasoning
-                ? `**处理思路（实时）**\n_由模型公开输出的工作思路，不含系统隐藏思维_\n${publicReasoning.trim()}`
-                : `**公开推理摘要**\n_工作阶段摘要，不包含模型内部思维_\n${progress.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
+              content: renderProcessTrace(progress, publicReasoning),
             }]
           : []),
       ],
@@ -279,7 +303,7 @@ function normalizeTarget(value) {
 
 async function sendMessage(client, target, msgType, content, uuid) {
   const data = { msg_type: msgType, content, uuid };
-  if (target.chatType === 'group') {
+  if (target.chatType === 'group' && target.replyToMessageId) {
     return requireSuccess(await client.im.message.reply({
       path: { message_id: target.replyToMessageId },
       data,
@@ -618,6 +642,7 @@ export function createConversationResponseStream({
     state.output = output;
     state.status = status;
     state.phase = phase;
+    clearTransientProcess(state);
     state.compatibilityTerminal = true;
     await render(state, { terminal: true, purpose: 'compatibility-terminal' });
     save(state);
@@ -625,6 +650,100 @@ export function createConversationResponseStream({
   }
 
   return Object.freeze({
+    async sendCompleted(input) {
+      const request = requireRecord(input, 'completed response request');
+      requireExactFields(request, ['requestId', 'target', 'output'], 'completed response request');
+      const requestId = requireText(request.requestId, 'requestId');
+      const targetValue = requireRecord(request.target, 'target');
+      requireExactFields(targetValue, ['chatId', 'chatType', 'replyToMessageId'], 'target');
+      const target = {
+        chatId: requireText(targetValue.chatId, 'target.chatId'),
+        chatType: targetValue.chatType,
+        replyToMessageId: targetValue.replyToMessageId === null
+          ? null
+          : requireText(targetValue.replyToMessageId, 'target.replyToMessageId'),
+      };
+      if (!['p2p', 'group'].includes(target.chatType)) {
+        throw new TypeError('target.chatType is unsupported');
+      }
+      const output = typeof request.output === 'string' ? request.output : String(request.output || '');
+      const release = await acquireRequestLock(requestId);
+      try {
+        const existing = load(requestId);
+        if (existing) {
+          if (existing.status !== 'completed'
+            || existing.output !== output
+            || JSON.stringify(existing.target) !== JSON.stringify(target)) {
+            const error = new Error('completed response requestId already owns different content');
+            error.code = 'ASSISTANT_TERMINAL_CONFLICT';
+            throw error;
+          }
+          return {
+            handled: true,
+            replayed: true,
+            parts: existing.cards.length,
+            messageId: existing.cards[0]?.messageId || existing.plainMessageId,
+          };
+        }
+
+        const state = {
+          version: 1,
+          requestId,
+          target,
+          mode: 'ordinary_card',
+          status: 'completed',
+          phase: '✅ 已完成',
+          progress: [],
+          publicReasoning: '',
+          output,
+          lastEventSequence: 0,
+          lastRenderedAt: clock(),
+          compatibilityTerminal: false,
+          plainTerminalSent: false,
+          plainTerminalFingerprint: null,
+          cards: [],
+        };
+        const segments = splitUtf8(output, answerBytesPerCard);
+        try {
+          for (let part = 0; part < segments.length; part += 1) {
+            const card = renderCard({
+              phase: state.phase,
+              answer: segments[part],
+              streaming: false,
+              part,
+              totalParts: segments.length,
+            });
+            const messageId = await sendInteractive(
+              client,
+              target,
+              card,
+              stableToken(requestId, `completed:${part}`),
+            );
+            state.cards.push({
+              part,
+              messageId,
+              cardId: null,
+              nextSequence: 1,
+              closed: true,
+              rendered: card,
+            });
+            save(state);
+          }
+        } catch (error) {
+          error.deliveredParts = state.cards.length;
+          throw error;
+        }
+        return {
+          handled: true,
+          replayed: false,
+          parts: state.cards.length,
+          messageId: state.cards[0]?.messageId,
+        };
+      } finally {
+        release();
+      }
+    },
+
     async open(input) {
       const request = requireRecord(input, 'open response stream request');
       requireExactFields(request, ['requestId', 'target'], 'open response stream request');
@@ -783,10 +902,12 @@ export function createConversationResponseStream({
             if (event.type === 'RunCompleted') {
               canonicalOutput = event.payload.output;
               canonicalStatus = 'completed';
+              clearTransientProcess(state);
               terminal = true;
             }
             if (event.type === 'RunFailed') {
               canonicalStatus = 'failed';
+              clearTransientProcess(state);
               terminal = true;
             }
           } else {
@@ -801,10 +922,12 @@ export function createConversationResponseStream({
             if (event.type === 'RunCompleted') {
               state.output = event.payload.output;
               state.status = 'completed';
+              clearTransientProcess(state);
               terminal = true;
             }
             if (event.type === 'RunFailed') {
               state.status = 'failed';
+              clearTransientProcess(state);
               terminal = true;
             }
           }

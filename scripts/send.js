@@ -13,6 +13,7 @@
  */
 
 import dotenv from 'dotenv';
+import { randomUUID } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
@@ -20,7 +21,7 @@ dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 import { getConfig, DATA_DIR, getCredentials } from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
-import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
+import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage } from '../src/lib/message.js';
 import { initMention, buildMentionContent, buildMentionMarkdown } from '../src/lib/mention.js';
 import { getClient } from '../src/lib/client.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
@@ -167,62 +168,9 @@ function splitMessage(text, maxLength) {
 }
 
 /**
- * Check if text contains markdown formatting worth rendering as a card.
- * Returns true for code blocks, headers, bold, lists, tables, etc.
- */
-function hasMarkdownContent(text) {
-  // Code blocks (``` or indented)
-  if (/```/.test(text)) return true;
-  // Headers (# at start of line)
-  if (/^#{1,6}\s/m.test(text)) return true;
-  // Bold (**text**)
-  if (/\*\*[^*]+\*\*/.test(text)) return true;
-  // Bullet or numbered lists (- item or 1. item at start of line)
-  if (/^[\s]*[-*]\s/m.test(text) || /^[\s]*\d+\.\s/m.test(text)) return true;
-  // Tables (| col | col |)
-  if (/\|.+\|/.test(text) && /^[\s]*\|[\s]*[-:]+/m.test(text)) return true;
-  return false;
-}
-
-// Card max content length (Feishu card body limit ~28KB JSON; keep text under 4000 for safety)
-const CARD_MAX_LENGTH = 4000;
-
-/**
- * Send a single chunk as a markdown card, with routing logic.
- * Falls back to plain text on card failure.
- */
-async function sendCardChunk(chunk, isFirstChunk) {
-  const { chatId } = parsedEndpoint;
-  // The card API speaks a different @-mention syntax than text messages do
-  // (<at id=x></at> vs <at user_id="x">Name</at>). Callers write the text form —
-  // it is the only one documented for c4-send and the one that works on the
-  // text path — so convert here, or every mention in a markdown-bearing message
-  // renders as literal text and notifies nobody. See src/lib/at-mention.js.
-  const cardChunk = convertAtMentionsForCard(buildMentionMarkdown(chunk));
-  // p2p DMs never reply-to (invisible in the 1:1 view); only groups reply.
-  const replyTarget = chooseReplyTarget(parsedEndpoint, { isFirstChunk });
-  let result;
-
-  if (replyTarget) {
-    try {
-      result = await replyMarkdownCard(replyTarget, cardChunk);
-    } catch (err) {
-      console.log('[feishu] Card reply threw, falling back:', err.message);
-      result = { success: false };
-    }
-    if (!result.success) {
-      result = await sendMarkdownCard(chatId, cardChunk);
-    }
-  } else {
-    result = await sendMarkdownCard(chatId, cardChunk);
-  }
-
-  return result;
-}
-
-/**
  * Send text message with auto-chunking.
- * When useMarkdownCard is enabled and text contains markdown, sends as interactive card.
+ * When useMarkdownCard is enabled, all ordinary assistant text uses the same
+ * completed response card as the direct streaming conversation path.
  * Routing logic (unified for DM and group):
  *   - Topic/reply (root exists): ALL chunks reply to parent||root (stay in thread)
  *   - Group @mention (no root): first chunk replies to msg, rest use sendToGroup
@@ -231,34 +179,36 @@ async function sendCardChunk(chunk, isFirstChunk) {
  * Reply failures fall back to sendMessage (DM) or sendToGroup (group).
  */
 async function sendText(endpoint, text) {
-  const useCard = config.message?.useMarkdownCard && hasMarkdownContent(text);
-  const maxLen = useCard ? CARD_MAX_LENGTH : MAX_LENGTH;
-  const chunks = splitMessage(text, maxLen);
-  const { chatId, root, parent, msg, type } = parsedEndpoint;
+  const useCard = config.message?.useMarkdownCard === true;
+  const { chatId, type } = parsedEndpoint;
   const isDM = type === 'p2p';
-  const isGroup = type === 'group';
+
+  if (useCard) {
+    const replyToMessageId = chooseReplyTarget(parsedEndpoint, { isFirstChunk: true }) || null;
+    const cardText = convertAtMentionsForCard(buildMentionMarkdown(text));
+    try {
+      const responseStream = createConversationResponseStream({ client: getClient() });
+      await responseStream.sendCompleted({
+        requestId: `assistant.feishu.proactive.${randomUUID()}`,
+        target: {
+          chatId,
+          chatType: isDM ? 'p2p' : 'group',
+          replyToMessageId,
+        },
+        output: cardText,
+      });
+      return;
+    } catch (error) {
+      if ((error.deliveredParts || 0) > 0) throw error;
+      console.log('[feishu] Completed card send failed, falling back to text:', error.message);
+    }
+  }
+
+  const chunks = splitMessage(text, MAX_LENGTH);
 
   for (let i = 0; i < chunks.length; i++) {
-    let result;
     const isFirstChunk = i === 0;
-
-    if (useCard) {
-      // Apply @mention conversion for markdown card path
-      const cardChunk = buildMentionMarkdown(chunks[i]);
-      result = await sendCardChunk(cardChunk, isFirstChunk);
-      // Fall back to plain text if card sending fails
-      if (!result.success) {
-        console.log('[feishu] Card send failed, falling back to text:', result.message);
-        // Re-split: card chunks (up to 4000) may exceed plain text limit (2000)
-        const subChunks = splitMessage(chunks[i], MAX_LENGTH);
-        for (let j = 0; j < subChunks.length; j++) {
-          result = await sendPlainTextChunk(endpoint, subChunks[j], isFirstChunk && j === 0);
-          if (!result.success) break;
-        }
-      }
-    } else {
-      result = await sendPlainTextChunk(endpoint, chunks[i], isFirstChunk);
-    }
+    const result = await sendPlainTextChunk(endpoint, chunks[i], isFirstChunk);
 
     if (!result.success) {
       throw new Error(result.message);

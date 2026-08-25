@@ -7,10 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-3ai.5] - 2026-08-26
+
+### Fixed
+- All ordinary assistant replies now use the same completed response-card format as streamed replies, including proactive updates; text fallback remains available before any card part is delivered.
+- Public progress and model-authored public work summaries remain visible only while a response is running and are removed from the completed or failed card.
+- Group response cards reply to the triggering message only when a reply target is present; direct messages and proactive group updates use the base send path.
+- Long completed cards no longer add a custom copy action.
+
+### Changed
+- The component upgrade route now targets the fork's `main` branch so general-purpose agents do not inherit a deployment-specific release branch.
+- Release metadata and compatibility fixtures no longer name a particular hosted agent or runtime deployment.
+
 ## [0.3.7-3ai.4] - 2026-08-26
 
 ### Fixed
-- Ordinary streamed replies now enter C4 with `--block-queue-until-idle`, keeping a second Feishu prompt durably queued until the active Mylos runtime turn settles instead of allowing two cards to compete for one runtime session.
+- Ordinary streamed replies now enter C4 with `--block-queue-until-idle`, keeping a second Feishu prompt durably queued until the active runtime turn settles instead of allowing two cards to compete for one runtime session.
 
 ## [0.3.7-3ai.3] - 2026-08-25
 
