@@ -13,7 +13,10 @@ module.exports = {
       script: 'src/index.js',
       cwd: FEISHU_SKILL_DIR,
       env: {
-        NODE_ENV: 'production'
+        NODE_ENV: 'production',
+        // Intake only: the separate task-comments supervisor performs all
+        // network/Core work after the event has been durably acknowledged.
+        FEISHU_TASK_COMMENTS_ENABLED: '1'
       },
       autorestart: true,
       max_restarts: 10,

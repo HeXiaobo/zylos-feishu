@@ -481,6 +481,20 @@ window and per-recipient rate limit. Review and explicit action-required
 notices are immediate. The SDK sender uses a stable Feishu message UUID so a
 crash before the local acknowledgement does not create another IM.
 
+Production enables event intake explicitly with
+`FEISHU_TASK_COMMENTS_ENABLED=1`. Disabled ordinary chat startup lazy-loads
+neither the SQLite store nor its native dependency. The main process only
+writes the durable inbox; `ecosystem.task-comments.config.cjs` owns the
+separate worker, reconciliation, notification and C4 wake loops.
+
+The production worker dynamically loads the installed Core coordinator and
+comm-bridge idempotent inbound queue. A human comment is recorded in Core,
+notifies the non-acting human audience, and wakes an `agent:*` assignee through
+one durable C4 receipt. The reply endpoint is opaque and platform-owned;
+`scripts/send.js` recognizes it and writes the Agent response back with the
+exact Task v2 `reply_to_comment_id`. Agent notification identities are routed
+to C4 and are never passed to Feishu as fake `open_id` values.
+
 ---
 
 ## 5. Configuration

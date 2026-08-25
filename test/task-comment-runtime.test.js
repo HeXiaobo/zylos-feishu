@@ -185,6 +185,43 @@ test('worker reads Task v2 content, maps through the fake F3 seam, records Core 
   }
 });
 
+test('worker records comments for a human-owned task without attempting an Agent wake', async () => {
+  const harness = createHarness();
+  try {
+    await enqueueHandler(harness.store)(event({ event_id: 'evt-human-task' }));
+    let records = 0;
+    let wakes = 0;
+    const worker = createTaskCommentWorker({
+      appId: APP_ID,
+      store: harness.store,
+      commentApi: {
+        async getComment() {
+          return { kind: 'found', comment: foundComment() };
+        },
+      },
+      taskMapping: {
+        async resolve() {
+          return { taskId: 'core-task-human', wakeTarget: null };
+        },
+      },
+      conversation: {
+        async record() {
+          records += 1;
+          return { event: { id: 'core-human-comment-1' } };
+        },
+      },
+      async wakeAgent() { wakes += 1; },
+      workerId: 'worker-human-task',
+    });
+
+    assert.equal((await worker.processOnce()).processed, 1);
+    assert.equal(records, 1);
+    assert.equal(wakes, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('worker maps an edited Task v2 comment to a Core revision command', async () => {
   const harness = createHarness();
   try {

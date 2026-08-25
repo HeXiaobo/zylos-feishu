@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
   createFeishuNotificationAdapter,
+  createRoutedNotificationSender,
   createSdkFeishuNotificationSender,
 } from '../src/lib/task-notification-adapter.js';
 import { openTaskCommentStore } from '../src/lib/task-comment-store.js';
@@ -132,6 +133,35 @@ test('SDK notification sender uses a stable UUID and direct open_id text message
   assert.equal(calls[0].data.msg_type, 'text');
   assert.equal(calls[0].data.uuid, calls[1].data.uuid);
   assert.match(calls[0].data.uuid, /^ztn_[a-f0-9]{40}$/);
+});
+
+test('logical Agent recipients are routed to the Agent wake sender instead of Feishu open_id', async () => {
+  const feishu = [];
+  const agents = [];
+  const sender = createRoutedNotificationSender({
+    feishuSender: {
+      async send(request) { feishu.push(request); return { messageId: 'om_human' }; },
+    },
+    agentSender: {
+      async send(request) { agents.push(request); return { wakeId: 'wake-agent' }; },
+    },
+  });
+  const common = { text: '任务阻塞，请处理', idempotencyKey: 'notification-1' };
+
+  assert.deepEqual(
+    await sender.send({ recipientId: 'agent:yueran', ...common }),
+    { wakeId: 'wake-agent' },
+  );
+  assert.deepEqual(
+    await sender.send({ recipientId: 'ou_owner', ...common }),
+    { messageId: 'om_human' },
+  );
+  assert.deepEqual(agents, [{ agentId: 'agent:yueran', ...common }]);
+  assert.deepEqual(feishu, [{ recipientId: 'ou_owner', ...common }]);
+  await assert.rejects(
+    () => sender.send({ recipientId: 'person-without-platform-mapping', ...common }),
+    (error) => error?.retryable === false,
+  );
 });
 
 test('immediate critical reminder retries durably and dead-letters at the attempt bound', async () => {

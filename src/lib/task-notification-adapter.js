@@ -54,6 +54,36 @@ function errorDetail(error) {
   return String(error?.message ?? error ?? 'notification delivery failed').slice(0, 4_000);
 }
 
+function permanentRecipientError(recipientId) {
+  const error = new Error(`notification recipient has no delivery mapping: ${recipientId}`);
+  error.code = 'NOTIFICATION_RECIPIENT_UNMAPPED';
+  error.retryable = false;
+  return error;
+}
+
+/** Route logical Core identities without pretending Agent IDs are Feishu open_ids. */
+export function createRoutedNotificationSender({ feishuSender, agentSender }) {
+  requireFunction(feishuSender?.send, 'feishuSender.send');
+  requireFunction(agentSender?.send, 'agentSender.send');
+  return Object.freeze({
+    async send(rawRequest) {
+      const request = requireRecord(rawRequest, 'routed notification');
+      const recipientId = requireText(request.recipientId, 'notification recipientId');
+      const common = {
+        text: requireText(request.text, 'notification text', 20_000),
+        idempotencyKey: requireText(request.idempotencyKey, 'notification idempotencyKey'),
+      };
+      if (recipientId.startsWith('agent:')) {
+        return agentSender.send({ agentId: recipientId, ...common });
+      }
+      if (recipientId.startsWith('ou_')) {
+        return feishuSender.send({ recipientId, ...common });
+      }
+      throw permanentRecipientError(recipientId);
+    },
+  });
+}
+
 export function createSdkFeishuNotificationSender({ client }) {
   const sdk = requireRecord(client, 'Feishu SDK client');
   if (typeof sdk.im?.message?.create !== 'function') {
@@ -61,6 +91,9 @@ export function createSdkFeishuNotificationSender({ client }) {
   }
   return Object.freeze({
     async send({ recipientId, text, idempotencyKey }) {
+      if (typeof recipientId !== 'string' || !recipientId.startsWith('ou_')) {
+        throw permanentRecipientError(recipientId);
+      }
       const response = await sdk.im.message.create({
         params: { receive_id_type: 'open_id' },
         data: {

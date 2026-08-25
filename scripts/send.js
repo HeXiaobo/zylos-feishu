@@ -17,13 +17,17 @@ import fs from 'fs';
 import path from 'path';
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
-import { getConfig, DATA_DIR } from '../src/lib/config.js';
+import { getConfig, DATA_DIR, getCredentials } from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
 import { initMention, buildMentionContent, buildMentionMarkdown } from '../src/lib/mention.js';
 import { getClient } from '../src/lib/client.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
+import {
+  parseTaskCommentReplyEndpoint,
+  taskCommentReplyIdempotencyKey,
+} from '../src/lib/task-comment-production.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -40,6 +44,7 @@ if (args.length < 2) {
 
 const rawEndpoint = args[0];
 const message = args.slice(1).join(' ');
+const taskCommentReplyEndpoint = parseTaskCommentReplyEndpoint(rawEndpoint);
 
 /**
  * Parse structured endpoint string.
@@ -437,31 +442,69 @@ async function recordOutgoing(text) {
 
 async function send() {
   try {
-    const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
-    let streamed = false;
-    if (assistantRequestId && !mediaMatch) {
-      try {
-        const responseStream = createConversationResponseStream({ client: getClient() });
-        const result = await responseStream.completeWithFullAnswer({
-          requestId: assistantRequestId,
-          output: message,
-        });
-        streamed = result.handled === true;
-      } catch (error) {
-        if (error?.code === 'ASSISTANT_TERMINAL_CONFLICT') throw error;
-        console.warn(`[feishu] Same-card completion failed; using full-answer fallback: ${error.message}`);
+    if (taskCommentReplyEndpoint) {
+      if (process.env.FEISHU_TASK_COMMENTS_ENABLED !== '1') {
+        throw new Error('Task comment replies are disabled');
       }
-    }
-
-    if (streamed) {
-      await recordOutgoing(message);
-    } else if (mediaMatch) {
-      const [, mediaType, mediaPath] = mediaMatch;
-      await sendMedia(mediaType, mediaPath);
-      await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');
+      if (mediaMatch) throw new Error('Task comment replies currently support text only');
+      const [
+        { getClient },
+        { openTaskCommentStore },
+        { createTaskCommentReplyAdapter },
+        { createSdkTaskV2CommentApi },
+      ] = await Promise.all([
+        import('../src/lib/client.js'),
+        import('../src/lib/task-comment-store.js'),
+        import('../src/lib/task-comment-runtime.js'),
+        import('../src/lib/task-v2-comment-api.js'),
+      ]);
+      const appId = getCredentials().app_id;
+      if (!appId) throw new Error('FEISHU_APP_ID is required for Task comment replies');
+      const store = openTaskCommentStore({ dbPath: path.join(DATA_DIR, 'task-comments.db') });
+      try {
+        const adapter = createTaskCommentReplyAdapter({
+          appId,
+          store,
+          commentApi: createSdkTaskV2CommentApi({ client: getClient() }),
+        });
+        await adapter.reply({
+          ...taskCommentReplyEndpoint,
+          content: message,
+          idempotencyKey: taskCommentReplyIdempotencyKey({
+            ...taskCommentReplyEndpoint,
+            content: message,
+          }),
+        });
+      } finally {
+        store.close();
+      }
     } else {
-      await sendText(endpointId, message);
-      await recordOutgoing(message);
+      const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
+      let streamed = false;
+      if (assistantRequestId && !mediaMatch) {
+        try {
+          const responseStream = createConversationResponseStream({ client: getClient() });
+          const result = await responseStream.completeWithFullAnswer({
+            requestId: assistantRequestId,
+            output: message,
+          });
+          streamed = result.handled === true;
+        } catch (error) {
+          if (error?.code === 'ASSISTANT_TERMINAL_CONFLICT') throw error;
+          console.warn(`[feishu] Same-card completion failed; using full-answer fallback: ${error.message}`);
+        }
+      }
+
+      if (streamed) {
+        await recordOutgoing(message);
+      } else if (mediaMatch) {
+        const [, mediaType, mediaPath] = mediaMatch;
+        await sendMedia(mediaType, mediaPath);
+        await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');
+      } else {
+        await sendText(endpointId, message);
+        await recordOutgoing(message);
+      }
     }
     // Mark the trigger message as replied (for typing indicator removal)
     markTypingDone(parsedEndpoint.msg);

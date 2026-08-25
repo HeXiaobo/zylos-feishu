@@ -64,8 +64,7 @@ import {
   isTaskV2Enabled,
   TASK_V2_STATUS_EVENT,
 } from './lib/task-v2-runtime-policy.js';
-import { openTaskCommentStore } from './lib/task-comment-store.js';
-import { createTaskCommentEventHandlers } from './lib/task-comment-event.js';
+import { initializeTaskCommentIntake } from './lib/task-comment-intake.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -2211,6 +2210,10 @@ function startWebhook(creds) {
       }
     }
     if (eventType === 'task.task.comment.updated_v1') {
+      if (typeof taskCommentEventHandlers[eventType] !== 'function') {
+        console.warn('[feishu] Task comment intake is disabled; acknowledging without processing');
+        return res.status(200).json({ code: 0, ignored: 'task_comments_disabled' });
+      }
       try {
         await taskCommentEventHandlers[eventType](event);
         return res.status(200).json({ code: 0 });
@@ -2379,19 +2382,26 @@ if (!creds.app_id || !creds.app_secret) {
   process.exit(1);
 }
 
-taskCommentStore = openTaskCommentStore({
-  dbPath: path.join(DATA_DIR, 'task-comments.db'),
-});
-taskCommentEventHandlers = createTaskCommentEventHandlers({
-  appId: creds.app_id,
-  store: taskCommentStore,
-  onError(error) {
-    console.error(`[feishu] Task comment event rejected: ${error.message}`);
-  },
-});
-
 // Fetch bot identity, then start the selected transport
 (async () => {
+  try {
+    const taskCommentIntake = await initializeTaskCommentIntake({
+      enabled: process.env.FEISHU_TASK_COMMENTS_ENABLED === '1',
+      appId: creds.app_id,
+      dbPath: path.join(DATA_DIR, 'task-comments.db'),
+      onError(error) {
+        console.error(`[feishu] Task comment event rejected: ${error.message}`);
+      },
+    });
+    taskCommentStore = taskCommentIntake.store;
+    taskCommentEventHandlers = taskCommentIntake.eventHandlers;
+    console.log(`[feishu] Task comment intake: ${taskCommentStore ? 'enabled' : 'disabled'}`);
+  } catch (err) {
+    console.error(`[feishu] Task comment intake failed to initialize: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
   try {
     const client = new Lark.Client({
       appId: creds.app_id,

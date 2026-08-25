@@ -43,7 +43,9 @@ function normalizeMapping(rawMapping) {
   const mapping = requireRecord(rawMapping, 'Task GUID mapping');
   return {
     taskId: requireText(mapping.taskId, 'Task GUID mapping.taskId'),
-    wakeTarget: requireRecord(mapping.wakeTarget, 'Task GUID mapping.wakeTarget'),
+    wakeTarget: mapping.wakeTarget === null || mapping.wakeTarget === undefined
+      ? null
+      : requireRecord(mapping.wakeTarget, 'Task GUID mapping.wakeTarget'),
   };
 }
 
@@ -134,19 +136,24 @@ export function createTaskCommentWorker({
         ]),
       };
       const result = await conversation.record(command);
-      await wakeAgent({
-        taskId: mapping.taskId,
-        target: mapping.wakeTarget,
-        commentEventId: requireText(result?.event?.id, 'Core conversation event ID'),
-        commentId: command.commentId,
-        replyContext: {
-          channel: 'feishu-task-v2',
-          appId: normalizedAppId,
-          taskGuid: entry.taskGuid,
-          replyToCommentId: comment.id,
-        },
-        idempotencyKey: `${command.idempotencyKey}:wake`,
-      });
+      if (mapping.wakeTarget) {
+        await wakeAgent({
+          taskId: mapping.taskId,
+          target: mapping.wakeTarget,
+          commentEventId: requireText(result?.event?.id, 'Core conversation event ID'),
+          commentId: command.commentId,
+          actorId: command.actorId,
+          body: command.body,
+          occurredAt: command.occurredAt,
+          replyContext: {
+            channel: 'feishu-task-v2',
+            appId: normalizedAppId,
+            taskGuid: entry.taskGuid,
+            replyToCommentId: comment.id,
+          },
+          idempotencyKey: `${command.idempotencyKey}:wake`,
+        });
+      }
       store.recordObserved({
         appId: normalizedAppId,
         taskGuid: entry.taskGuid,
@@ -171,13 +178,6 @@ export function createTaskCommentWorker({
       ]),
     };
     const result = await conversation.record(command);
-    await wakeAgent({
-      taskId: mapping.taskId,
-      target: mapping.wakeTarget,
-      commentEventId: requireText(result?.event?.id, 'Core conversation event ID'),
-      commentId: command.commentId,
-      idempotencyKey: `${command.idempotencyKey}:wake`,
-    });
     return { outcome: 'tombstone_recorded', command, result };
   }
 
