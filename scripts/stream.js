@@ -1,8 +1,15 @@
 #!/usr/bin/env node
 
+import os from 'node:os';
+import path from 'node:path';
+
+import dotenv from 'dotenv';
+
 import { getClient } from '../src/lib/client.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
 import { createConversationResponseDelivery } from '../src/lib/conversation-response-delivery.js';
+
+dotenv.config({ path: path.join(process.env.HOME || os.homedir(), 'zylos/.env') });
 
 function readStdin() {
   return new Promise((resolve, reject) => {
