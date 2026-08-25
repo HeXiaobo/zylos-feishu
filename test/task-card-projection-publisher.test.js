@@ -333,6 +333,43 @@ test('SDK publisher converts a message ID and performs one CardKit full update',
   assert.equal(JSON.parse(updates[0].data.card.data).schema, '2.0');
 });
 
+test('SDK publisher treats an already-applied CardKit sequence as an idempotent replay', async () => {
+  const signer = createTaskActionContextSigner({ secret: SECRET, clock: () => NOW });
+  let updates = 0;
+  const client = {
+    im: { message: { async create() { throw new Error('create must not run'); } } },
+    cardkit: {
+      v1: {
+        card: {
+          async idConvert() {
+            return { code: 0, data: { card_id: 'AA-replayed-card' } };
+          },
+          async update() {
+            updates += 1;
+            return { code: 300317, msg: 'sequence number compare failed' };
+          },
+        },
+      },
+    },
+  };
+  const publisher = createSdkTaskCardProjectionPublisher({
+    client,
+    issueTaskActionContext: claims => signer.issue(claims),
+    clock: () => NOW,
+    actionContextTtlMs: 10 * 60_000,
+  });
+
+  const result = await publisher.updateTask({
+    target: { receiveId: 'ou_acceptor', receiveIdType: 'open_id' },
+    externalId: 'om_replayed_task',
+    task: task({ state: 'done', version: 8 }),
+    idempotencyKey: 'feishu:update:task-projection-1:8',
+  });
+
+  assert.deepEqual(result, { externalId: 'om_replayed_task' });
+  assert.equal(updates, 1);
+});
+
 test('fails closed on ambiguous request fields and unbounded identities', async () => {
   const signer = createTaskActionContextSigner({ secret: SECRET, clock: () => NOW });
   const publisher = createTaskCardProjectionPublisher({

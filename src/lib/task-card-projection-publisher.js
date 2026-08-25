@@ -85,6 +85,11 @@ function taskVersionSequence(version) {
   return version * 10 + 9;
 }
 
+function isAlreadyAppliedSequence(response) {
+  return response?.code === 300317
+    && /sequence (?:number compare failed|is not increasing)/i.test(response?.msg || '');
+}
+
 function normalizeTarget(value) {
   const target = requireRecord(value, 'target');
   requireExactFields(target, TARGET_FIELDS, 'target');
@@ -201,6 +206,13 @@ export function createSdkTaskCardProjectionPublisher(input) {
         sequence: updateOptions.sequence,
       },
     });
+    // CardKit rejects an at-least-once replay after the first request already
+    // advanced the card sequence. Under this Adapter's single-writer,
+    // task-version-derived sequence contract, that rejection proves the same
+    // version (or a newer one) already won and is safe to acknowledge.
+    if (isAlreadyAppliedSequence(response)) {
+      return { success: true, replayed: true };
+    }
     if (response?.code !== 0) {
       return {
         success: false,
