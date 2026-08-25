@@ -272,6 +272,25 @@ test('exposes the exact WebSocket callback key and forwards its authenticated pa
   });
 });
 
+test('uses a specialized success toast returned by a non-task card action', async () => {
+  const handlers = createTaskCardEventHandlers({
+    handleTaskCardAction: async () => ({
+      toast: { type: 'success', content: '已发送可复制文本' },
+    }),
+    onError() {},
+  });
+
+  const response = await handlers['card.action.trigger']({
+    context: { open_message_id: 'om_copy' },
+    operator: { open_id: 'ou_copy' },
+    action: { tag: 'button', value: { action: 'assistant_response_copy' } },
+  });
+
+  assert.deepEqual(response, {
+    toast: { type: 'success', content: '已发送可复制文本' },
+  });
+});
+
 test('accepts the SDK legacy verified webhook callback shape', async () => {
   const contexts = createTaskActionContextSigner({
     secret: SECRET,
