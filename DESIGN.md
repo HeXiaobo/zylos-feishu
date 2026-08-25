@@ -3,7 +3,7 @@
 **Version**: v1.0
 **Date**: 2026-02-14
 **Author**: Zylos Team
-**Repository**: https://github.com/zylos-ai/zylos-feishu
+**Repository**: https://github.com/HeXiaobo/zylos-feishu
 **Status**: Implemented
 
 ---

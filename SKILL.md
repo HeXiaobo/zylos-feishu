@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.6
+version: 0.3.7-3ai.1
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),
@@ -33,8 +33,8 @@ lifecycle:
     - data/
 
 upgrade:
-  repo: zylos-ai/zylos-feishu
-  branch: main
+  repo: HeXiaobo/zylos-feishu
+  branch: codex/mylos-compat-release
 
 config:
   required:
@@ -171,6 +171,13 @@ this signing secret inside the component; Commitment Core receives only the
 narrow publisher Interface. Cards use Card JSON 2.0, stable create UUIDs, Core
 task versions as CardKit update sequences, and signed callback contexts.
 
+The paired Core/Feishu release requires Node.js 20.20.0 or newer. Before the
+canary, grant `task:task:read`, `task:task:write`, and task-comment read/write
+permissions, then subscribe to `task.task.updated_v1`,
+`task.task.comment.updated_v1`, and `card.action.trigger`. Task v2 status sync
+requires `COMMITMENT_FEISHU_TASK_V2_ENABLED=1`; comment sync additionally
+requires `FEISHU_TASK_COMMENTS_ENABLED=1`.
+
 Do not start projection implicitly. An operator must first register one
 history policy in Commitment Core (`from_now` for a new business canary;
 `from_beginning` only after reviewing all existing tasks), then run one bounded
@@ -282,8 +289,9 @@ After changes, restart: `pm2 restart zylos-feishu`
 
 ## Downloading Media by Resource Key
 
-In smart group mode, images and files sent without @mention are logged with
-metadata only (image_key/file_key). Use `download.js` to fetch them on demand:
+In smart group mode, authorized images and files sent without @mention use the
+normal media path. For resource keys surfaced only in historical context, use
+`download.js` to fetch them on demand:
 
 ```bash
 # Download image
@@ -420,14 +428,15 @@ DM and group access are controlled by **independent** top-level policies:
 2. `groupPolicy` = `open`? → respond to @mentions from any group
 3. `groupPolicy` = `allowlist`? → only configured groups; unlisted groups → only owner passes, others dropped silently
 4. Per-group `allowFrom` set? → only listed senders pass (owner always bypasses)
-5. Smart group (mode: `smart`)? → receive all messages, no @mention needed
-6. Not smart? → only @mentions are processed, other messages are logged only
+5. Smart group (mode: `smart`)? → receive ordinary chat without @mention; task protocols remain mention-gated
+6. Not smart? → only exact bot @mentions are processed; other messages are ignored before content parsing
 
 **Key points:**
 - Owner always bypasses all access checks
 - `dmPolicy` and `groupPolicy` are fully independent — changing one never affects the other
 - Group access is controlled by `groupPolicy` + `groups` config + per-group `allowFrom`
 - No user-level whitelist for groups; use per-group `allowFrom` if you need to restrict specific senders
+- Smart mode is opt-in compatibility behavior. A no-mention smart message is not mapped into the structured Commitment Core task protocol.
 
 ### Groups Config Format
 

@@ -1,6 +1,6 @@
 {
   "name": "zylos-feishu",
-  "version": "0.3.6",
+  "version": "0.3.7-3ai.1",
   "description": "Feishu communication channel",
   "type": "module",
   "main": "src/index.js",
@@ -13,13 +13,13 @@
   "larkCli": {
     "version": "1.0.81"
   },
-  "homepage": "https://github.com/zylos-ai/zylos-feishu#readme",
+  "homepage": "https://github.com/HeXiaobo/zylos-feishu#readme",
   "bugs": {
-    "url": "https://github.com/zylos-ai/zylos-feishu/issues"
+    "url": "https://github.com/HeXiaobo/zylos-feishu/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zylos-ai/zylos-feishu.git"
+    "url": "git+https://github.com/HeXiaobo/zylos-feishu.git"
   },
   "keywords": [
     "zylos",
@@ -29,7 +29,7 @@
   "author": "Zylos AI",
   "license": "MIT",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.20.0"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.72.0",

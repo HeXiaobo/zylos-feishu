@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-3ai.1] - 2026-08-25
+
 ### Added
+- Safe response streaming, durable WorkIntake confirmations, Task v2 projection and reverse events, reliable task-comment reconciliation, and CardKit replay idempotency from the task-management MVP integration branch.
 - Fork-only `@mention` resolution module (`src/lib/mention.js`): outgoing
   `@name` references can be resolved from a paginated source-group member sync
   plus a config-driven override map. The cache is written atomically and has a
@@ -16,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolation, override priority, and unknown/empty-ID fallbacks.
 
 ### Changed
+- Release metadata and the component upgrade route now point to `HeXiaobo/zylos-feishu` branch `codex/mylos-compat-release` so fork deployments do not drift back to the canonical component.
+- Explicit smart groups retain legacy no-mention conversation handling, while task and WorkIntake protocols remain exact-mention gated.
 - Plain-text sends use Feishu rich-text `post` content when configured names
   resolve successfully; markdown-card sends use the verified interactive-card
   `<at id=ou_xxx></at>` form. Existing structured `<at user_id="...">` input

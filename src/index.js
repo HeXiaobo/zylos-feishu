@@ -73,6 +73,7 @@ import {
   processInboundEventInboxOnce,
 } from './lib/inbound-event-inbox.js';
 import { normalizeInboundMessageEvent } from './lib/inbound-message-event.js';
+import { decideGroupActivation } from './lib/group-activation-policy.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -709,6 +710,18 @@ function updateCursor(chatId, messageId) {
 function resolveGroupConfig(chatId) {
   const groups = config.groups || {};
   return groups[chatId];
+}
+
+/**
+ * Smart mode must be explicitly configured for the chat. Legacy smart_groups
+ * remains supported so existing Mylos deployments do not silently stop
+ * receiving their operational group traffic after the upgrade.
+ */
+function isSmartGroup(chatId) {
+  const normalizedChatId = chatId === undefined || chatId === null ? '' : String(chatId);
+  const groupConfig = resolveGroupConfig(normalizedChatId);
+  if (groupConfig?.mode === 'smart' || groupConfig?.requireMention === false) return true;
+  return (config.smart_groups || []).some(group => String(group.chat_id) === normalizedChatId);
 }
 
 /**
@@ -1824,14 +1837,18 @@ async function handleMessage(data) {
   // DEBUG: log threading fields for analysis
   console.log(`[feishu] DEBUG threading: msg=${messageId} root=${rootId} parent=${parentId} thread=${threadId} upper=${upperMessageId}`);
 
-  // F2 deliberately does not listen to whole-group conversation. A group
-  // message must @玥然 before content parsing, logging, history, downloads, or
-  // C4/WorkIntake processing can occur, even if an old config says "smart".
+  // Mention-only is the safe default. Explicit smart groups retain the legacy
+  // no-mention conversation path, while task protocols stay mention-gated.
   const mentionedAtIngress = chatType === 'group' && hasExactBotMention(mentions, {
     botOpenId,
     botAppId,
   });
-  if (chatType === 'group' && !mentionedAtIngress) {
+  const groupActivation = decideGroupActivation({
+    chatType,
+    mentionedBot: mentionedAtIngress,
+    smartMode: chatType === 'group' && isSmartGroup(chatId),
+  });
+  if (!groupActivation.process) {
     console.log(`[feishu] Group message ${messageId} ignored: bot not mentioned`);
     return;
   }
@@ -1922,21 +1939,23 @@ async function handleMessage(data) {
       logText = text;
     }
 
-    const taskInput = await handleAuthorizedTaskInput({
-      message,
-      text: explicitTaskText,
-      actorId: senderOpenId || senderUserId,
-      chatType,
-      chatId,
-      senderUserId,
-      senderOpenId,
-      messageId,
-      timestamp: data._timestamp || null,
-      mentions,
-      threadId,
-      rootId,
-      parentId,
-    });
+    const taskInput = groupActivation.allowTaskIntake
+      ? await handleAuthorizedTaskInput({
+        message,
+        text: explicitTaskText,
+        actorId: senderOpenId || senderUserId,
+        chatType,
+        chatId,
+        senderUserId,
+        senderOpenId,
+        messageId,
+        timestamp: data._timestamp || null,
+        mentions,
+        threadId,
+        rootId,
+        parentId,
+      })
+      : { handled: false, route: null };
     if (taskInput.handled) return;
     const taskRoute = taskInput.route;
 
@@ -2109,7 +2128,9 @@ async function handleMessage(data) {
 
     await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
 
-    console.log(`[feishu] Bot @mentioned in group ${chatId}`);
+    console.log(groupActivation.smartMode
+      ? `[feishu] Smart-group message accepted without @mention in ${chatId}`
+      : `[feishu] Bot @mentioned in group ${chatId}`);
     await preloadGroupMembers(chatId);
     const contextMessages = await getGroupContext(chatId, messageId);
     updateCursor(chatId, messageId);
@@ -2192,7 +2213,13 @@ async function handleMessage(data) {
       return;
     }
 
-    const msg = formatMessage('group', senderName, cleanText || text, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
+    const msg = formatMessage('group', senderName, cleanText || text, contextMessages, null, {
+      quotedContent,
+      threadContext,
+      threadRootId,
+      groupName: getGroupName(chatId),
+      smartHint: groupActivation.smartMode,
+    });
     const workIntakeEnvelope = taskRoute?.kind === 'task-intent'
       ? null
       : buildNaturalWorkIntakeEnvelope({

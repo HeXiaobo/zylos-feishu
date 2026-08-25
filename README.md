@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg" alt="Node.js"></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D20.20.0-brightgreen.svg" alt="Node.js"></a>
   <a href="https://discord.gg/GS2J39EGff"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://x.com/ZylosAI"><img src="https://img.shields.io/badge/X-follow-000000?logo=x&logoColor=white" alt="X"></a>
   <a href="https://zylos.ai"><img src="https://img.shields.io/badge/website-zylos.ai-blue" alt="Website"></a>
@@ -26,7 +26,7 @@
 ---
 
 - **Talk through Feishu** — your AI agent speaks Feishu, both private chats and group conversations
-- **Explicit group activation** — group messages are processed only when the bot is @mentioned
+- **Explicit group activation** — group messages require @mention by default; trusted groups can opt into legacy smart mode
 - **Trusted owner setup** — owner identity is explicitly configured; inbound messages cannot claim admin
 - **Rich Feishu integration** — documents, spreadsheets, calendar — not just messaging
 
@@ -69,6 +69,7 @@ zylos uninstall feishu
 |----------|--------------|
 | Private chat (owner/whitelisted) | Responds via Claude |
 | @mention in allowed group | Responds with recent context |
+| Message in an explicitly configured smart group | Responds without @mention; structured task intake remains disabled |
 | Owner @mention in any group | Always responds |
 | Unknown user | Ignored |
 
@@ -96,8 +97,9 @@ WorkIntake is opt-in. Set `workIntake.enabled` in
 
 `mode` can be `owner`, `tenant_members`, `departments`, or `allowlist`.
 Non-owner policies require an exact tenant match and every decision is appended
-to `logs/member-access-audit.jsonl`. Group intake always requires @mention;
-the old smart/no-mention behavior is not used by this build.
+to `logs/member-access-audit.jsonl`. Group task and WorkIntake entry always
+require an exact bot @mention. Smart mode affects ordinary conversation only;
+no-mention messages are not mapped into the structured task protocol.
 Stable confirmation data is persisted to a local `0600` outbox before delivery.
 Each attempt signs a fresh card, and transient failures or process restarts retry
 with the same Feishu UUID.
