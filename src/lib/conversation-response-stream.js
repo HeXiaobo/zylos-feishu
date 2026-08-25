@@ -174,6 +174,7 @@ function phaseForEvent(event) {
     case 'RunQueued': return '⏳ 排队中';
     case 'RunStarted': return '▶️ 已开始处理';
     case 'ProgressUpdated': return publicProgressText(event.payload);
+    case 'OutputDelta': return '✍️ 正在生成回答';
     case 'RunCompleted': return '✅ 已完成';
     case 'RunFailed': return event.payload?.retryable
       ? '⚠️ 本次处理未完成，可重试'
@@ -185,6 +186,7 @@ function phaseForEvent(event) {
 function progressForEvent(event) {
   if (event.type === 'RunStarted') return '正在分析问题';
   if (event.type === 'ProgressUpdated') return publicProgressText(event.payload);
+  if (event.type === 'OutputDelta') return '正在生成回答';
   return null;
 }
 
@@ -216,6 +218,22 @@ function appendPublicReasoning(state, delta) {
   state.publicReasoning = `${omission}${kept.reverse().join('')}`;
 }
 
+function renderProcessTrace(progress, publicReasoning) {
+  const stages = progress.map((step, index) => `${index + 1}. ${step}`).join('\n');
+  const reasoning = publicReasoning.trim();
+  return [
+    '**处理过程（实时）**',
+    '_仅展示可公开的阶段与工作摘要，不含模型隐藏思维；完成后自动收起_',
+    stages,
+    reasoning ? `\n**公开工作摘要**\n${reasoning}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function clearTransientProcess(state) {
+  state.progress = [];
+  state.publicReasoning = '';
+}
+
 function renderCard({ phase, answer, progress = [], publicReasoning = '', streaming, part, totalParts }) {
   const continuation = part > 0
     ? `\n\n_续 ${part + 1}${totalParts > 1 ? ` / ${totalParts}` : ''}_`
@@ -245,13 +263,11 @@ function renderCard({ phase, answer, progress = [], publicReasoning = '', stream
           element_id: ANSWER_ELEMENT_ID,
           content: `${answer || (streaming ? '_等待回答…_' : '_没有可显示的回答_')}${continuation}`,
         },
-        ...(publicReasoning || progress.length > 0
+        ...(streaming && (publicReasoning || progress.length > 0)
           ? [{
               tag: 'markdown',
               element_id: PROGRESS_ELEMENT_ID,
-              content: publicReasoning
-                ? `**处理思路（实时）**\n_由模型公开输出的工作思路，不含系统隐藏思维_\n${publicReasoning.trim()}`
-                : `**公开推理摘要**\n_工作阶段摘要，不包含模型内部思维_\n${progress.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
+              content: renderProcessTrace(progress, publicReasoning),
             }]
           : []),
       ],
@@ -618,6 +634,7 @@ export function createConversationResponseStream({
     state.output = output;
     state.status = status;
     state.phase = phase;
+    clearTransientProcess(state);
     state.compatibilityTerminal = true;
     await render(state, { terminal: true, purpose: 'compatibility-terminal' });
     save(state);
@@ -783,10 +800,12 @@ export function createConversationResponseStream({
             if (event.type === 'RunCompleted') {
               canonicalOutput = event.payload.output;
               canonicalStatus = 'completed';
+              clearTransientProcess(state);
               terminal = true;
             }
             if (event.type === 'RunFailed') {
               canonicalStatus = 'failed';
+              clearTransientProcess(state);
               terminal = true;
             }
           } else {
@@ -801,10 +820,12 @@ export function createConversationResponseStream({
             if (event.type === 'RunCompleted') {
               state.output = event.payload.output;
               state.status = 'completed';
+              clearTransientProcess(state);
               terminal = true;
             }
             if (event.type === 'RunFailed') {
               state.status = 'failed';
+              clearTransientProcess(state);
               terminal = true;
             }
           }
