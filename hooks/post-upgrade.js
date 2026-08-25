@@ -16,13 +16,13 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
-  requireMinCoreVersion,
+  requireCompatibleCore,
   installLarkCliBinary,
   installLarkCliSkills,
   syncCredentialsToLarkCli,
 } from './post-install-shared.js';
 
-requireMinCoreVersion();
+requireCompatibleCore();
 
 const __filename_hook = fileURLToPath(import.meta.url);
 const __dirname_hook = path.dirname(__filename_hook);

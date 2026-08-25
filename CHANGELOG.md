@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-3ai.2] - 2026-08-25
+
+### Added
+- A machine-readable capability manifest covering response streaming, WorkIntake, task projections, and task comments.
+- A fail-closed Core protocol check in pre-install and pre-upgrade hooks.
+
+### Changed
+- The fork upgrade route now points to the paired `codex/mylos-capability-bundle-rc` branch.
+
 ## [0.3.7-3ai.1] - 2026-08-25
 
 ### Added
