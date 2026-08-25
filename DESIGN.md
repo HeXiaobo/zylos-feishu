@@ -423,6 +423,64 @@ node send.js "oc_xxx" "[MEDIA:file]/path/to/document.pdf"
 [Feishu DM] Howard said: [image] What is this ---- file: ~/zylos/components/feishu/media/feishu-xxx.png
 ```
 
+### 4.5 Task v2 Comment and Reliable Notification Seam
+
+The official Node SDK `EventDispatcher` registers
+`task.task.comment.updated_v1`. Its handler performs only strict event
+normalization and a synchronous SQLite inbox write, then returns. It never
+calls Task v2, Commitment Core, C4, or an Agent before acknowledging.
+
+`createTaskCommentWorker(...)` consumes the inbox behind three narrow injected
+Interfaces:
+
+```text
+taskMapping.resolve({ appId, taskGuid }) -> { taskId, wakeTarget }
+conversation.record(command) -> { event, comment }
+wakeAgent({ taskId, target, commentEventId, commentId, replyContext, idempotencyKey })
+```
+
+`taskMapping` is the only F3 integration seam. Tests use an in-memory fake;
+integration must resolve the F3 Task GUID `ExternalLink` and return the linked
+Core Task plus its Agent/session wake target. No Task v2 or SDK type crosses
+into Core.
+
+`wakeAgent` must durably honor its `idempotencyKey`: Core comment persistence
+can succeed before inbox acknowledgement, so a crash retry deliberately calls
+the wake seam again with the same key. Its opaque `replyContext` carries the
+original App, Task GUID, and comment ID so an Agent answer can set the exact
+`reply_to_comment_id`; Core does not inspect this platform context.
+
+The Worker reads content, author, timestamps, resource identity, and
+`reply_to_comment_id` through `client.task.v2.comment.get`. It maps creates and
+revisions to Core append-only comment commands. A confirmed missing/deleted
+comment maps to a Core deletion tombstone. Inbox delivery uses app/event and
+business-key deduplication, fenced leases, retry, and dead-letter state.
+
+`createTaskCommentReplyAdapter(...)` writes Agent answers with
+`client.task.v2.comment.create` and `reply_to_comment_id`. Its durable outbound
+ledger records the exact returned Feishu comment ID for echo suppression.
+Ambiguous transport failures are dead-lettered and not automatically resent,
+because Task v2 comment creation has no reusable idempotency token and a blind
+retry could duplicate an Agent reply.
+
+The caller records the Agent response in Core `TaskConversation` first, then
+uses that immutable Core event identity as the reply Adapter idempotency key.
+The Adapter is a platform projection; suppressing its returned Feishu comment
+echo therefore does not remove the Agent response from Core history.
+
+`createTaskCommentReconciler(...)` lists comments every 5–10 minutes for active
+Task mappings, including mappings whose Task was not created by this App. Done
+and cancelled Tasks remain eligible for a configurable 24–72 hour grace
+window. Reconciliation enqueues the same durable work path and detects deleted
+comments previously observed locally.
+
+Core `NotificationPolicy` output is consumed by
+`createFeishuNotificationAdapter(...)`. Each `event + recipient + feishu-im`
+delivery has a durable receipt; ordinary deliveries use a 30–60 second merge
+window and per-recipient rate limit. Review and explicit action-required
+notices are immediate. The SDK sender uses a stable Feishu message UUID so a
+crash before the local acknowledgement does not create another IM.
+
 ---
 
 ## 5. Configuration

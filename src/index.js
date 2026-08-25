@@ -64,6 +64,8 @@ import {
   isTaskV2Enabled,
   TASK_V2_STATUS_EVENT,
 } from './lib/task-v2-runtime-policy.js';
+import { openTaskCommentStore } from './lib/task-comment-store.js';
+import { createTaskCommentEventHandlers } from './lib/task-comment-event.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -101,6 +103,8 @@ let botAppName = '';
 let wsClient = null;
 let webhookServer = null;
 let isShuttingDown = false;
+let taskCommentStore = null;
+let taskCommentEventHandlers = Object.freeze({});
 
 // Initialize
 let config = getConfig();
@@ -2145,6 +2149,7 @@ function startWebSocket(creds) {
       },
       ...taskV2EventHandlers,
       ...taskCardEventHandlers,
+      ...taskCommentEventHandlers,
     })
   });
 }
@@ -2203,6 +2208,15 @@ function startWebhook(creds) {
       } catch (error) {
         console.error(`[feishu] Task v2 status event failed: ${error.message}`);
         return res.status(503).json({ error: 'Task v2 status event unavailable' });
+      }
+    }
+    if (eventType === 'task.task.comment.updated_v1') {
+      try {
+        await taskCommentEventHandlers[eventType](event);
+        return res.status(200).json({ code: 0 });
+      } catch (error) {
+        console.error(`[feishu] Task comment inbox write failed: ${error.message}`);
+        return res.status(503).json({ error: 'Task comment intake unavailable' });
       }
     }
     let callback;
@@ -2341,7 +2355,11 @@ function shutdown() {
     wsClient.close({ force: false });
   }
 
-  const finalizeExit = () => process.exit(0);
+  const finalizeExit = () => {
+    taskCommentStore?.close();
+    taskCommentStore = null;
+    process.exit(0);
+  };
   if (webhookServer) {
     webhookServer.close(() => finalizeExit());
     setTimeout(finalizeExit, 1000).unref();
@@ -2360,6 +2378,17 @@ if (!creds.app_id || !creds.app_secret) {
   console.error('[feishu] FEISHU_APP_ID and FEISHU_APP_SECRET must be set in ~/zylos/.env');
   process.exit(1);
 }
+
+taskCommentStore = openTaskCommentStore({
+  dbPath: path.join(DATA_DIR, 'task-comments.db'),
+});
+taskCommentEventHandlers = createTaskCommentEventHandlers({
+  appId: creds.app_id,
+  store: taskCommentStore,
+  onError(error) {
+    console.error(`[feishu] Task comment event rejected: ${error.message}`);
+  },
+});
 
 // Fetch bot identity, then start the selected transport
 (async () => {
