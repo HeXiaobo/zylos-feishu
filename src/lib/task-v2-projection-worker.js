@@ -11,10 +11,17 @@ import { getClient } from './client.js';
 import { createTaskV2MemberMapper } from './task-v2-member-mapper.js';
 import {
   createTaskV2Projection,
+  TASK_V2_LINK_BACKEND,
   TASK_V2_PROJECTION,
 } from './task-v2-projection.js';
 import { collectTaskV2ReconciliationSnapshot } from './task-v2-reconciliation-snapshot.js';
 import { createSdkTaskV2Gateway } from './task-v2-sdk-adapter.js';
+import {
+  createTaskV2StatusInbox,
+  processTaskV2StatusInboxOnce,
+} from './task-v2-status-inbox.js';
+import { createTaskV2StatusEventHandler } from './task-v2-status-event.js';
+import { isTaskV2Enabled } from './task-v2-runtime-policy.js';
 
 const REGISTRATION_ACTOR = 'commitment-feishu-task-v2-projection';
 const DEFAULTS = Object.freeze({
@@ -94,13 +101,18 @@ export async function loadCommitmentProjectionDependencies({
   });
 }
 
-export function createTaskV2ProjectionRuntime({ env = process.env, client } = {}) {
+export function createTaskV2ProjectionRuntime({ env = process.env, client, statusInbox } = {}) {
   const appId = requireText(env.FEISHU_APP_ID, 'FEISHU_APP_ID');
+  const zylosDir = env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
   return Object.freeze({
+    appId,
     gateway: createSdkTaskV2Gateway({ client: client ?? getClient() }),
     memberMapper: createTaskV2MemberMapper({
       appId,
       agentAppIds: parseAgentAppIds(env.FEISHU_TASK_V2_AGENT_APP_IDS),
+    }),
+    statusInbox: statusInbox ?? createTaskV2StatusInbox({
+      directory: path.join(zylosDir, 'components/feishu/task-v2-status-inbox'),
     }),
   });
 }
@@ -132,6 +144,8 @@ export async function runTaskV2ProjectionOnce({
   operationId = randomUUID(),
   gateway,
   memberMapper,
+  appId,
+  statusInbox,
   openCore,
   processBatch,
 } = {}) {
@@ -144,7 +158,7 @@ export async function runTaskV2ProjectionOnce({
   if (typeof processBatch !== 'function') throw new TypeError('processBatch must be a function');
   const core = openCore();
   try {
-    let receipts = Object.freeze([]);
+    const receipts = [];
     const projection = createTaskV2Projection({ core, gateway, memberMapper });
     const summary = await processBatch({
       core,
@@ -156,28 +170,97 @@ export async function runTaskV2ProjectionOnce({
       maxAttempts,
       operationId,
       adapter: {
-        async publishBatch(request) {
-          receipts = await projection.publishBatch(request);
-          return receipts;
+        async publishDelivery({ delivery }) {
+          const [receipt] = await projection.publishBatch({ deliveries: [delivery] });
+          receipts.push(receipt);
+          return receipt;
         },
       },
     });
-    return Object.freeze({ ...summary, receipts });
+    const statusInboxSummary = statusInbox === undefined
+      ? null
+      : await processTaskV2StatusInboxOnce({
+        inbox: statusInbox,
+        handler: createTaskV2StatusEventHandler({ core, gateway, appId }),
+        limit,
+        retryAfterMs,
+        maxAttempts,
+      });
+    return Object.freeze({
+      ...summary,
+      receipts: Object.freeze(receipts),
+      ...(statusInboxSummary === null ? {} : { statusInbox: statusInboxSummary }),
+    });
   } finally {
     core.close();
   }
 }
 
-export async function runTaskV2Reconciliation({ openCore, reconcile, gateway, tasks } = {}) {
+export async function runTaskV2Reconciliation({
+  openCore,
+  reconcile,
+  gateway,
+  tasks,
+  repairStatus = false,
+  appId,
+} = {}) {
   if (typeof openCore !== 'function') throw new TypeError('openCore must be a function');
   if (typeof reconcile !== 'function') throw new TypeError('reconcile must be a function');
+  if (typeof repairStatus !== 'boolean') throw new TypeError('repairStatus must be a boolean');
   const core = openCore();
   try {
     const snapshot = await collectTaskV2ReconciliationSnapshot({ core, gateway, tasks });
+    const repairs = [];
+    if (repairStatus) {
+      const handler = createTaskV2StatusEventHandler({ core, gateway, appId });
+      for (const candidate of snapshot.statusRepairCandidates) {
+        repairs.push(await handler.handle({
+          event_id: `reconcile:${candidate.taskGuid}:${candidate.completedAt}`,
+          task_id: candidate.taskGuid,
+          app_id: appId,
+        }));
+      }
+    }
     return Object.freeze({
       ...reconcile({ expected: snapshot.expected, actual: snapshot.actual }),
       missingLinks: snapshot.missingLinks,
       linkMismatches: snapshot.linkMismatches,
+      repairs: Object.freeze(repairs),
+    });
+  } finally {
+    core.close();
+  }
+}
+
+export async function resolveTaskV2Url({ taskId, openCore, gateway } = {}) {
+  const normalizedTaskId = requireText(taskId, 'taskId');
+  if (typeof openCore !== 'function') throw new TypeError('openCore must be a function');
+  if (!gateway || typeof gateway.getTask !== 'function') {
+    throw new TypeError('gateway.getTask must be a function');
+  }
+  const core = openCore();
+  try {
+    if (!core.query({ taskId: normalizedTaskId })) {
+      throw new TypeError(`Core task not found: ${normalizedTaskId}`);
+    }
+    const links = core.externalLinks.query({
+      taskId: normalizedTaskId,
+      backend: TASK_V2_LINK_BACKEND,
+    });
+    if (!Array.isArray(links)) throw new TypeError('Core ExternalLink query must return an array');
+    if (links.length === 0) {
+      return Object.freeze({
+        status: 'unlinked', taskId: normalizedTaskId, taskGuid: null, url: null,
+      });
+    }
+    if (links.length > 1) throw new TypeError(`multiple Task v2 links found for ${normalizedTaskId}`);
+    const taskGuid = requireText(links[0].externalId, 'Task v2 ExternalLink externalId');
+    const remoteTask = await gateway.getTask(taskGuid);
+    return Object.freeze({
+      status: 'linked',
+      taskId: normalizedTaskId,
+      taskGuid,
+      url: requireText(remoteTask?.url, 'Task v2 URL'),
     });
   } finally {
     core.close();
@@ -225,11 +308,29 @@ async function main(args = process.argv.slice(2), env = process.env) {
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return;
   }
-  if (args.length === 1 && args[0] === 'reconcile') {
+  if (!isTaskV2Enabled(env)) {
+    throw new TypeError('COMMITMENT_FEISHU_TASK_V2_ENABLED=1 is required for Task v2 runtime commands');
+  }
+  if (
+    args[0] === 'reconcile'
+    && (args.length === 1 || (args.length === 2 && args[1] === '--repair-status'))
+  ) {
     const runtime = createTaskV2ProjectionRuntime({ env });
     const result = await runTaskV2Reconciliation({
       openCore: dependencies.openCore,
       reconcile: dependencies.reconcile,
+      gateway: runtime.gateway,
+      appId: runtime.appId,
+      repairStatus: args[1] === '--repair-status',
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  if (args.length === 2 && args[0] === 'url') {
+    const runtime = createTaskV2ProjectionRuntime({ env });
+    const result = await resolveTaskV2Url({
+      taskId: args[1],
+      openCore: dependencies.openCore,
       gateway: runtime.gateway,
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);
@@ -237,7 +338,7 @@ async function main(args = process.argv.slice(2), env = process.env) {
   }
   const once = args.length === 2 && args[0] === 'run' && args[1] === '--once';
   if (!once && !(args.length === 1 && args[0] === 'run')) {
-    throw new TypeError('usage: task-v2-projection-worker.js register --bootstrap-policy <from_now|from_beginning> | run [--once] | reconcile');
+    throw new TypeError('usage: task-v2-projection-worker.js register --bootstrap-policy <from_now|from_beginning> | run [--once] | reconcile [--repair-status] | url <core-task-id>');
   }
   const runtime = createTaskV2ProjectionRuntime({ env });
   const cycleOptions = {

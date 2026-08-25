@@ -57,9 +57,13 @@ import {
 } from './lib/work-intake-confirmation-card.js';
 import { createWorkIntakeConfirmationDelivery } from './lib/work-intake-confirmation-delivery.js';
 import { createWorkIntakeResultHandler } from './lib/work-intake-result.js';
-import { loadCommitmentProjectionDependencies } from './lib/task-v2-projection-worker.js';
-import { createSdkTaskV2Gateway } from './lib/task-v2-sdk-adapter.js';
-import { createTaskV2StatusEventHandler } from './lib/task-v2-status-event.js';
+import { createTaskV2StatusInbox } from './lib/task-v2-status-inbox.js';
+import { createTaskV2StatusEventIngestor } from './lib/task-v2-status-event.js';
+import {
+  createTaskV2EventHandlerEntries,
+  isTaskV2Enabled,
+  TASK_V2_STATUS_EVENT,
+} from './lib/task-v2-runtime-policy.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -102,6 +106,7 @@ let isShuttingDown = false;
 let config = getConfig();
 const connectionMode = config.connection_mode || 'websocket';
 const INTERNAL_SECRET = crypto.randomUUID();
+const taskV2Enabled = isTaskV2Enabled(process.env);
 // Persist token to file so send.js (spawned by C4 in a separate process tree) can read it
 const TOKEN_FILE = path.join(DATA_DIR, '.internal-token');
 try {
@@ -1068,19 +1073,32 @@ const taskCardEventHandlers = createTaskCardEventHandlers({
   },
 });
 
-async function handleTaskV2StatusEvent(event) {
-  const dependencies = await loadCommitmentProjectionDependencies({ env: process.env });
-  const core = dependencies.openCore();
-  try {
-    return await createTaskV2StatusEventHandler({
-      core,
-      gateway: createSdkTaskV2Gateway({ client: getClient() }),
+let taskV2StatusEventIngestor = null;
+function handleTaskV2StatusEvent(event) {
+  if (!taskV2Enabled) throw new Error('Task v2 capability is disabled');
+  if (!taskV2StatusEventIngestor) {
+    taskV2StatusEventIngestor = createTaskV2StatusEventIngestor({
       appId: process.env.FEISHU_APP_ID,
-    }).handle(event);
-  } finally {
-    core.close();
+      inbox: createTaskV2StatusInbox({
+        directory: path.join(DATA_DIR, 'task-v2-status-inbox'),
+      }),
+    });
   }
+  return taskV2StatusEventIngestor.handle(event);
 }
+
+const taskV2EventHandlers = createTaskV2EventHandlerEntries({
+  enabled: taskV2Enabled,
+  async handle(data) {
+    try {
+      const result = handleTaskV2StatusEvent(data);
+      console.log(`[feishu] Task v2 status event: ${result.status}`);
+    } catch (err) {
+      console.error(`[feishu] Error queuing Task v2 status event: ${err.message}`);
+      throw err;
+    }
+  },
+});
 
 function parseAuthorizedTaskMessage(message, text, actorId) {
   return parseExplicitTaskMessage({
@@ -2125,15 +2143,7 @@ function startWebSocket(creds) {
           console.error(`[feishu] Error handling message: ${err.message}`);
         }
       },
-      'task.task.updated_v1': async (data) => {
-        try {
-          const result = await handleTaskV2StatusEvent(data);
-          console.log(`[feishu] Task v2 status event: ${result.status}`);
-        } catch (err) {
-          console.error(`[feishu] Error handling Task v2 status event: ${err.message}`);
-          throw err;
-        }
-      },
+      ...taskV2EventHandlers,
       ...taskCardEventHandlers,
     })
   });
@@ -2185,9 +2195,9 @@ function startWebhook(creds) {
     }
 
     const eventType = event.header?.event_type;
-    if (eventType === 'task.task.updated_v1') {
+    if (taskV2Enabled && eventType === TASK_V2_STATUS_EVENT) {
       try {
-        const result = await handleTaskV2StatusEvent(event);
+        const result = handleTaskV2StatusEvent(event);
         console.log(`[feishu] Task v2 status event: ${result.status}`);
         return res.status(200).json({ ok: true });
       } catch (error) {

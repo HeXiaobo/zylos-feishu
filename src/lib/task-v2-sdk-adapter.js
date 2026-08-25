@@ -1,6 +1,7 @@
 const USER_ID_TYPE = 'open_id';
 const MARKER_SCHEMA = 'zylos.task-v2-projection/v1';
 const PERMANENT_FEISHU_CODES = new Set([99992402]);
+const MAX_SEARCH_PAGES = 1_000;
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -143,18 +144,37 @@ function createPayload(task, members, clientToken) {
   };
 }
 
-function patchPayload(task) {
+function patchPayload(task, current) {
+  const patch = {};
+  const updateFields = [];
+  const summary = requireText(task.title, 'task.title');
+  if (current.summary !== summary) {
+    patch.summary = summary;
+    updateFields.push('summary');
+  }
+  const description = descriptionFromTask(task);
+  if (current.description !== description) {
+    patch.description = description;
+    updateFields.push('description');
+  }
   const due = dueFromTask(task);
-  return {
-    task: {
-      summary: requireText(task.title, 'task.title'),
-      description: descriptionFromTask(task),
-      ...(due ? { due } : {}),
-      completed_at: completionFromTask(task),
-      extra: taskMarker(task),
-    },
-    update_fields: ['summary', 'description', 'due', 'completed_at', 'extra'],
-  };
+  const dueAt = due ? new Date(Number(due.timestamp)).toISOString() : null;
+  if (current.dueAt !== dueAt) {
+    if (due) patch.due = due;
+    updateFields.push('due');
+  }
+  const completedAt = completionFromTask(task);
+  const currentCompleted = current.completedAt !== null && current.completedAt !== '0';
+  const desiredCompleted = completedAt !== '0';
+  if (currentCompleted !== desiredCompleted) {
+    patch.completed_at = completedAt;
+    updateFields.push('completed_at');
+  }
+  if (current.coreTaskId !== task.id || current.coreTaskVersion !== task.version) {
+    patch.extra = taskMarker(task);
+    updateFields.push('extra');
+  }
+  return { task: patch, update_fields: updateFields };
 }
 
 /** SDK-backed tenant/bot Adapter. Tests inject a fake SDK client; no OAuth user token is used. */
@@ -221,11 +241,15 @@ export function createSdkTaskV2Gateway({ client } = {}) {
       const desiredMembers = normalizeMembers(members);
       try {
         const current = await getTask(guid);
-        const patched = taskFromResponse(await taskApi.patch({
-          path: { task_guid: guid },
-          params: { user_id_type: USER_ID_TYPE },
-          data: patchPayload(requireRecord(task, 'task')),
-        }), 'patch');
+        const normalizedTask = requireRecord(task, 'task');
+        const patch = patchPayload(normalizedTask, current);
+        const patched = patch.update_fields.length === 0
+          ? current
+          : taskFromResponse(await taskApi.patch({
+            path: { task_guid: guid },
+            params: { user_id_type: USER_ID_TYPE },
+            data: patch,
+          }), 'patch');
         await syncMembers(guid, current.members, desiredMembers, requireText(clientToken, 'clientToken'));
         return Object.freeze({ ...patched, members: Object.freeze(desiredMembers) });
       } catch (error) {
@@ -238,18 +262,41 @@ export function createSdkTaskV2Gateway({ client } = {}) {
     async findTasksByCoreTaskId(coreTaskId) {
       const expectedId = requireText(coreTaskId, 'coreTaskId');
       try {
-        const response = await taskApi.search({
-          params: { user_id_type: USER_ID_TYPE, page_size: 50 },
-          data: { query: `Zylos Core Task: ${expectedId}` },
-        });
-        if (response?.code !== 0) taskFromResponse(response, 'search');
-        const candidates = response?.data?.items ?? [];
         const tasks = [];
-        for (const candidate of candidates) {
-          const snapshot = await getTask(requireText(candidate.id, 'Task v2 search item id'));
-          if (snapshot.coreTaskId === expectedId) tasks.push(snapshot);
+        const seenTaskGuids = new Set();
+        const seenPageTokens = new Set();
+        let pageToken;
+        for (let page = 0; page < MAX_SEARCH_PAGES; page += 1) {
+          const response = await taskApi.search({
+            params: {
+              user_id_type: USER_ID_TYPE,
+              page_size: 50,
+              ...(pageToken ? { page_token: pageToken } : {}),
+            },
+            data: { query: `Zylos Core Task: ${expectedId}` },
+          });
+          if (response?.code !== 0) taskFromResponse(response, 'search');
+          const candidates = response?.data?.items ?? [];
+          for (const candidate of candidates) {
+            const taskGuid = requireText(candidate.id, 'Task v2 search item id');
+            if (seenTaskGuids.has(taskGuid)) continue;
+            seenTaskGuids.add(taskGuid);
+            const snapshot = await getTask(taskGuid);
+            if (snapshot.coreTaskId === expectedId) tasks.push(snapshot);
+          }
+          if (!response?.data?.has_more) return tasks;
+          const nextPageToken = requireText(response?.data?.page_token, 'Task v2 search page_token');
+          if (seenPageTokens.has(nextPageToken)) {
+            throw new FeishuTaskV2Error('Feishu Task v2 search repeated a page token', {
+              retryable: false,
+            });
+          }
+          seenPageTokens.add(nextPageToken);
+          pageToken = nextPageToken;
         }
-        return tasks;
+        throw new FeishuTaskV2Error('Feishu Task v2 search exceeded the page safety limit', {
+          retryable: false,
+        });
       } catch (error) {
         return wrapSdkFailure('search', error);
       }

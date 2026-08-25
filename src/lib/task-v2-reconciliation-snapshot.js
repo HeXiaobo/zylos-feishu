@@ -15,6 +15,23 @@ function projectionStateFromRemote(task) {
   return task.completedAt === null || task.completedAt === '0' ? 'open' : 'completed';
 }
 
+function queryAllCoreTasks(core) {
+  const tasks = [];
+  let cursor;
+  while (true) {
+    const page = core.query({ limit: 100, ...(cursor ? { cursor } : {}) });
+    if (!Array.isArray(page)) throw new TypeError('Core task query must return an array');
+    tasks.push(...page);
+    if (page.length < 100) return tasks;
+    const last = requireRecord(page.at(-1), 'Core task page tail');
+    const nextCursor = { updatedAt: last.updatedAt, taskId: last.id };
+    if (cursor?.updatedAt === nextCursor.updatedAt && cursor?.taskId === nextCursor.taskId) {
+      throw new TypeError('Core task query cursor did not advance');
+    }
+    cursor = nextCursor;
+  }
+}
+
 /** Collect platform-shaped inputs for Core's generic reconcileProjection Module. */
 export async function collectTaskV2ReconciliationSnapshot({ core, gateway, tasks } = {}) {
   if (!core || typeof core.query !== 'function' || typeof core.externalLinks?.query !== 'function') {
@@ -23,13 +40,14 @@ export async function collectTaskV2ReconciliationSnapshot({ core, gateway, tasks
   if (!gateway || typeof gateway.findTasksByCoreTaskId !== 'function') {
     throw new TypeError('gateway.findTasksByCoreTaskId must be a function');
   }
-  const coreTasks = tasks ?? core.query({ limit: 100 });
+  const coreTasks = tasks ?? queryAllCoreTasks(core);
   if (!Array.isArray(coreTasks)) throw new TypeError('tasks must be an array');
 
   const expected = [];
   const actual = [];
   const missingLinks = [];
   const linkMismatches = [];
+  const statusRepairCandidates = [];
   for (const [index, taskValue] of coreTasks.entries()) {
     const task = requireRecord(taskValue, `tasks[${index}]`);
     expected.push({ key: task.id, state: projectionStateFromCore(task) });
@@ -49,6 +67,17 @@ export async function collectTaskV2ReconciliationSnapshot({ core, gateway, tasks
         externalId: remote.guid,
         url: remote.url,
       });
+      if (
+        projectionStateFromCore(task) === 'open'
+        && projectionStateFromRemote(remote) === 'completed'
+        && links.some(link => link.externalId === remote.guid)
+      ) {
+        statusRepairCandidates.push({
+          taskId: task.id,
+          taskGuid: remote.guid,
+          completedAt: remote.completedAt,
+        });
+      }
     }
     for (const link of links) {
       if (!discoveredGuids.has(link.externalId)) {
@@ -61,5 +90,6 @@ export async function collectTaskV2ReconciliationSnapshot({ core, gateway, tasks
     actual: Object.freeze(actual),
     missingLinks: Object.freeze(missingLinks),
     linkMismatches: Object.freeze(linkMismatches),
+    statusRepairCandidates: Object.freeze(statusRepairCandidates),
   });
 }

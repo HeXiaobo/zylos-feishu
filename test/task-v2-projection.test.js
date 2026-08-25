@@ -9,7 +9,10 @@ import {
 } from '../src/lib/task-v2-projection.js';
 import { collectTaskV2ReconciliationSnapshot } from '../src/lib/task-v2-reconciliation-snapshot.js';
 import { createSdkTaskV2Gateway } from '../src/lib/task-v2-sdk-adapter.js';
-import { createTaskV2StatusEventHandler } from '../src/lib/task-v2-status-event.js';
+import {
+  createTaskV2StatusEventHandler,
+  createTaskV2StatusEventIngestor,
+} from '../src/lib/task-v2-status-event.js';
 
 const APP_ID = 'cli_zylos_yueran';
 const DUE_AT = '2026-08-28T10:00:00.000Z';
@@ -39,7 +42,13 @@ function fakeCore(tasks = [coreTask()]) {
   const core = {
     query(query) {
       if (query.taskId) return taskMap.get(query.taskId) ?? null;
-      return [...taskMap.values()].slice(0, query.limit ?? 50);
+      const tasks = [...taskMap.values()];
+      const cursorIndex = query.cursor
+        ? tasks.findIndex(task => (
+          task.updatedAt === query.cursor.updatedAt && task.id === query.cursor.taskId
+        ))
+        : -1;
+      return tasks.slice(cursorIndex + 1, cursorIndex + 1 + (query.limit ?? 50));
     },
     externalLinks: {
       query(query) {
@@ -284,6 +293,36 @@ test('native completion submits for review exactly once and never accepts for th
   })).status, 'already_in_review');
 });
 
+test('status event callback authenticates and durably enqueues without opening Core', () => {
+  const events = [];
+  const ingestor = createTaskV2StatusEventIngestor({
+    appId: APP_ID,
+    inbox: {
+      enqueue(event) {
+        events.push(event);
+        return { created: true, event };
+      },
+    },
+  });
+
+  assert.deepEqual(ingestor.handle({
+    header: { event_id: 'evt-queued', app_id: APP_ID },
+    event: { task_id: 'guid-queued' },
+  }), {
+    status: 'queued',
+    created: true,
+    eventId: 'evt-queued',
+    taskGuid: 'guid-queued',
+  });
+  assert.deepEqual(events, [{
+    event_id: 'evt-queued', task_id: 'guid-queued', app_id: APP_ID,
+  }]);
+  assert.throws(
+    () => ingestor.handle({ event_id: 'evt-other', task_id: 'guid-queued', app_id: 'cli_other' }),
+    /another App/,
+  );
+});
+
 test('reconciliation snapshots expose missing links, state drift, and duplicate native GUIDs', async () => {
   const harness = fakeCore([
     coreTask({ id: 'task-1', state: 'review' }),
@@ -314,6 +353,23 @@ test('reconciliation snapshots expose missing links, state drift, and duplicate 
   assert.equal(snapshot.actual.filter(record => record.key === 'task-1').length, 2);
   assert.deepEqual(snapshot.missingLinks, [{ taskId: 'task-2' }]);
   assert.deepEqual(snapshot.linkMismatches, []);
+});
+
+test('reconciliation walks every bounded Core page instead of silently truncating at 100 tasks', async () => {
+  const tasks = Array.from({ length: 101 }, (_, index) => coreTask({
+    id: `task-${String(index + 1).padStart(3, '0')}`,
+    updatedAt: '2026-08-25T10:00:00.000Z',
+  }));
+  const harness = fakeCore(tasks);
+
+  const snapshot = await collectTaskV2ReconciliationSnapshot({
+    core: harness.core,
+    gateway: { async findTasksByCoreTaskId() { return []; } },
+  });
+
+  assert.equal(snapshot.expected.length, 101);
+  assert.equal(snapshot.missingLinks.length, 101);
+  assert.equal(snapshot.expected.at(-1).key, 'task-101');
 });
 
 function sdkTask(overrides = {}) {
@@ -396,4 +452,96 @@ test('SDK Adapter uses tenant Task v2 create/patch/member calls with client_toke
   const found = await gateway.findTasksByCoreTaskId('task-1');
   assert.equal(found.length, 1);
   assert.equal(found[0].guid, 'guid-sdk');
+});
+
+test('SDK Adapter does not complete an already-completed native Task again on Core acceptance', async () => {
+  const calls = [];
+  const task = coreTask({
+    state: 'done',
+    version: 4,
+    updatedAt: '2026-08-26T11:00:00.000Z',
+  });
+  const members = createTaskV2MemberMapper({ appId: APP_ID }).map(task);
+  const current = sdkTask({
+    summary: task.title,
+    description: `${task.description}\n\nZylos Core Task: ${task.id}`,
+    due: { timestamp: String(Date.parse(DUE_AT)), is_all_day: false },
+    completed_at: '1787900000000',
+    members,
+    extra: JSON.stringify({
+      schema: 'zylos.task-v2-projection/v1',
+      coreTaskId: task.id,
+      coreTaskVersion: 3,
+    }),
+  });
+  const response = value => ({ code: 0, data: { task: value } });
+  const client = {
+    task: { v2: { task: {
+      async create() { throw new Error('unexpected create'); },
+      async get() { return response(current); },
+      async patch(payload) {
+        calls.push(payload);
+        if (payload.data.update_fields.includes('completed_at')) {
+          throw new Error('Feishu rejects completing an already-completed task');
+        }
+        return response({ ...current, extra: payload.data.task.extra });
+      },
+      async addMembers() { throw new Error('unexpected addMembers'); },
+      async removeMembers() { throw new Error('unexpected removeMembers'); },
+      async search() { throw new Error('unexpected search'); },
+    } } },
+  };
+
+  const updated = await createSdkTaskV2Gateway({ client }).updateTask({
+    taskGuid: current.guid,
+    task,
+    members,
+    clientToken: 'zt2_accept',
+  });
+
+  assert.equal(updated.guid, current.guid);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].data.update_fields, ['extra']);
+});
+
+test('SDK Adapter searches every Task page before deciding create-after-crash recovery is empty', async () => {
+  const searches = [];
+  const response = task => ({ code: 0, data: { task } });
+  const client = {
+    task: { v2: { task: {
+      async create() { throw new Error('unexpected create'); },
+      async patch() { throw new Error('unexpected patch'); },
+      async addMembers() { throw new Error('unexpected addMembers'); },
+      async removeMembers() { throw new Error('unexpected removeMembers'); },
+      async search(payload) {
+        searches.push(payload);
+        if (!payload.params.page_token) {
+          return {
+            code: 0,
+            data: { items: [{ id: 'guid-other' }], has_more: true, page_token: 'page-2' },
+          };
+        }
+        return {
+          code: 0,
+          data: { items: [{ id: 'guid-target' }], has_more: false },
+        };
+      },
+      async get({ path }) {
+        const coreTaskId = path.task_guid === 'guid-target' ? 'task-1' : 'task-other';
+        return response(sdkTask({
+          guid: path.task_guid,
+          extra: JSON.stringify({
+            schema: 'zylos.task-v2-projection/v1',
+            coreTaskId,
+            coreTaskVersion: 1,
+          }),
+        }));
+      },
+    } } },
+  };
+
+  const found = await createSdkTaskV2Gateway({ client }).findTasksByCoreTaskId('task-1');
+
+  assert.deepEqual(found.map(task => task.guid), ['guid-target']);
+  assert.deepEqual(searches.map(call => call.params.page_token ?? null), [null, 'page-2']);
 });

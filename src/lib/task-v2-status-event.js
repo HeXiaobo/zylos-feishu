@@ -38,6 +38,28 @@ function taskCommand(core, task, type, eventId, phase) {
   }, task.version);
 }
 
+export function createTaskV2StatusEventIngestor({ inbox, appId } = {}) {
+  if (!inbox || typeof inbox.enqueue !== 'function') {
+    throw new TypeError('inbox.enqueue must be a function');
+  }
+  const expectedAppId = requireText(appId, 'appId');
+  return Object.freeze({
+    handle(eventInput) {
+      const event = normalizeTaskV2StatusEvent(eventInput);
+      if (event.app_id !== expectedAppId) {
+        throw new TypeError('Task v2 status event belongs to another App');
+      }
+      const queued = inbox.enqueue(event);
+      return Object.freeze({
+        status: 'queued',
+        created: queued.created,
+        eventId: event.event_id,
+        taskGuid: event.task_id,
+      });
+    },
+  });
+}
+
 /**
  * Convert an App-owned Task status event back into Core commands.
  *

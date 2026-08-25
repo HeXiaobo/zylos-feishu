@@ -19,6 +19,10 @@ test('ordinary Feishu ecosystem cannot implicitly start task projection', () => 
     Object.hasOwn(ordinaryFeishu.env, 'COMMITMENT_FEISHU_TASK_V2_PROJECTION_AUTOSTART'),
     false,
   );
+  assert.equal(
+    Object.hasOwn(ordinaryFeishu.env, 'COMMITMENT_FEISHU_TASK_V2_ENABLED'),
+    false,
+  );
 });
 
 test('ships Task v2 as a second explicit projection process', () => {
@@ -39,6 +43,10 @@ test('ships Task v2 as a second explicit projection process', () => {
   assert.equal(projection.exec_mode, 'fork');
   assert.equal(projection.env.ZYLOS_DIR, path.join(os.homedir(), 'zylos'));
   assert.equal(projection.env.COMMITMENT_FEISHU_TASK_V2_PROJECTION_AUTOSTART, '1');
+  assert.equal(
+    Object.hasOwn(projection.env, 'COMMITMENT_FEISHU_TASK_V2_ENABLED'),
+    false,
+  );
 });
 
 test('ships a separate opt-in PM2 process for the durable Core projection worker', () => {

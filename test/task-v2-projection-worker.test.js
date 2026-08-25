@@ -4,7 +4,9 @@ import test from 'node:test';
 import { createTaskV2MemberMapper } from '../src/lib/task-v2-member-mapper.js';
 import { TASK_V2_PROJECTION } from '../src/lib/task-v2-projection.js';
 import {
+  createTaskV2ProjectionRuntime,
   initializeTaskV2Projection,
+  resolveTaskV2Url,
   runTaskV2Reconciliation,
   runTaskV2ProjectionOnce,
   superviseTaskV2Projection,
@@ -12,6 +14,12 @@ import {
 
 function fakeCore() {
   const calls = [];
+  const task = {
+    id: 'task-worker', title: 'Worker task', description: null, state: 'ready',
+    ownerId: 'ou_owner', acceptorId: 'ou_owner', assigneeId: 'agent:yueran',
+    dueAt: null, version: 1, createdAt: '2026-08-25T00:00:00.000Z',
+    updatedAt: '2026-08-25T00:00:00.000Z',
+  };
   const core = {
     outbox: {
       register(request) {
@@ -19,22 +27,42 @@ function fakeCore() {
         return { created: true, registration: request };
       },
     },
-    query() {
-      return {
-        id: 'task-worker', title: 'Worker task', description: null, state: 'ready',
-        ownerId: 'ou_owner', acceptorId: 'ou_owner', assigneeId: 'agent:yueran',
-        dueAt: null, version: 1, createdAt: '2026-08-25T00:00:00.000Z',
-        updatedAt: '2026-08-25T00:00:00.000Z',
-      };
+    query(query = {}) {
+      return query.taskId ? { ...task } : [{ ...task }];
     },
     externalLinks: {
-      query() { return []; },
+      query(query) { return query?.externalId ? null : []; },
       link() { return { created: true }; },
+    },
+    command(command, expectedVersion) {
+      assert.equal(expectedVersion, task.version);
+      calls.push(['command', command]);
+      if (command.type === 'StartTask') task.state = 'in_progress';
+      else if (command.type === 'SubmitForReview') task.state = 'review';
+      else throw new Error(`unexpected Core command: ${command.type}`);
+      task.version += 1;
+      return { task: { ...task } };
     },
     close() { calls.push(['close']); },
   };
   return { core, calls };
 }
+
+test('production runtime shares one App identity and an injectable durable status inbox', () => {
+  const statusInbox = { pending() {}, ack() {}, fail() {} };
+  const taskApi = {
+    async create() {}, async patch() {}, async get() {},
+    async addMembers() {}, async removeMembers() {}, async search() {},
+  };
+  const runtime = createTaskV2ProjectionRuntime({
+    env: { FEISHU_APP_ID: 'cli_yueran' },
+    client: { task: { v2: { task: taskApi } } },
+    statusInbox,
+  });
+
+  assert.equal(runtime.appId, 'cli_yueran');
+  assert.equal(runtime.statusInbox, statusInbox);
+});
 
 test('registers a separately named Task v2 projection with explicit history policy', () => {
   const harness = fakeCore();
@@ -64,13 +92,13 @@ test('one worker cycle injects the Core batch worker and always closes Core', as
     openCore: () => harness.core,
     async processBatch(options) {
       assert.equal(options.projection, TASK_V2_PROJECTION);
-      const receipts = await options.adapter.publishBatch({
-        deliveries: [{
+      const receipt = await options.adapter.publishDelivery({
+        delivery: {
           projection: TASK_V2_PROJECTION,
           event: { taskId: 'task-worker' },
-        }],
+        },
       });
-      return { projection: options.projection, published: receipts.length };
+      return { projection: options.projection, published: receipt ? 1 : 0 };
     },
   });
   assert.deepEqual(summary, {
@@ -88,13 +116,49 @@ test('one worker cycle injects the Core batch worker and always closes Core', as
   assert.deepEqual(harness.calls.map(([operation]) => operation), ['close']);
 });
 
+test('one worker cycle drains the durable reverse-status inbox after outbound settlement', async () => {
+  const harness = fakeCore();
+  const event = { event_id: 'evt-unlinked', task_id: 'guid-unlinked', app_id: 'cli_yueran' };
+  const acknowledgements = [];
+  const result = await runTaskV2ProjectionOnce({
+    workerId: 'task-v2-worker',
+    operationId: 'cycle-with-inbox',
+    appId: 'cli_yueran',
+    statusInbox: {
+      pending() { return [event]; },
+      ack(request) {
+        acknowledgements.push(request);
+        return { status: 'acknowledged' };
+      },
+      fail() { throw new Error('unexpected fail'); },
+    },
+    gateway: {
+      async findTasksByCoreTaskId() { return []; },
+      async createTask() { throw new Error('unexpected create'); },
+      async updateTask() { throw new Error('unexpected update'); },
+      async getTask() { throw new Error('unlinked event must not read Feishu'); },
+    },
+    memberMapper: createTaskV2MemberMapper({ appId: 'cli_yueran' }),
+    openCore: () => harness.core,
+    async processBatch() {
+      return { projection: TASK_V2_PROJECTION, idle: true };
+    },
+  });
+
+  assert.deepEqual(result.statusInbox, {
+    claimed: 1, acknowledged: 1, retryWaiting: 0, deadLettered: 0,
+  });
+  assert.equal(acknowledgements[0].eventId, event.event_id);
+  assert.equal(acknowledgements[0].result.status, 'unlinked');
+});
+
 test('reconciliation combines the Feishu snapshot with the Core generic diff', async () => {
   const harness = fakeCore();
   harness.core.externalLinks.query = () => [];
   const report = await runTaskV2Reconciliation({
     openCore: () => harness.core,
     gateway: { async findTasksByCoreTaskId() { return []; } },
-    tasks: [harness.core.query()],
+    tasks: [harness.core.query({ taskId: 'task-worker' })],
     reconcile({ expected, actual }) {
       assert.equal(expected.length, 1);
       assert.deepEqual(actual, []);
@@ -109,6 +173,62 @@ test('reconciliation combines the Feishu snapshot with the Core generic diff', a
   });
   assert.equal(report.consistent, false);
   assert.deepEqual(report.missingLinks, [{ taskId: 'task-worker' }]);
+  assert.deepEqual(harness.calls.map(([operation]) => operation), ['close']);
+});
+
+test('explicit reconciliation repair converts linked native completion only to Core review', async () => {
+  const harness = fakeCore();
+  harness.core.externalLinks.query = query => (
+    query.externalId
+      ? { taskId: 'task-worker', externalId: 'guid-worker' }
+      : [{ taskId: 'task-worker', externalId: 'guid-worker' }]
+  );
+  const gateway = {
+    async findTasksByCoreTaskId() {
+      return [{ guid: 'guid-worker', url: 'https://task/guid-worker', completedAt: '1787900000000' }];
+    },
+    async getTask() { return { completedAt: '1787900000000' }; },
+  };
+
+  const report = await runTaskV2Reconciliation({
+    openCore: () => harness.core,
+    gateway,
+    appId: 'cli_yueran',
+    repairStatus: true,
+    reconcile: () => ({
+      consistent: false, missing: [], unexpected: [], stateMismatches: [], duplicateKeys: [],
+    }),
+  });
+
+  assert.equal(report.repairs[0].status, 'submitted_for_review');
+  assert.equal(harness.core.query({ taskId: 'task-worker' }).state, 'review');
+  assert.deepEqual(
+    harness.calls.filter(([operation]) => operation === 'command').map(([, command]) => command.type),
+    ['StartTask', 'SubmitForReview'],
+  );
+});
+
+test('URL resolver exposes the linked native Task URL through a stable user-facing command seam', async () => {
+  const harness = fakeCore();
+  harness.core.externalLinks.query = () => [{ externalId: 'guid-worker' }];
+
+  const result = await resolveTaskV2Url({
+    taskId: 'task-worker',
+    openCore: () => harness.core,
+    gateway: {
+      async getTask(taskGuid) {
+        assert.equal(taskGuid, 'guid-worker');
+        return { guid: taskGuid, url: 'https://applink.feishu.cn/task/guid-worker' };
+      },
+    },
+  });
+
+  assert.deepEqual(result, {
+    status: 'linked',
+    taskId: 'task-worker',
+    taskGuid: 'guid-worker',
+    url: 'https://applink.feishu.cn/task/guid-worker',
+  });
   assert.deepEqual(harness.calls.map(([operation]) => operation), ['close']);
 });
 

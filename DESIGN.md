@@ -276,21 +276,28 @@ Native completion means "submitted by the executor": `ready` is first started
 and then moved to `review`, while `in_progress` moves directly to `review`.
 The reverse Adapter never emits `AcceptTask`. Core `review`, `done`, and
 `cancelled` project as completed; `RequestChanges` returns Core to `ready` and
-the next projection reopens the native Task.
+the next projection reopens the native Task. Updates are field-difference
+patches: an already-completed native Task is not completed again when Core
+advances from `review` to `done`.
 
 Remote create uses a stable `client_token` only for Feishu's short deduplication
 window. Durable identity is the Core ExternalLink plus its receipt. If create
-succeeds but link persistence is interrupted, a retry searches for the exact
-Core marker in the App-owned Task and adopts the GUID. Multiple matching GUIDs
+succeeds but link persistence is interrupted, a retry exhausts all Task search
+pages for the exact Core marker and adopts the GUID. Multiple matching GUIDs
 are a permanent error. Core's projection worker owns retry, max-attempt
-dead-lettering, redrive, and delivery receipts; a Feishu failure never rolls
-back the Core Task.
+dead-lettering, redrive, and delivery receipts; Task v2 uses its per-delivery
+Adapter seam so one poison delivery does not hold back unrelated Tasks. A
+Feishu failure never rolls back the Core Task.
 
-The projection remains explicit opt-in and is not part of the ordinary Feishu
-PM2 app:
+Both projection directions share one explicit opt-in and remain off unless
+`COMMITMENT_FEISHU_TASK_V2_ENABLED=1` is set in `~/zylos/.env`. The separate
+PM2 worker is still not part of the ordinary Feishu PM2 app. Registering the
+Core projection is safe while disabled; canary, continuous projection, reverse
+event registration, URL resolution, and reconciliation require opt-in:
 
 ```bash
 node src/lib/task-v2-projection-worker.js register --bootstrap-policy from_now
+echo 'COMMITMENT_FEISHU_TASK_V2_ENABLED=1' >> ~/zylos/.env
 node src/lib/task-v2-projection-worker.js run --once
 node src/lib/task-v2-projection-worker.js reconcile
 pm2 start ecosystem.task-v2-projection.config.cjs
@@ -299,11 +306,24 @@ pm2 start ecosystem.task-v2-projection.config.cjs
 Each `run --once` result and supervisor cycle includes projection receipts with
 the native `url`, GUID, and create/recovery flags. Core's generic worker stays
 platform-neutral and does not know the Task v2 response shape.
+Resolve the same user-consumable native URL later from a Core task ID with
+`node src/lib/task-v2-projection-worker.js url <core-task-id>`.
 
 Choose `from_beginning` instead of `from_now` only for an intentional rebuild.
-`reconcile` combines the platform snapshot with Core's generic reconciliation
-and reports missing, duplicate, state-drift, missing-link, and link-mismatch
-records without changing either system.
+`reconcile` cursor-pages through all Core tasks and combines the platform
+snapshot with Core's generic reconciliation; it never silently truncates at
+the Core query limit. It reports missing, duplicate, state-drift, missing-link,
+and link-mismatch records without changing either system. Explicit
+`reconcile --repair-status` replays native-completed/Core-open status drift
+through the same Core status handler; it can start and submit for review but
+never accepts a Task. Its report is the detection snapshot plus applied repair
+receipts, so run reconciliation again to verify the resulting clean state.
+
+Native status callbacks acknowledge only after an append and `fsync` to the
+Feishu-owned Task v2 inbox. The projection worker drains that inbox one event
+at a time with retry and dead-letter settlement. Callback processing therefore
+does not mutate Core or depend on Core availability, and reconciliation can
+repair a missed reverse event from current native state.
 
 The Feishu App needs `task:task:read` and `task:task:write`, plus the
 `task.task.updated_v1` event subscription. F3 does not call comment APIs;

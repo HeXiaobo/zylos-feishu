@@ -6,7 +6,9 @@ const FEISHU_DIR = path.join(ZYLOS_DIR, '.claude/skills/feishu');
 const LOG_DIR = path.join(ZYLOS_DIR, 'components/feishu/logs');
 
 // Task v2 is a separate opt-in projection. Register its explicit history
-// policy and run a one-shot fake/canary before starting this process.
+// policy, set COMMITMENT_FEISHU_TASK_V2_ENABLED=1 in ~/zylos/.env, and run a
+// one-shot fake/canary before starting this process. The shared .env flag also
+// gates reverse Task events in the ordinary Feishu service.
 module.exports = {
   apps: [{
     name: 'zylos-feishu-task-v2-projection',
