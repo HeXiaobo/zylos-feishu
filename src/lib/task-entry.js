@@ -121,6 +121,7 @@ export function buildC4ReceiveArgs({
   content,
   taskEnvelope,
   assistantRequest,
+  workIntakeEnvelope,
 }) {
   if (taskEnvelope && assistantRequest) {
     throw new TypeError('taskEnvelope and assistantRequest are mutually exclusive');
@@ -141,6 +142,12 @@ export function buildC4ReceiveArgs({
       '--assistant-request-id', requireText(request.requestId, 'assistantRequest.requestId'),
       '--assistant-source-id', requireText(request.sourceId, 'assistantRequest.sourceId'),
     );
+  }
+  if (workIntakeEnvelope) {
+    if (taskEnvelope) {
+      throw new TypeError('taskEnvelope and workIntakeEnvelope are mutually exclusive');
+    }
+    args.push('--work-intake-envelope-json', JSON.stringify(workIntakeEnvelope));
   }
   args.push('--content', content);
   return args;

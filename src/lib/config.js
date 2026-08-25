@@ -34,6 +34,15 @@ export const DEFAULT_CONFIG = {
   dmPolicy: 'owner',
   // DM allowlist — user_id or open_id values (used when dmPolicy = 'allowlist')
   dmAllowFrom: [],
+  // Optional F2 member policy. null preserves the legacy dmPolicy behavior.
+  // Supported modes: owner, tenant_members, departments, allowlist.
+  // Non-owner modes require an exact tenantKey and are audited per decision.
+  memberAccessPolicy: null,
+  workIntake: {
+    enabled: false,
+    timeZone: 'Asia/Shanghai',
+    confirmationTtlMs: 15 * 60 * 1000,
+  },
   // Group policy: 'open' (all groups), 'allowlist' (only configured groups), 'disabled' (no groups)
   groupPolicy: 'allowlist',
   // Per-group configuration map
@@ -69,7 +78,14 @@ export function loadConfig() {
     if (fs.existsSync(CONFIG_PATH)) {
       const content = fs.readFileSync(CONFIG_PATH, 'utf8');
       const parsed = JSON.parse(content);
-      config = { ...DEFAULT_CONFIG, ...parsed };
+      config = {
+        ...DEFAULT_CONFIG,
+        ...parsed,
+        workIntake: {
+          ...DEFAULT_CONFIG.workIntake,
+          ...(parsed.workIntake || {}),
+        },
+      };
       // Runtime backward-compat: derive groupPolicy from legacy group_whitelist,
       // but only if the file doesn't already have an explicit groupPolicy
       if (config.group_whitelist !== undefined && !('groupPolicy' in parsed)) {

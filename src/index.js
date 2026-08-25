@@ -40,6 +40,14 @@ import {
   isExplicitTaskProtocolMessage,
   parseExplicitTaskMessage,
 } from './lib/task-entry.js';
+import { createMemberAccessPolicy } from './lib/work-intake-access.js';
+import { createFeishuWorkIntakeInboundAdapter } from './lib/feishu-work-intake-inbound.js';
+import { createWorkIntakeConfirmationContextSigner } from './lib/work-intake-confirmation-context.js';
+import {
+  createWorkIntakeConfirmationCardRenderer,
+  createWorkIntakeConfirmationRuntime,
+  isWorkIntakeConfirmationAction,
+} from './lib/work-intake-confirmation-card.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -53,6 +61,18 @@ if (process.env.FEISHU_TASK_CONTEXT_SECRET) {
     });
   } catch (error) {
     console.error(`[feishu] Signed task actions disabled: ${error.message}`);
+  }
+}
+
+let workIntakeConfirmationContextSigner = null;
+if (process.env.FEISHU_WORK_INTAKE_CONTEXT_SECRET) {
+  try {
+    workIntakeConfirmationContextSigner = createWorkIntakeConfirmationContextSigner({
+      secret: process.env.FEISHU_WORK_INTAKE_CONTEXT_SECRET,
+      clock: Date.now,
+    });
+  } catch (error) {
+    console.error(`[feishu] WorkIntake confirmations disabled: ${error.message}`);
   }
 }
 
@@ -84,6 +104,7 @@ console.log(`[feishu] Data directory: ${DATA_DIR}`);
 // Ensure directories exist
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
 const MEDIA_DIR = path.join(DATA_DIR, 'media');
+const ACCESS_AUDIT_PATH = path.join(LOGS_DIR, 'member-access-audit.jsonl');
 fs.mkdirSync(LOGS_DIR, { recursive: true });
 fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
@@ -681,20 +702,6 @@ function isGroupAllowed(chatId) {
 }
 
 /**
- * Check if a group is in "smart" mode (receives all messages without @mention).
- */
-function isSmartGroup(chatId) {
-  const normalizedChatId = chatId === undefined || chatId === null ? '' : String(chatId);
-  if ((config.groupPolicy || 'allowlist') === 'disabled') return false;
-  const groupConfig = resolveGroupConfig(normalizedChatId);
-  if (groupConfig) {
-    return groupConfig.mode === 'smart' || groupConfig.requireMention === false;
-  }
-  // Legacy fallback
-  return (config.smart_groups || []).some(g => String(g.chat_id) === normalizedChatId);
-}
-
-/**
  * Check if a sender is allowed in a specific group.
  * If the group has an allowFrom list, check it; otherwise allow all.
  */
@@ -816,6 +823,7 @@ async function openConversationResponse({ chatId, chatType, messageId, rootId, p
     console.warn(`[feishu] Failed to open immediate response card: ${error.message}`);
     return null;
   }
+  return null;
 }
 
 function failConversationResponse(request) {
@@ -833,7 +841,13 @@ function failConversationResponse(request) {
  * Send message to Claude via C4 (with 1 retry on unexpected failure).
  * Explicit task intents atomically carry their normalized envelope.
  */
-function sendToC4(source, endpoint, content, onReject, { taskEnvelope, assistantRequest } = {}) {
+function sendToC4(
+  source,
+  endpoint,
+  content,
+  onReject,
+  { taskEnvelope, workIntakeEnvelope, assistantRequest, onSuccess } = {},
+) {
   if (!content) {
     console.error('[feishu] sendToC4 called with empty content');
     return;
@@ -846,7 +860,19 @@ function sendToC4(source, endpoint, content, onReject, { taskEnvelope, assistant
     content,
     taskEnvelope,
     assistantRequest,
+    workIntakeEnvelope,
   });
+
+  const notifySuccess = (stdout) => {
+    if (!onSuccess) return;
+    try {
+      Promise.resolve(onSuccess(parseC4Response(stdout))).catch((error) => {
+        console.error(`[feishu] C4 success handler failed: ${error.message}`);
+      });
+    } catch (error) {
+      console.error(`[feishu] C4 success handler failed: ${error.message}`);
+    }
+  };
 
   execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
     if (!error) {
@@ -857,6 +883,7 @@ function sendToC4(source, endpoint, content, onReject, { taskEnvelope, assistant
         return;
       }
       console.log(`[feishu] Sent to C4: ${content.substring(0, 50)}...`);
+      notifySuccess(stdout);
       return;
     }
     const response = parseC4Response(error.stdout || stdout);
@@ -876,6 +903,7 @@ function sendToC4(source, endpoint, content, onReject, { taskEnvelope, assistant
             return;
           }
           console.log(`[feishu] Sent to C4 (retry): ${content.substring(0, 50)}...`);
+          notifySuccess(retryStdout);
           return;
         }
         const retryResponse = parseC4Response(retryError.stdout || retryStdout);
@@ -888,6 +916,25 @@ function sendToC4(source, endpoint, content, onReject, { taskEnvelope, assistant
         }
       });
     }, 2000);
+  });
+}
+
+function executeC4Receive(args) {
+  return new Promise((resolve, reject) => {
+    execFile('node', args, {
+      encoding: 'utf8',
+      timeout: 35000,
+      env: { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET },
+    }, (error, stdout) => {
+      const response = parseC4Response(error?.stdout || stdout);
+      if (!error && response?.ok !== false) {
+        resolve(response || { ok: true });
+        return;
+      }
+      const failure = new Error(response?.error?.message || error?.message || 'C4 receive failed');
+      failure.code = response?.error?.code || 'C4_RECEIVE_FAILED';
+      reject(failure);
+    });
   });
 }
 
@@ -919,6 +966,58 @@ function executeTaskAction(taskAction) {
 }
 
 let taskCardActionRuntime = null;
+let workIntakeConfirmationRuntime = null;
+let workIntakeConfirmationCardRenderer = null;
+let workIntakeConfigurationWarningEmitted = false;
+
+function getWorkIntakeConfirmationCardRenderer() {
+  if (!workIntakeConfirmationContextSigner) {
+    throw new Error('signed WorkIntake confirmations are not configured');
+  }
+  if (!workIntakeConfirmationCardRenderer) {
+    workIntakeConfirmationCardRenderer = createWorkIntakeConfirmationCardRenderer({
+      issueContext: (claims) => workIntakeConfirmationContextSigner.issue(claims),
+      clock: Date.now,
+      contextTtlMs: config.workIntake?.confirmationTtlMs ?? 15 * 60 * 1000,
+    });
+  }
+  return workIntakeConfirmationCardRenderer;
+}
+
+async function executeWorkIntakeConfirmation(route) {
+  if (route.action === 'edit') {
+    const [chatId, ...metadata] = route.claims.endpoint.split('|');
+    const chatType = metadata.find((part) => part.startsWith('type:'))?.slice(5);
+    const prompt = '请重新发送修改后的交办；新消息会使用新的 message_id 重新判断。';
+    return chatType === 'p2p'
+      ? sendMessage(chatId, prompt, 'chat_id', 'text')
+      : replyToMessage(route.claims.messageId, prompt);
+  }
+  const content = route.action === 'chat_only'
+    ? `[Feishu confirmed ordinary message] ${route.claims.originalText}`
+    : `[Feishu confirmed WorkIntake task] ${route.claims.originalText}`;
+  const args = buildC4ReceiveArgs({
+    receiverPath: C4_RECEIVE,
+    source: route.claims.channel,
+    endpoint: route.claims.endpoint,
+    content,
+    taskEnvelope: route.taskEnvelope || undefined,
+  });
+  return executeC4Receive(args);
+}
+
+function getWorkIntakeConfirmationRuntime() {
+  if (!workIntakeConfirmationContextSigner) {
+    throw new Error('signed WorkIntake confirmations are not configured');
+  }
+  if (!workIntakeConfirmationRuntime) {
+    workIntakeConfirmationRuntime = createWorkIntakeConfirmationRuntime({
+      verifyContext: (token) => workIntakeConfirmationContextSigner.verify(token),
+      executeDecision: executeWorkIntakeConfirmation,
+    });
+  }
+  return workIntakeConfirmationRuntime;
+}
 
 function getTaskCardActionRuntime() {
   if (!taskActionContextSigner) {
@@ -934,6 +1033,9 @@ function getTaskCardActionRuntime() {
 }
 
 async function handleTaskCardAction(event) {
+  if (isWorkIntakeConfirmationAction(event)) {
+    return getWorkIntakeConfirmationRuntime().handle(event);
+  }
   return getTaskCardActionRuntime().handle(event);
 }
 
@@ -1036,6 +1138,99 @@ function buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId
     endpoint += `|thread:${threadId}`;
   }
   return endpoint;
+}
+
+function toIsoTimestamp(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric) ? new Date(numeric) : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function normalizeWorkIntakeMentions(mentions) {
+  if (!Array.isArray(mentions)) return [];
+  return mentions.flatMap((mention) => {
+    const id = mention.id?.open_id || mention.id?.user_id || mention.id?.app_id || null;
+    const name = mention.name || mention.user_name;
+    if (!name || !id) return [];
+    const isBot = String(id) === String(botOpenId || '')
+      || String(id) === String(botAppId || '');
+    return [{
+      name,
+      id,
+      candidateIds: [id],
+      kind: mention.id?.app_id || isBot ? 'agent' : 'human',
+      isBot,
+    }];
+  });
+}
+
+function buildNaturalWorkIntakeEnvelope({
+  message,
+  text,
+  senderId,
+  mentionedBot,
+  timestamp,
+}) {
+  if (!config.workIntake?.enabled) return null;
+  if (!config.memberAccessPolicy || !workIntakeConfirmationContextSigner) {
+    if (!workIntakeConfigurationWarningEmitted) {
+      console.error('[feishu] WorkIntake disabled: memberAccessPolicy and FEISHU_WORK_INTAKE_CONTEXT_SECRET are required');
+      workIntakeConfigurationWarningEmitted = true;
+    }
+    return null;
+  }
+  const adapter = createFeishuWorkIntakeInboundAdapter({
+    // An original platform message is revision one forever. Editing is a new
+    // Feishu message with its own message_id; config reloads cannot change the
+    // idempotency identity of a replayed event.
+    intentRevision: 1,
+    timeZone: config.workIntake.timeZone || 'Asia/Shanghai',
+  });
+  return adapter.toEnvelope({
+    messageId: message.message_id,
+    chatId: message.chat_id,
+    chatType: message.chat_type,
+    threadId: message.thread_id || null,
+    senderId,
+    text,
+    mentionedBot,
+    receivedAt: toIsoTimestamp(timestamp),
+    mentions: normalizeWorkIntakeMentions(message.mentions),
+  });
+}
+
+async function handleWorkIntakeResult(response, {
+  inboundEnvelope,
+  endpoint,
+  messageId,
+  chatId,
+  chatType,
+  rootId,
+  parentId,
+}) {
+  const workIntake = response?.workIntake;
+  if (!workIntake || workIntake.replayed) return;
+  const { replayed: _replayed, ...decision } = workIntake;
+  if (decision.decision === 'create_task') {
+    const sent = await sendThreadAwareMessage(
+      chatId,
+      `已登记任务：${decision.taskDraft.title}`,
+      { chatType, rootId, parentId, messageId },
+    );
+    if (!sent.success) throw new Error(sent.message || 'failed to send WorkIntake receipt');
+    return;
+  }
+  if (decision.decision !== 'confirm') return;
+  const card = getWorkIntakeConfirmationCardRenderer().render({
+    decision,
+    inboundEnvelope,
+    endpoint,
+  });
+  const sent = chatType === 'p2p'
+    ? await sendMessage(chatId, card, 'chat_id', 'interactive')
+    : await replyToMessage(messageId, card, 'interactive');
+  if (!sent.success) throw new Error(sent.message || 'failed to send WorkIntake confirmation card');
 }
 
 // Params shared by every `im.message.get` call.
@@ -1393,8 +1588,50 @@ function isOwner(userId, openId) {
     || (ownerOpenId !== undefined && ownerOpenId !== null && openId !== undefined && openId !== null && String(ownerOpenId) === String(openId));
 }
 
-// Check DM access — uses dmPolicy + dmAllowFrom
-function isDmAllowed(userId, openId) {
+function appendMemberAccessAudit(entry) {
+  const line = `${JSON.stringify(entry)}\n`;
+  fs.appendFileSync(ACCESS_AUDIT_PATH, line, { encoding: 'utf8', mode: 0o600 });
+  console.log(`[feishu] member access ${entry.reasonCode} actor=${entry.actorId} allowed=${entry.allowed}`);
+}
+
+async function authorizeConfiguredMemberAccess(userId, openId, sender) {
+  const configuredPolicy = config.memberAccessPolicy;
+  if (!configuredPolicy) return null;
+  let departmentIds = [];
+  if (configuredPolicy.mode === 'departments') {
+    const profile = await getUserInfo(openId || userId);
+    if (profile.success) departmentIds = profile.user?.departmentIds || [];
+  }
+  try {
+    const policy = createMemberAccessPolicy({
+      policy: {
+        mode: configuredPolicy.mode,
+        tenantKey: configuredPolicy.tenantKey || '',
+        memberIds: configuredPolicy.memberIds || [],
+        departmentIds: configuredPolicy.departmentIds || [],
+      },
+      ownerIds: [config.owner?.open_id, config.owner?.user_id].filter(Boolean),
+      audit: appendMemberAccessAudit,
+      clock: () => new Date().toISOString(),
+    });
+    return policy.authorize({
+      openId: openId || null,
+      userId: userId || null,
+      tenantKey: sender?.tenant_key || null,
+      isTenantMember: sender?.sender_type === 'user' && Boolean(sender?.tenant_key),
+      departmentIds,
+    }).allowed;
+  } catch (error) {
+    console.error(`[feishu] member access denied because policy/audit failed: ${error.message}`);
+    return false;
+  }
+}
+
+// Check DM access. The optional F2 member policy supersedes legacy dmPolicy
+// and records one durable audit row for every decision.
+async function isDmAllowed(userId, openId, sender) {
+  const memberAccess = await authorizeConfiguredMemberAccess(userId, openId, sender);
+  if (memberAccess !== null) return memberAccess;
   if (isOwner(userId, openId)) return true;
   const policy = config.dmPolicy || 'owner';
   if (policy === 'open') return true;
@@ -1454,6 +1691,15 @@ async function handleMessage(data) {
   // Unified dedup check (both websocket and webhook modes)
   if (isDuplicate(messageId)) return;
 
+  // F2 deliberately does not listen to whole-group conversation. A group
+  // message must @玥然 before content parsing, logging, history, downloads, or
+  // C4/WorkIntake processing can occur, even if an old config says "smart".
+  const mentionedAtIngress = chatType === 'group' && isBotMentioned(mentions, botOpenId);
+  if (chatType === 'group' && !mentionedAtIngress) {
+    console.log(`[feishu] Group message ${messageId} ignored: bot not mentioned`);
+    return;
+  }
+
   const extracted = extractMessageContent(message);
   let { text } = extracted;
   const { imageKeys, fileKey, fileName } = extracted;
@@ -1504,7 +1750,7 @@ async function handleMessage(data) {
       if (!boundOwner) return;
     }
 
-    if (!isDmAllowed(senderUserId, senderOpenId)) {
+    if (!(await isDmAllowed(senderUserId, senderOpenId, sender))) {
       console.log(`[feishu] Private message from non-allowed user ${senderUserId} (dmPolicy=${config.dmPolicy || 'owner'}), rejecting`);
       sendMessage(chatId, "Sorry, I'm not available for private messages. Please ask my owner to grant you access.").catch(() => {});
       return;
@@ -1622,18 +1868,39 @@ async function handleMessage(data) {
     }
 
     const msg = formatMessage('p2p', senderName, cleanText, [], null, { quotedContent, threadContext, threadRootId });
+    const workIntakeEnvelope = taskRoute?.kind === 'task-intent'
+      ? null
+      : buildNaturalWorkIntakeEnvelope({
+        message,
+        text: cleanText,
+        senderId: senderOpenId || senderUserId,
+        mentionedBot: false,
+        timestamp: data._timestamp || null,
+      });
     sendToC4('feishu', endpoint, msg, rejectReply, {
       taskEnvelope: taskRoute?.kind === 'task-intent'
         ? taskRoute.taskEnvelope
         : undefined,
+      workIntakeEnvelope: workIntakeEnvelope || undefined,
       assistantRequest: assistantRequest || undefined,
+      onSuccess: workIntakeEnvelope
+        ? (response) => handleWorkIntakeResult(response, {
+          inboundEnvelope: workIntakeEnvelope,
+          endpoint,
+          messageId,
+          chatId,
+          chatType,
+          rootId,
+          parentId,
+        })
+        : undefined,
     });
     return;
   }
 
   // Group chat handling
   if (chatType === 'group') {
-    const mentioned = isBotMentioned(mentions, botOpenId);
+    const mentioned = mentionedAtIngress;
     const senderIsOwner = isOwner(senderUserId, senderOpenId);
     const groupPolicy = config.groupPolicy || 'allowlist';
     if (groupPolicy === 'disabled') {
@@ -1644,9 +1911,6 @@ async function handleMessage(data) {
       return;
     }
     const allowedGroup = isGroupAllowed(chatId);
-    const smart = isSmartGroup(chatId);
-    const smartNoMention = smart && !mentioned;
-
     if (!allowedGroup && !(senderIsOwner && mentioned)) {
       if (mentioned) {
         console.log(`[feishu] Group ${chatId} not allowed by policy, rejecting`);
@@ -1654,6 +1918,13 @@ async function handleMessage(data) {
       } else {
         console.log(`[feishu] Group ${chatId} not allowed by policy, ignoring`);
       }
+      return;
+    }
+
+    const memberAccess = await authorizeConfiguredMemberAccess(senderUserId, senderOpenId, sender);
+    if (memberAccess === false) {
+      console.log(`[feishu] Sender ${senderUserId} rejected by configured member access policy in group ${chatId}`);
+      replyToMessage(messageId, "Sorry, you don't have permission to interact with me in this group.").catch(() => {});
       return;
     }
 
@@ -1676,16 +1947,8 @@ async function handleMessage(data) {
       logText = text;
     }
 
-    if (!smart && !mentioned) {
-      if (allowedGroup) {
-        await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
-      }
-      console.log(`[feishu] Group message without @mention, logged only`);
-      return;
-    }
-
-    // Group user access is controlled by groupPolicy + groups config + per-group allowFrom.
-    // No separate user-level whitelist for groups (dmPolicy/dmAllowFrom only applies to DMs).
+    // Group access is the intersection of groupPolicy, per-group allowFrom,
+    // and the configured audited member policy when present.
 
     const taskInput = await handleAuthorizedTaskInput({
       message,
@@ -1704,7 +1967,7 @@ async function handleMessage(data) {
     });
     if (taskInput.handled) return;
     const taskRoute = taskInput.route;
-    if (!assistantRequest && !smartNoMention && taskRoute?.kind !== 'task-intent') {
+    if (!assistantRequest && taskRoute?.kind !== 'task-intent') {
       assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
     }
 
@@ -1714,13 +1977,12 @@ async function handleMessage(data) {
 
     await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
 
-    console.log(`[feishu] ${smart ? 'Smart group' : 'Bot @mentioned in'} group ${chatId}`);
+    console.log(`[feishu] Bot @mentioned in group ${chatId}`);
     await preloadGroupMembers(chatId);
     const contextMessages = await getGroupContext(chatId, messageId);
     updateCursor(chatId, messageId);
 
-    // Smart mode without @mention may skip reply entirely ([SKIP]), so do not show typing.
-    if (!smartNoMention && !assistantRequest) {
+    if (!assistantRequest) {
       addTypingIndicator(messageId);
     }
 
@@ -1739,7 +2001,6 @@ async function handleMessage(data) {
 
     const senderName = await resolveUserName(senderUserId, senderOpenId);
     const cleanText = resolveMentions(text, mentions);
-    const cleanLogText = resolveMentions(logText, mentions);
     const threadRootId = threadId ? rootId : null;
     const groupRejectReply = () => {
       removeTypingIndicator(messageId);
@@ -1758,12 +2019,6 @@ async function handleMessage(data) {
 
     // Handle images (lazy download: only for messages being sent to C4)
     if (imageKeys.length > 0) {
-      if (smartNoMention) {
-        const msg = formatMessage('group', senderName, cleanLogText || '[image]', contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
-        return;
-      }
-
       const mediaPaths = [];
       for (const imgKey of imageKeys) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1784,12 +2039,6 @@ async function handleMessage(data) {
     }
 
     if (fileKey) {
-      if (smartNoMention) {
-        const msg = formatMessage('group', senderName, cleanLogText || `[file: ${fileName}]`, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
-        return;
-      }
-
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       let localPath = null;
       try {
@@ -1807,12 +2056,33 @@ async function handleMessage(data) {
       return;
     }
 
-    const msg = formatMessage('group', senderName, cleanText || text, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: smartNoMention });
+    const msg = formatMessage('group', senderName, cleanText || text, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
+    const workIntakeEnvelope = taskRoute?.kind === 'task-intent'
+      ? null
+      : buildNaturalWorkIntakeEnvelope({
+        message,
+        text: cleanText || text,
+        senderId: senderOpenId || senderUserId,
+        mentionedBot: mentioned,
+        timestamp: data._timestamp || null,
+      });
     sendToC4('feishu', endpoint, msg, groupRejectReply, {
       taskEnvelope: taskRoute?.kind === 'task-intent'
         ? taskRoute.taskEnvelope
         : undefined,
+      workIntakeEnvelope: workIntakeEnvelope || undefined,
       assistantRequest: assistantRequest || undefined,
+      onSuccess: workIntakeEnvelope
+        ? (response) => handleWorkIntakeResult(response, {
+          inboundEnvelope: workIntakeEnvelope,
+          endpoint,
+          messageId,
+          chatId,
+          chatType,
+          rootId,
+          parentId,
+        })
+        : undefined,
     });
   }
 }

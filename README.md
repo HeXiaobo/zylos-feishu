@@ -26,7 +26,7 @@
 ---
 
 - **Talk through Feishu** — your AI agent speaks Feishu, both private chats and group conversations
-- **Smart group monitoring** — automatically follow designated group discussions, no @mention needed
+- **Explicit group activation** — group messages are processed only when the bot is @mentioned
 - **Zero-config start** — first message auto-binds you as admin, no setup wizards
 - **Rich Feishu integration** — documents, spreadsheets, calendar — not just messaging
 
@@ -51,7 +51,6 @@ Just tell your Zylos agent what you need:
 | Task | Example |
 |------|---------|
 | Add user to whitelist | "Add user xxx to feishu whitelist" |
-| Enable smart group | "Make this group a smart group" |
 | Check status | "Show feishu bot status" |
 | Restart bot | "Restart feishu bot" |
 | Upgrade | "Upgrade feishu component" |
@@ -69,10 +68,36 @@ zylos uninstall feishu
 | Scenario | Bot Response |
 |----------|--------------|
 | Private chat (owner/whitelisted) | Responds via Claude |
-| Smart group message | Receives all messages |
 | @mention in allowed group | Responds with recent context |
 | Owner @mention in any group | Always responds |
 | Unknown user | Ignored |
+
+## Natural-language WorkIntake
+
+WorkIntake is opt-in. Set `workIntake.enabled` in
+`~/zylos/components/feishu/config.json`, configure a member policy, and provide
+`FEISHU_WORK_INTAKE_CONTEXT_SECRET` (at least 32 bytes) in `~/zylos/.env`:
+
+```json
+{
+  "workIntake": {
+    "enabled": true,
+    "timeZone": "Asia/Shanghai",
+    "confirmationTtlMs": 900000
+  },
+  "memberAccessPolicy": {
+    "mode": "tenant_members",
+    "tenantKey": "your-tenant-key",
+    "memberIds": [],
+    "departmentIds": []
+  }
+}
+```
+
+`mode` can be `owner`, `tenant_members`, `departments`, or `allowlist`.
+Non-owner policies require an exact tenant match and every decision is appended
+to `logs/member-access-audit.jsonl`. Group intake always requires @mention;
+the old smart/no-mention behavior is not used by this build.
 
 ## Documentation
 

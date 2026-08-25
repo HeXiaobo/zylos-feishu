@@ -142,6 +142,47 @@ test('recognizes only the explicit text protocol and leaves ordinary chat on the
   );
 });
 
+test('passes a channel-neutral WorkIntake envelope to C4 without a task envelope', () => {
+  const workIntakeEnvelope = {
+    source: {
+      channel: 'feishu',
+      messageId: 'om_natural',
+      conversationId: 'oc_natural',
+      conversationType: 'direct',
+      threadId: null,
+    },
+    sender: { id: 'ou_sender', kind: 'human' },
+    text: '请玥然整理客户记录',
+    intentRevision: 1,
+    receivedAt: null,
+    timeZone: 'Asia/Shanghai',
+    people: [],
+  };
+  assert.deepEqual(buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_natural|type:p2p|msg:om_natural',
+    content: '[Feishu DM] Sender said: natural task',
+    workIntakeEnvelope,
+  }), [
+    '/opt/zylos/c4-receive.js',
+    '--channel', 'feishu',
+    '--endpoint', 'oc_natural|type:p2p|msg:om_natural',
+    '--json',
+    '--work-intake-envelope-json', JSON.stringify(workIntakeEnvelope),
+    '--content', '[Feishu DM] Sender said: natural task',
+  ]);
+
+  assert.throws(() => buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_natural',
+    content: 'invalid dual route',
+    taskEnvelope: { idempotencyKey: 'task' },
+    workIntakeEnvelope,
+  }), /mutually exclusive/);
+});
+
 test('verifies an explicit complete action and binds the trusted event actor before invoking Core', () => {
   const contexts = createTaskActionContextSigner({
     secret: SECRET,

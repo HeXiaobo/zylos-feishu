@@ -24,7 +24,7 @@
 ---
 
 - **通过飞书对话** — 你的 AI 智能体接入飞书，支持私聊和群聊
-- **智能群组监控** — 自动关注指定群组的所有讨论，无需 @
+- **群聊显式触发** — 只有 @机器人 的群消息才会被处理
 - **零配置启动** — 第一条消息自动绑定为管理员，无需繁琐设置
 - **丰富的飞书集成** — 文档、表格、日历 — 不止是消息收发
 
@@ -49,7 +49,6 @@ Zylos 会引导你完成设置，包括配置飞书应用凭证。安装完成�
 | 操作 | 示例 |
 |------|------|
 | 添加白名单用户 | "把用户 xxx 加入飞书白名单" |
-| 启用智能群组 | "把这个群设为智能群组" |
 | 查看状态 | "看下飞书机器人状态" |
 | 重启机器人 | "重启飞书机器人" |
 | 升级组件 | "升级飞书组件" |
@@ -67,10 +66,36 @@ zylos uninstall feishu
 | 场景 | 机器人响应 |
 |------|-----------|
 | 私聊（管理员/白名单） | 通过 Claude 回复 |
-| 智能群组消息 | 接收所有消息 |
 | 在允许的群里 @机器人 | 带上下文回复 |
 | 管理员在任意群 @机器人 | 始终回复 |
 | 未知用户 | 忽略 |
+
+## 自然语言 WorkIntake
+
+WorkIntake 默认关闭。请在 `~/zylos/components/feishu/config.json` 中开启，
+配置成员访问策略，并在 `~/zylos/.env` 中设置至少 32 字节的
+`FEISHU_WORK_INTAKE_CONTEXT_SECRET`：
+
+```json
+{
+  "workIntake": {
+    "enabled": true,
+    "timeZone": "Asia/Shanghai",
+    "confirmationTtlMs": 900000
+  },
+  "memberAccessPolicy": {
+    "mode": "tenant_members",
+    "tenantKey": "your-tenant-key",
+    "memberIds": [],
+    "departmentIds": []
+  }
+}
+```
+
+`mode` 支持 `owner`、`tenant_members`、`departments`、`allowlist`。
+非 Owner 策略必须精确匹配租户；每次放行或拒绝都会写入
+`logs/member-access-audit.jsonl`。群聊始终要求 @机器人，本构建不启用旧的
+smart/免 @ 监听行为。
 
 ## 文档
 
