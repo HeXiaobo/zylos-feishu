@@ -152,12 +152,45 @@ test('phase events never fabricate answer deltas and completion may supply one f
   });
   const progressCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
   assert.match(progressCard.body.elements[1].content, /等待回答/);
+  assert.match(progressCard.body.elements[2].content, /正在分析问题/);
+  assert.match(progressCard.body.elements[2].content, /正在整理结果/);
+  assert.equal(progressCard.body.elements[2].content.includes('chain-of-thought'), false);
   await stream.apply({
     requestId: 'assistant.feishu.om_1',
     events: [event(5, 'RunCompleted', { output: '只有完整答案，没有伪造 token 流。' })],
   });
   const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
   assert.equal(finalCard.body.elements[1].content, '只有完整答案，没有伪造 token 流。');
+  assert.match(finalCard.body.elements[2].content, /处理过程/);
+}));
+
+test('keeps a bounded, de-duplicated public progress trace across restart', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const first = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await first.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await first.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'AssistantRequestAccepted', { sourceId: 'om_trace' }),
+      event(2, 'RunQueued'),
+      event(3, 'RunStarted'),
+      event(4, 'ProgressUpdated', { stage: 'reading' }),
+      event(5, 'ProgressUpdated', { stage: 'reading' }),
+    ],
+  });
+  const second = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await second.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(6, 'ProgressUpdated', { stage: 'querying' }),
+      event(7, 'RunCompleted', { output: '完成' }),
+    ],
+  });
+
+  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const trace = finalCard.body.elements[2].content;
+  assert.equal((trace.match(/正在读取资料/g) || []).length, 1);
+  assert.match(trace, /正在分析问题[\s\S]*正在读取资料[\s\S]*正在查询数据/);
 }));
 
 test('swaps to continuation cards only when the verified answer exceeds one card', () => withState(async stateDirectory => {

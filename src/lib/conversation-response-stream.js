@@ -6,6 +6,8 @@ import { DATA_DIR } from './config.js';
 
 const PHASE_ELEMENT_ID = 'zylos_phase';
 const ANSWER_ELEMENT_ID = 'zylos_answer';
+const PROGRESS_ELEMENT_ID = 'zylos_progress';
+const MAX_PROGRESS_STEPS = 8;
 const MAX_CARD_BYTES = 30_000;
 const DEFAULT_ANSWER_BYTES_PER_CARD = 12_000;
 const DEFAULT_THROTTLE_MS = 250;
@@ -88,7 +90,9 @@ function atomicWrite(filePath, value) {
 function readState(filePath) {
   try {
     const state = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    return state?.version === 1 ? state : null;
+    if (state?.version !== 1) return null;
+    if (!Array.isArray(state.progress)) state.progress = [];
+    return state;
   } catch {
     return null;
   }
@@ -127,7 +131,21 @@ function phaseForEvent(event) {
   }
 }
 
-function renderCard({ phase, answer, streaming, part, totalParts }) {
+function progressForEvent(event) {
+  if (event.type === 'RunStarted') return '正在分析问题';
+  if (event.type === 'ProgressUpdated') return SAFE_PROGRESS[event.payload?.stage] || null;
+  return null;
+}
+
+function appendProgress(state, step) {
+  if (!step || state.progress.includes(step)) return;
+  if (state.progress.length >= MAX_PROGRESS_STEPS) {
+    state.progress.splice(state.progress.length > 1 ? 1 : 0, 1);
+  }
+  state.progress.push(step);
+}
+
+function renderCard({ phase, answer, progress = [], streaming, part, totalParts }) {
   const continuation = part > 0
     ? `\n\n_续 ${part + 1}${totalParts > 1 ? ` / ${totalParts}` : ''}_`
     : '';
@@ -156,6 +174,13 @@ function renderCard({ phase, answer, streaming, part, totalParts }) {
           element_id: ANSWER_ELEMENT_ID,
           content: `${answer || (streaming ? '_等待回答…_' : '_没有可显示的回答_')}${continuation}`,
         },
+        ...(progress.length > 0
+          ? [{
+              tag: 'markdown',
+              element_id: PROGRESS_ELEMENT_ID,
+              content: `**处理过程**\n${progress.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
+            }]
+          : []),
       ],
     },
   };
@@ -342,6 +367,7 @@ export function createConversationResponseStream({
     const ordinary = renderCard({
       phase: state.phase,
       answer: state.output,
+      progress: state.progress,
       streaming: false,
       part: 0,
       totalParts: 1,
@@ -395,6 +421,7 @@ export function createConversationResponseStream({
     const card = renderCard({
       phase: state.phase,
       answer,
+      progress: state.progress,
       streaming: !terminal,
       part,
       totalParts,
@@ -462,6 +489,7 @@ export function createConversationResponseStream({
       const card = renderCard({
         phase: state.phase,
         answer: segments[part],
+        progress: state.progress,
         streaming: state.mode === 'cardkit' && !terminal && part === segments.length - 1,
         part,
         totalParts: segments.length,
@@ -563,6 +591,7 @@ export function createConversationResponseStream({
             plainMessageId,
             status: 'opening',
             phase: '正在接收消息…',
+            progress: [],
             output: '',
             lastEventSequence: 0,
             lastRenderedAt: clock(),
@@ -580,6 +609,7 @@ export function createConversationResponseStream({
             mode: 'conversion_pending',
             status: 'opening',
             phase: '正在接收消息…',
+            progress: [],
             output: '',
             lastEventSequence: 0,
             lastRenderedAt: clock(),
@@ -650,6 +680,7 @@ export function createConversationResponseStream({
             throw new Error(`assistant response event gap: expected ${state.lastEventSequence + 1}, received ${event.sequence}`);
           }
           const phase = phaseForEvent(event);
+          appendProgress(state, progressForEvent(event));
           if (compatibility) {
             if (phase) canonicalPhase = phase;
             if (event.type === 'AssistantRequestAccepted') canonicalStatus = 'accepted';
