@@ -28,10 +28,6 @@ import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { createTaskActionContextSigner } from './lib/task-action-context.js';
 import { getClient } from './lib/client.js';
 import { createConversationResponseStream } from './lib/conversation-response-stream.js';
-import {
-  createAssistantResponseCopyRuntime,
-  isAssistantResponseCopyAction,
-} from './lib/assistant-response-copy.js';
 import { isRetryableC4Failure } from './lib/c4-retry-policy.js';
 import { resolveZylosCli } from './lib/zylos-cli-resolver.js';
 import {
@@ -129,7 +125,6 @@ let webhookServer = null;
 let isShuttingDown = false;
 let taskCommentStore = null;
 let taskCommentEventHandlers = Object.freeze({});
-let assistantResponseCopyRuntime = null;
 let inboundEventInbox = null;
 let inboundDrainPromise = null;
 let inboundDrainInterval = null;
@@ -1134,18 +1129,6 @@ function getTaskCardActionRuntime() {
 }
 
 async function handleTaskCardAction(event) {
-  if (isAssistantResponseCopyAction(event)) {
-    if (!assistantResponseCopyRuntime) {
-      assistantResponseCopyRuntime = createAssistantResponseCopyRuntime({
-        sendText: async ({ target, messageId, text, uuid }) => (
-          target.chatType === 'group'
-            ? replyToMessage(messageId, text, 'text', { uuid })
-            : sendMessage(target.chatId, text, 'chat_id', 'text', { uuid })
-        ),
-      });
-    }
-    return assistantResponseCopyRuntime.handle(event);
-  }
   if (isWorkIntakeConfirmationAction(event)) {
     return getWorkIntakeConfirmationRuntime().handle(event);
   }
@@ -2445,7 +2428,7 @@ function startWebhook(creds) {
 
     if (eventType === 'card.action.trigger') {
       if (callback.statusCode === 200) {
-        console.log('[feishu] Applied card action');
+        console.log('[feishu] Applied task card action');
       }
       return res.status(callback.statusCode).json(callback.body);
     }
