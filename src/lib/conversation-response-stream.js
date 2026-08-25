@@ -225,7 +225,7 @@ function renderCard({ phase, answer, progress = [], streaming, part, totalParts 
           ? [{
               tag: 'markdown',
               element_id: PROGRESS_ELEMENT_ID,
-              content: `**处理过程**\n${progress.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
+              content: `**公开推理摘要**\n_工作阶段摘要，不包含模型内部思维_\n${progress.map((step, index) => `${index + 1}. ${step}`).join('\n')}`,
             }]
           : []),
       ],

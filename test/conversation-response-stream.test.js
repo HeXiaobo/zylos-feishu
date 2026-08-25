@@ -161,7 +161,8 @@ test('phase events never fabricate answer deltas and completion may supply one f
   });
   const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
   assert.equal(finalCard.body.elements[1].content, '只有完整答案，没有伪造 token 流。');
-  assert.match(finalCard.body.elements[2].content, /处理过程/);
+  assert.match(finalCard.body.elements[2].content, /公开推理摘要/);
+  assert.match(finalCard.body.elements[2].content, /不包含模型内部思维/);
 }));
 
 test('keeps a bounded, de-duplicated public progress trace across restart', () => withState(async stateDirectory => {
