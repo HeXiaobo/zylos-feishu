@@ -74,6 +74,7 @@ function callback(action, context, actorId = 'ou_sender') {
 
 test('renders the required create/chat/edit confirmation choices', () => {
   const { card, buttons } = cardAndContext();
+  assert.equal(card.config.update_multi, true);
   assert.equal(card.header.title.content, '这条消息要创建任务吗？');
   assert.deepEqual(
     buttons.map((button) => button.text.content),

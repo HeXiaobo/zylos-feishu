@@ -135,7 +135,7 @@ export function createWorkIntakeConfirmationCardRenderer(input) {
       });
       const card = {
         schema: '2.0',
-        config: { update_multi: false, width_mode: 'fill' },
+        config: { update_multi: true, width_mode: 'fill' },
         header: {
           template: 'orange',
           title: { tag: 'plain_text', content: '这条消息要创建任务吗？' },
