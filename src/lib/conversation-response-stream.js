@@ -329,11 +329,33 @@ export function createConversationResponseStream({
     }), 'Feishu ordinary response card patch');
   }
 
+  async function settleInitialCardMode(state) {
+    if (state.mode !== 'conversion_pending') return;
+    const [initial] = state.cards;
+    const cardId = await convertCard(initial.messageId);
+    if (cardId) {
+      initial.cardId = cardId;
+      state.mode = 'cardkit';
+      save(state);
+      return;
+    }
+    const ordinary = renderCard({
+      phase: state.phase,
+      answer: state.output,
+      streaming: false,
+      part: 0,
+      totalParts: 1,
+    });
+    await patchOrdinary(initial.messageId, ordinary);
+    initial.rendered = ordinary;
+    state.mode = 'ordinary_card';
+    save(state);
+  }
+
   async function updateCard(state, cardState, card, purpose) {
     if (state.mode === 'ordinary_card') {
       await patchOrdinary(cardState.messageId, card);
       cardState.rendered = card;
-      save(state);
       return;
     }
     const sequence = nextSequence(cardState);
@@ -346,7 +368,6 @@ export function createConversationResponseStream({
       },
     }), 'Feishu response card update');
     cardState.rendered = card;
-    save(state);
   }
 
   async function closeCard(state, cardState, purpose) {
@@ -368,7 +389,6 @@ export function createConversationResponseStream({
       }), 'Feishu response card close');
     }
     cardState.closed = true;
-    save(state);
   }
 
   async function createContinuation(state, part, answer, totalParts, terminal) {
@@ -402,7 +422,6 @@ export function createConversationResponseStream({
       state.mode = 'ordinary_card';
     }
     state.cards.push(cardState);
-    save(state);
     if (terminal) await closeCard(state, cardState, `close-terminal-part-${part}`);
     return cardState;
   }
@@ -448,14 +467,34 @@ export function createConversationResponseStream({
       }
     }
     state.lastRenderedAt = clock();
-    save(state);
   }
 
   async function terminalCompatibility(requestId, output, status, phase) {
     const state = load(requestId);
     if (!state) return { handled: false, reason: 'stream_not_found' };
-    if (state.status === 'completed' && state.output === output) {
-      return { handled: true, messageId: state.cards[0]?.messageId || state.plainMessageId };
+    if (['completed', 'failed'].includes(state.status)) {
+      if (state.status === status && state.output === output) {
+        return { handled: true, replayed: true, messageId: state.cards[0]?.messageId || state.plainMessageId };
+      }
+      const error = new Error('conversation response stream already has a different terminal result');
+      error.code = 'ASSISTANT_TERMINAL_CONFLICT';
+      throw error;
+    }
+    try {
+      await settleInitialCardMode(state);
+    } catch (error) {
+      // The Core completion event is persisted after this compatibility call.
+      // Defer projection to that reliable delivery path instead of making the
+      // caller send a second answer card and orphaning the accepted placeholder.
+      logger.warn?.('Response placeholder repair deferred to durable event delivery', {
+        requestId,
+        error: error.message,
+      });
+      return {
+        handled: true,
+        pending: true,
+        messageId: state.cards[0]?.messageId || state.plainMessageId,
+      };
     }
     state.output = output;
     state.status = status;
@@ -490,47 +529,14 @@ export function createConversationResponseStream({
           totalParts: 1,
         });
         let state;
+        let messageId = null;
         try {
-          const messageId = await sendInteractive(
+          messageId = await sendInteractive(
             client,
             target,
             initialCard,
             stableToken(requestId, 'placeholder'),
           );
-          const cardId = await convertCard(messageId);
-          state = {
-            version: 1,
-            requestId,
-            target,
-            mode: cardId ? 'cardkit' : 'ordinary_card',
-            status: 'opening',
-            phase: '正在接收消息…',
-            output: '',
-            lastEventSequence: 0,
-            lastRenderedAt: clock(),
-            compatibilityTerminal: false,
-            plainTerminalSent: false,
-            cards: [{
-              part: 0,
-              messageId,
-              cardId,
-              nextSequence: 1,
-              closed: false,
-              rendered: initialCard,
-            }],
-          };
-          if (!cardId) {
-            logger.warn?.('CardKit conversion unavailable; using ordinary response card', { requestId });
-            const ordinary = renderCard({
-              phase: state.phase,
-              answer: '',
-              streaming: false,
-              part: 0,
-              totalParts: 1,
-            });
-            await patchOrdinary(messageId, ordinary);
-            state.cards[0].rendered = ordinary;
-          }
         } catch (error) {
           logger.warn?.('Interactive response placeholder failed; using plain text', {
             requestId,
@@ -558,6 +564,41 @@ export function createConversationResponseStream({
             cards: [],
           };
         }
+        if (messageId) {
+          state = {
+            version: 1,
+            requestId,
+            target,
+            mode: 'conversion_pending',
+            status: 'opening',
+            phase: '正在接收消息…',
+            output: '',
+            lastEventSequence: 0,
+            lastRenderedAt: clock(),
+            compatibilityTerminal: false,
+            plainTerminalSent: false,
+            cards: [{
+              part: 0,
+              messageId,
+              cardId: null,
+              nextSequence: 1,
+              closed: false,
+              rendered: initialCard,
+            }],
+          };
+          // Once Feishu has accepted the stable placeholder UUID, persist its
+          // ownership before attempting conversion.  A later conversion or
+          // patch failure must repair this message, never send a second one.
+          save(state);
+          try {
+            await settleInitialCardMode(state);
+          } catch (error) {
+            logger.warn?.('CardKit placeholder conversion is pending repair', {
+              requestId,
+              error: error.message,
+            });
+          }
+        }
         save(state);
         return {
           handled: true,
@@ -581,6 +622,7 @@ export function createConversationResponseStream({
       try {
         const state = load(requestId);
         if (!state) return { handled: false, reason: 'stream_not_found' };
+        await settleInitialCardMode(state);
         const events = request.events
           .map(event => validateEvent(event, requestId))
           .sort((left, right) => left.sequence - right.sequence);

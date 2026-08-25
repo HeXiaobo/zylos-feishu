@@ -448,6 +448,7 @@ async function send() {
         });
         streamed = result.handled === true;
       } catch (error) {
+        if (error?.code === 'ASSISTANT_TERMINAL_CONFLICT') throw error;
         console.warn(`[feishu] Same-card completion failed; using full-answer fallback: ${error.message}`);
       }
     }

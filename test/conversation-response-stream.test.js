@@ -237,6 +237,44 @@ test('survives process restart and resumes from persisted sequence without dupli
   );
 }));
 
+test('retries the same terminal projection when CardKit close fails after the content update', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let closeAttempts = 0;
+  client.cardkit.v1.card.settings = async payload => {
+    calls.push(['close', payload]);
+    closeAttempts += 1;
+    return closeAttempts === 1
+      ? { code: 230099, msg: 'temporary close failure' }
+      : { code: 0 };
+  };
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'AssistantRequestAccepted', { sourceId: 'om_1' }),
+      event(2, 'RunQueued'),
+      event(3, 'RunStarted'),
+    ],
+  });
+
+  await assert.rejects(
+    stream.apply({
+      requestId: 'assistant.feishu.om_1',
+      events: [event(4, 'RunCompleted', { output: '可恢复终态' })],
+    }),
+    /temporary close failure/,
+  );
+  const retried = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(4, 'RunCompleted', { output: '可恢复终态' })],
+  });
+
+  assert.equal(retried.replayed, false);
+  assert.equal(retried.status, 'completed');
+  assert.equal(calls.filter(([name]) => name === 'close').length, 2);
+}));
+
 test('serializes worker updates with the compatibility full-answer process', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const originalUpdate = client.cardkit.v1.card.update;
@@ -305,6 +343,66 @@ test('falls back to plain text when interactive creation fails and sends one ter
   assert.equal(JSON.parse(textSends[1][1].data.content).text, '纯文本降级答案');
 }));
 
+test('keeps the sent placeholder and repairs CardKit conversion without sending a second placeholder', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const originalConvert = client.cardkit.v1.card.idConvert;
+  let conversionAttempts = 0;
+  client.cardkit.v1.card.idConvert = async payload => {
+    conversionAttempts += 1;
+    if (conversionAttempts === 1) throw new Error('temporary conversion transport failure');
+    return originalConvert(payload);
+  };
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    logger: { warn() {} },
+  });
+
+  const opened = await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  assert.equal(opened.mode, 'conversion_pending');
+  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+
+  const applied = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'AssistantRequestAccepted', { sourceId: 'om_1' }),
+      event(2, 'RunQueued'),
+      event(3, 'RunStarted'),
+    ],
+  });
+  assert.equal(applied.status, 'started');
+  assert.equal(conversionAttempts, 2);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+  assert.equal(calls.filter(([name]) => name === 'update').length, 1);
+}));
+
+test('defers compatibility completion when placeholder repair still fails instead of sending another card', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  client.cardkit.v1.card.idConvert = async payload => {
+    calls.push(['convert', payload]);
+    throw new Error('conversion transport remains unavailable');
+  };
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    logger: { warn() {} },
+  });
+
+  const opened = await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  assert.equal(opened.mode, 'conversion_pending');
+  const completed = await stream.completeWithFullAnswer({
+    requestId: 'assistant.feishu.om_1',
+    output: '等待可靠事件投影的答案',
+  });
+
+  assert.equal(completed.handled, true);
+  assert.equal(completed.pending, true);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+  assert.equal(calls.filter(([name]) => name === 'update').length, 0);
+}));
+
 test('legacy full-answer completion finalizes the existing card and durable terminal replay is a no-op', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
@@ -325,4 +423,22 @@ test('legacy full-answer completion finalizes the existing card and durable term
     ],
   });
   assert.equal(calls.length, apiCallCount, 'durable replay must not reopen or duplicate a closed compatibility card');
+}));
+
+test('legacy compatibility completion cannot overwrite an existing terminal result', () => withState(async stateDirectory => {
+  const { client } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.completeWithFullAnswer({
+    requestId: 'assistant.feishu.om_1',
+    output: '第一个终态答案',
+  });
+
+  await assert.rejects(
+    stream.completeWithFullAnswer({
+      requestId: 'assistant.feishu.om_1',
+      output: '冲突的第二个答案',
+    }),
+    error => error?.code === 'ASSISTANT_TERMINAL_CONFLICT',
+  );
 }));
