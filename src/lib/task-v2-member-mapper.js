@@ -42,6 +42,7 @@ function deduplicateMembers(members) {
  */
 export function createTaskV2MemberMapper({
   appId,
+  agentId = null,
   agentAppIds = {},
   requireGatewayAppAssignee = false,
 } = {}) {
@@ -54,7 +55,11 @@ export function createTaskV2MemberMapper({
     if (!AGENT_ID.test(agentId)) throw new TypeError(`invalid Agent identity: ${agentId}`);
     return [agentId, requireText(mappedAppId, `agentAppIds.${agentId}`)];
   }));
-  if (!agentIds.has('agent:yueran')) agentIds.set('agent:yueran', gatewayAppId);
+  if (agentId !== null) {
+    const deploymentAgentId = requireText(agentId, 'agentId');
+    if (!AGENT_ID.test(deploymentAgentId)) throw new TypeError('agentId must be a logical Agent identity');
+    if (!agentIds.has(deploymentAgentId)) agentIds.set(deploymentAgentId, gatewayAppId);
+  }
 
   return Object.freeze({
     map(taskInput) {
@@ -81,7 +86,7 @@ export function createTaskV2MemberMapper({
         && member.role === 'assignee'
         && member.id === gatewayAppId
       ))) {
-        throw new TypeError('Task v2 MVP requires agent:yueran as assignee for crash-safe recovery');
+        throw new TypeError('Task v2 MVP requires the configured gateway Agent as assignee for crash-safe recovery');
       }
       return Object.freeze(result);
     },

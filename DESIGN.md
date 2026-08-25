@@ -264,13 +264,18 @@ receives this worker-start capability.
 `src/lib/task-v2-projection.js` is a second, Card-independent projection. Core
 is its only source of truth. It stores exactly one `feishu-task-v2` ExternalLink
 per Core task while leaving the existing `feishu` Card message link untouched.
-The SDK Adapter always uses the configured Zylos/Yueran App tenant identity;
-there is no user OAuth path and therefore no user refresh-token lifecycle.
+The SDK Adapter always uses the deployment's configured Feishu App tenant
+identity; there is no user OAuth path and therefore no user refresh-token
+lifecycle.
 
 The member mapping is deliberately narrow: Core Owner is a follower, a distinct
 Acceptor is another follower, and an explicit human or mapped Agent is the
-assignee. `agent:yueran` maps to `FEISHU_APP_ID`; additional logical agents can
-be configured as a JSON object in `FEISHU_TASK_V2_AGENT_APP_IDS`.
+assignee. `ZYLOS_AGENT_ID` maps the current deployment Agent to
+`FEISHU_APP_ID`; additional logical Agents are configured as a JSON object in
+`FEISHU_TASK_V2_AGENT_APP_IDS`. The universal module has no built-in Agent ID.
+Colleague-facing names come from `ZYLOS_AGENT_LABEL` or
+`ZYLOS_AGENT_LABELS`; an unknown label uses a generic readable fallback while
+an unmapped Task assignee fails closed.
 
 Native completion means "submitted by the executor": `ready` is first started
 and then moved to `review`, while `in_progress` moves directly to `review`.

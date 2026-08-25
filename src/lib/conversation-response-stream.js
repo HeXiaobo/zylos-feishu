@@ -107,13 +107,31 @@ function requireSuccess(response, operation) {
   if (response?.code !== 0) {
     const error = new Error(response?.msg || `${operation} failed`);
     error.code = response?.code;
+    error.deliveryOutcome = 'rejected';
     throw error;
   }
   return response;
 }
 
+function deliveryError(error) {
+  if (error?.deliveryOutcome === 'rejected') return error;
+  const explicitCode = error?.response?.data?.code;
+  if (Number.isInteger(explicitCode) && explicitCode !== 0) {
+    error.deliveryOutcome = 'rejected';
+    return error;
+  }
+  const uncertain = error instanceof Error ? error : new Error(String(error));
+  uncertain.code = 'FEISHU_DELIVERY_OUTCOME_UNKNOWN';
+  uncertain.deliveryOutcome = 'unknown';
+  return uncertain;
+}
+
 function stableToken(requestId, purpose) {
   return `zcr_${createHash('sha256').update(`${requestId}:${purpose}`).digest('hex').slice(0, 40)}`;
+}
+
+function outputHash(output) {
+  return createHash('sha256').update(output).digest('hex');
 }
 
 function statePath(directory, requestId) {
@@ -316,13 +334,21 @@ async function sendMessage(client, target, msgType, content, uuid) {
 }
 
 async function sendInteractive(client, target, card, uuid) {
-  const response = await sendMessage(client, target, 'interactive', JSON.stringify(card), uuid);
-  return requireText(response.data?.message_id, 'Feishu response messageId');
+  try {
+    const response = await sendMessage(client, target, 'interactive', JSON.stringify(card), uuid);
+    return requireText(response.data?.message_id, 'Feishu response messageId');
+  } catch (error) {
+    throw deliveryError(error);
+  }
 }
 
 async function sendPlain(client, target, text, uuid) {
-  const response = await sendMessage(client, target, 'text', JSON.stringify({ text }), uuid);
-  return requireText(response.data?.message_id, 'Feishu fallback messageId');
+  try {
+    const response = await sendMessage(client, target, 'text', JSON.stringify({ text }), uuid);
+    return requireText(response.data?.message_id, 'Feishu fallback messageId');
+  } catch (error) {
+    throw deliveryError(error);
+  }
 }
 
 function validateEvent(event, requestId) {
@@ -401,6 +427,22 @@ export function createConversationResponseStream({
 
   function save(state) {
     atomicWrite(statePath(stateDirectory, state.requestId), state);
+  }
+
+  function compactTerminalState(state) {
+    const terminalOutput = typeof state.output === 'string' ? state.output : '';
+    state.outputHash = outputHash(terminalOutput);
+    state.terminalTombstone = true;
+    state.terminalAt = clock();
+    clearTransientProcess(state);
+    delete state.output;
+    for (const card of state.cards) delete card.rendered;
+  }
+
+  function terminalOutputMatches(state, output) {
+    return typeof state.output === 'string'
+      ? state.output === output
+      : state.outputHash === outputHash(output);
   }
 
   async function acquireRequestLock(requestId) {
@@ -615,8 +657,9 @@ export function createConversationResponseStream({
   async function terminalCompatibility(requestId, output, status, phase) {
     const state = load(requestId);
     if (!state) return { handled: false, reason: 'stream_not_found' };
+    if (state.mode === 'delivery_pending') await finishOpening(state);
     if (['completed', 'failed'].includes(state.status)) {
-      if (state.status === status && state.output === output) {
+      if (state.status === status && terminalOutputMatches(state, output)) {
         return { handled: true, replayed: true, messageId: state.cards[0]?.messageId || state.plainMessageId };
       }
       const error = new Error('conversation response stream already has a different terminal result');
@@ -645,8 +688,144 @@ export function createConversationResponseStream({
     clearTransientProcess(state);
     state.compatibilityTerminal = true;
     await render(state, { terminal: true, purpose: 'compatibility-terminal' });
+    compactTerminalState(state);
     save(state);
     return { handled: true, messageId: state.cards[0]?.messageId || state.plainMessageId };
+  }
+
+  function newOpeningState(requestId, target) {
+    return {
+      version: 1,
+      requestId,
+      target,
+      mode: 'delivery_pending',
+      delivery: {
+        kind: 'interactive_placeholder',
+        status: 'pending',
+        uuid: stableToken(requestId, 'placeholder'),
+      },
+      status: 'opening',
+      phase: '正在接收消息…',
+      progress: [],
+      publicReasoning: '',
+      output: '',
+      lastEventSequence: 0,
+      lastRenderedAt: clock(),
+      compatibilityTerminal: false,
+      plainTerminalSent: false,
+      plainTerminalFingerprint: null,
+      cards: [],
+    };
+  }
+
+  async function finishOpening(state) {
+    const initialCard = renderCard({
+      phase: '正在接收消息…',
+      answer: '',
+      streaming: true,
+      part: 0,
+      totalParts: 1,
+    });
+    if (state.delivery.kind === 'interactive_placeholder') {
+      let messageId;
+      try {
+        messageId = await sendInteractive(
+          client,
+          state.target,
+          initialCard,
+          state.delivery.uuid,
+        );
+      } catch (error) {
+        state.delivery.lastError = error.message;
+        save(state);
+        if (error.deliveryOutcome !== 'rejected') throw error;
+        logger.warn?.('Interactive response placeholder was rejected; using plain text', {
+          requestId: state.requestId,
+          error: error.message,
+        });
+        state.delivery = {
+          kind: 'plain_placeholder',
+          status: 'pending',
+          uuid: stableToken(state.requestId, 'plain-placeholder'),
+        };
+        save(state);
+      }
+      if (messageId) {
+        state.delivery.status = 'sent';
+        state.delivery.messageId = messageId;
+        delete state.delivery.lastError;
+        state.mode = 'conversion_pending';
+        state.cards = [{
+          part: 0,
+          messageId,
+          cardId: null,
+          nextSequence: 1,
+          closed: false,
+          rendered: initialCard,
+        }];
+        save(state);
+        try {
+          await settleInitialCardMode(state);
+        } catch (error) {
+          logger.warn?.('CardKit placeholder conversion is pending repair', {
+            requestId: state.requestId,
+            error: error.message,
+          });
+        }
+        save(state);
+        return;
+      }
+    }
+
+    if (state.delivery.kind === 'plain_placeholder') {
+      try {
+        const plainMessageId = await sendPlain(
+          client,
+          state.target,
+          '已接收，正在处理…',
+          state.delivery.uuid,
+        );
+        state.delivery.status = 'sent';
+        state.delivery.messageId = plainMessageId;
+        delete state.delivery.lastError;
+        state.plainMessageId = plainMessageId;
+        state.mode = 'plain_text';
+        save(state);
+      } catch (error) {
+        state.delivery.lastError = error.message;
+        save(state);
+        throw error;
+      }
+    }
+  }
+
+  async function finishCompletedPlain(state, output) {
+    try {
+      const messageId = await sendPlain(
+        client,
+        state.target,
+        output || '处理完成。',
+        state.delivery.uuid,
+      );
+      state.plainMessageId = messageId;
+      state.delivery.status = 'sent';
+      state.delivery.messageId = messageId;
+      delete state.delivery.lastError;
+      compactTerminalState(state);
+      save(state);
+      return {
+        handled: true,
+        replayed: false,
+        mode: 'plain_text',
+        parts: 1,
+        messageId,
+      };
+    } catch (error) {
+      state.delivery.lastError = error.message;
+      save(state);
+      error.deliveredParts = 0;
+      throw error;
+    }
   }
 
   return Object.freeze({
@@ -669,43 +848,60 @@ export function createConversationResponseStream({
       const output = typeof request.output === 'string' ? request.output : String(request.output || '');
       const release = await acquireRequestLock(requestId);
       try {
-        const existing = load(requestId);
-        if (existing) {
-          if (existing.status !== 'completed'
-            || existing.output !== output
-            || JSON.stringify(existing.target) !== JSON.stringify(target)) {
+        let state = load(requestId);
+        if (state) {
+          if (state.status !== 'completed'
+            || !terminalOutputMatches(state, output)
+            || JSON.stringify(state.target) !== JSON.stringify(target)) {
             const error = new Error('completed response requestId already owns different content');
             error.code = 'ASSISTANT_TERMINAL_CONFLICT';
             throw error;
           }
-          return {
-            handled: true,
-            replayed: true,
-            parts: existing.cards.length,
-            messageId: existing.cards[0]?.messageId || existing.plainMessageId,
-          };
+          if (state.delivery?.status === 'sent') {
+            return {
+              handled: true,
+              replayed: true,
+              parts: state.cards.length,
+              messageId: state.cards[0]?.messageId || state.plainMessageId,
+            };
+          }
+          if (!state.delivery && (state.cards.length > 0 || state.plainMessageId)) {
+            return {
+              handled: true,
+              replayed: true,
+              parts: state.cards.length || 1,
+              messageId: state.cards[0]?.messageId || state.plainMessageId,
+            };
+          }
         }
 
-        const state = {
-          version: 1,
-          requestId,
-          target,
-          mode: 'ordinary_card',
-          status: 'completed',
-          phase: '✅ 已完成',
-          progress: [],
-          publicReasoning: '',
-          output,
-          lastEventSequence: 0,
-          lastRenderedAt: clock(),
-          compatibilityTerminal: false,
-          plainTerminalSent: false,
-          plainTerminalFingerprint: null,
-          cards: [],
-        };
+        if (!state) {
+          state = {
+            version: 1,
+            requestId,
+            target,
+            mode: 'ordinary_card',
+            delivery: { kind: 'completed_cards', status: 'pending' },
+            status: 'completed',
+            phase: '✅ 已完成',
+            progress: [],
+            publicReasoning: '',
+            output,
+            lastEventSequence: 0,
+            lastRenderedAt: clock(),
+            compatibilityTerminal: false,
+            plainTerminalSent: false,
+            plainTerminalFingerprint: null,
+            cards: [],
+          };
+          save(state);
+        }
+        if (state.delivery?.kind === 'completed_plain') {
+          return finishCompletedPlain(state, output);
+        }
         const segments = splitUtf8(output, answerBytesPerCard);
         try {
-          for (let part = 0; part < segments.length; part += 1) {
+          for (let part = state.cards.length; part < segments.length; part += 1) {
             const card = renderCard({
               phase: state.phase,
               answer: segments[part],
@@ -713,11 +909,15 @@ export function createConversationResponseStream({
               part,
               totalParts: segments.length,
             });
+            state.delivery.part = part;
+            state.delivery.uuid = stableToken(requestId, `completed:${part}`);
+            delete state.delivery.lastError;
+            save(state);
             const messageId = await sendInteractive(
               client,
               target,
               card,
-              stableToken(requestId, `completed:${part}`),
+              state.delivery.uuid,
             );
             state.cards.push({
               part,
@@ -730,9 +930,31 @@ export function createConversationResponseStream({
             save(state);
           }
         } catch (error) {
+          state.delivery.lastError = error.message;
+          save(state);
           error.deliveredParts = state.cards.length;
+          if (error.deliveryOutcome === 'rejected' && state.cards.length === 0) {
+            logger.warn?.('Completed response card was rejected; using one idempotent plain fallback', {
+              requestId,
+              error: error.message,
+            });
+            state.mode = 'plain_text';
+            state.delivery = {
+              kind: 'completed_plain',
+              status: 'pending',
+              uuid: stableToken(requestId, 'completed-plain'),
+            };
+            save(state);
+            return finishCompletedPlain(state, output);
+          }
           throw error;
         }
+        state.delivery.status = 'sent';
+        delete state.delivery.part;
+        delete state.delivery.uuid;
+        delete state.delivery.lastError;
+        compactTerminalState(state);
+        save(state);
         return {
           handled: true,
           replayed: false,
@@ -756,94 +978,21 @@ export function createConversationResponseStream({
           if (JSON.stringify(existing.target) !== JSON.stringify(target)) {
             throw new Error('response stream requestId belongs to a different target');
           }
+          if (existing.mode === 'delivery_pending') {
+            await finishOpening(existing);
+            return {
+              handled: true,
+              replayed: false,
+              mode: existing.mode,
+              messageId: existing.cards[0]?.messageId || existing.plainMessageId,
+            };
+          }
           return { handled: true, replayed: true, mode: existing.mode, messageId: existing.cards[0]?.messageId || existing.plainMessageId };
         }
 
-        const initialCard = renderCard({
-          phase: '正在接收消息…',
-          answer: '',
-          streaming: true,
-          part: 0,
-          totalParts: 1,
-        });
-        let state;
-        let messageId = null;
-        try {
-          messageId = await sendInteractive(
-            client,
-            target,
-            initialCard,
-            stableToken(requestId, 'placeholder'),
-          );
-        } catch (error) {
-          logger.warn?.('Interactive response placeholder failed; using plain text', {
-            requestId,
-            error: error.message,
-          });
-          const plainMessageId = await sendPlain(
-            client,
-            target,
-            '已接收，正在处理…',
-            stableToken(requestId, 'plain-placeholder'),
-          );
-          state = {
-            version: 1,
-            requestId,
-            target,
-            mode: 'plain_text',
-            plainMessageId,
-            status: 'opening',
-            phase: '正在接收消息…',
-            progress: [],
-            publicReasoning: '',
-            output: '',
-            lastEventSequence: 0,
-            lastRenderedAt: clock(),
-            compatibilityTerminal: false,
-            plainTerminalSent: false,
-            plainTerminalFingerprint: null,
-            cards: [],
-          };
-        }
-        if (messageId) {
-          state = {
-            version: 1,
-            requestId,
-            target,
-            mode: 'conversion_pending',
-            status: 'opening',
-            phase: '正在接收消息…',
-            progress: [],
-            publicReasoning: '',
-            output: '',
-            lastEventSequence: 0,
-            lastRenderedAt: clock(),
-            compatibilityTerminal: false,
-            plainTerminalSent: false,
-            plainTerminalFingerprint: null,
-            cards: [{
-              part: 0,
-              messageId,
-              cardId: null,
-              nextSequence: 1,
-              closed: false,
-              rendered: initialCard,
-            }],
-          };
-          // Once Feishu has accepted the stable placeholder UUID, persist its
-          // ownership before attempting conversion.  A later conversion or
-          // patch failure must repair this message, never send a second one.
-          save(state);
-          try {
-            await settleInitialCardMode(state);
-          } catch (error) {
-            logger.warn?.('CardKit placeholder conversion is pending repair', {
-              requestId,
-              error: error.message,
-            });
-          }
-        }
+        const state = newOpeningState(requestId, target);
         save(state);
+        await finishOpening(state);
         return {
           handled: true,
           replayed: false,
@@ -866,12 +1015,21 @@ export function createConversationResponseStream({
       try {
         const state = load(requestId);
         if (!state) return { handled: false, reason: 'stream_not_found' };
+        if (state.mode === 'delivery_pending') await finishOpening(state);
         await settleInitialCardMode(state);
         const events = request.events
           .map(event => validateEvent(event, requestId))
           .sort((left, right) => left.sequence - right.sequence);
+        if (state.terminalTombstone && !state.compatibilityTerminal) {
+          if (events.every(event => event.sequence <= state.lastEventSequence)) {
+            return { handled: true, replayed: true, status: state.status };
+          }
+          const error = new Error('conversation response stream is already terminal');
+          error.code = 'ASSISTANT_TERMINAL_CONFLICT';
+          throw error;
+        }
         const compatibility = state.compatibilityTerminal
-          ? { status: state.status, output: state.output, phase: state.phase }
+          ? { status: state.status, outputHash: state.outputHash, phase: state.phase }
           : null;
         let canonicalStatus = compatibility ? null : state.status;
         let canonicalPhase = compatibility ? state.phase : null;
@@ -943,16 +1101,19 @@ export function createConversationResponseStream({
             return { handled: true, replayed: false, status: compatibility.status };
           }
           const sameTerminal = canonicalStatus === compatibility.status
-            && canonicalOutput === compatibility.output;
+            && outputHash(canonicalOutput) === compatibility.outputHash;
           state.status = canonicalStatus;
           state.phase = canonicalPhase;
-          state.output = canonicalOutput;
           state.compatibilityTerminal = false;
           delete state.durableOutput;
           if (sameTerminal) {
             save(state);
             return { handled: true, replayed: false, status: state.status };
           }
+          state.output = canonicalOutput;
+          state.terminalTombstone = false;
+          delete state.outputHash;
+          delete state.terminalAt;
         }
 
         const elapsed = clock() - state.lastRenderedAt;
@@ -960,6 +1121,7 @@ export function createConversationResponseStream({
           await pause(throttleMs - elapsed);
         }
         await render(state, { terminal, purpose: `event-${state.lastEventSequence}` });
+        if (terminal) compactTerminalState(state);
         save(state);
         return {
           handled: true,

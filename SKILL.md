@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.7-3ai.5
+version: 0.3.7-rc.1
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),
@@ -172,8 +172,25 @@ narrow publisher Interface. Cards use Card JSON 2.0, stable create UUIDs, Core
 task versions as CardKit update sequences, and signed callback contexts.
 
 The paired release's pre-install/pre-upgrade gate also requires Core's
-`c4.reply.argv-compat` capability, so rolling upgrades cannot disconnect older
-endpoint-addressed reply callers.
+`c4.reply.argv-compat` capability and `c4.assistant-response-stream >= 2`.
+Protocol v2 is the turn-safe request-binding and stable-delivery contract; an
+older Core must fail the compatibility gate instead of starting this component.
+
+Configure deployment identity explicitly in `~/zylos/.env`; the universal
+component has no built-in Agent name or logical Agent-to-App mapping:
+
+```sh
+ZYLOS_AGENT_ID=agent:your-agent
+ZYLOS_AGENT_LABEL="Your Agent（AI）"
+ZYLOS_AGENT_LABELS='{"agent:another-agent":"Another Agent（AI）"}'
+FEISHU_TASK_V2_AGENT_APP_IDS='{"agent:another-agent":"cli_other_app"}'
+```
+
+`ZYLOS_AGENT_ID` maps the current deployment's logical Agent to
+`FEISHU_APP_ID`. `FEISHU_TASK_V2_AGENT_APP_IDS` supplies any additional App
+identities, and `ZYLOS_AGENT_LABELS` controls colleague-facing card names.
+Unknown logical Agents fail closed in Task v2 projection; missing labels fall
+back to a readable generic AI-employee label.
 
 The paired Core/Feishu release requires Node.js 20.20.0 or newer. Before the
 canary, grant `task:task:read`, `task:task:write`, and task-comment read/write
@@ -473,7 +490,8 @@ Groups are stored in a map keyed by `chat_id`:
 
 ### Markdown Card
 
-Outgoing messages can be rendered as interactive cards with proper markdown formatting (code blocks, tables, headers, etc.):
+Assistant text is rendered consistently as an interactive response card,
+including plain text, Markdown, streamed replies, and proactive C4 delivery:
 
 ```json
 {
@@ -483,7 +501,21 @@ Outgoing messages can be rendered as interactive cards with proper markdown form
 }
 ```
 
-On by default. Note mobile display limitation: cards cannot be long-pressed to copy on mobile. Can be disabled via `node admin.js set-markdown-card off`. When enabled (cards cannot be long-pressed to copy on mobile). When enabled, messages containing markdown are auto-detected and sent as cards; plain text messages are sent normally. Falls back to plain text if card sending fails.
+On by default. Ordinary conversations open one placeholder card and update that
+same card; proactive delivery sends the same completed-card format directly.
+Core supplies `C4_ASSISTANT_REQUEST_ID` or a persisted `C4_DELIVERY_ID`, from
+which this component derives a stable Feishu UUID. An ambiguous network outcome
+is never followed by a second text message: the pending intent is persisted and
+retried with the same UUID. Plain text is used only after Feishu explicitly
+rejects card creation, also with a stable UUID. Without a stable C4 delivery
+identity, proactive card delivery degrades safely to the legacy plain path.
+
+Running progress and public work summaries disappear at terminal state. The
+local stream record is then compacted to a tombstone containing hashes and
+delivery metadata, not the full answer or process summary. Mobile Feishu cards
+cannot always be long-pressed to copy; there is intentionally no custom
+"copyable text" action. Disable cards with
+`node admin.js set-markdown-card off` if native text selection is required.
 
 ## Group Context
 

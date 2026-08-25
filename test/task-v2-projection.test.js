@@ -117,7 +117,7 @@ function delivery(taskId = 'task-1', version = 1) {
 }
 
 test('maps owner/acceptor followers and Agent or human assignees without changing Core roles', () => {
-  const mapper = createTaskV2MemberMapper({ appId: APP_ID });
+  const mapper = createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' });
   assert.deepEqual(mapper.map(coreTask()), [
     { id: 'ou_owner', type: 'user', role: 'follower' },
     { id: 'ou_acceptor', type: 'user', role: 'follower' },
@@ -136,11 +136,20 @@ test('maps owner/acceptor followers and Agent or human assignees without changin
   );
   const crashSafeMapper = createTaskV2MemberMapper({
     appId: APP_ID,
+    agentId: 'agent:yueran',
     requireGatewayAppAssignee: true,
   });
   assert.throws(
     () => crashSafeMapper.map(coreTask({ assigneeId: 'ou_executor' })),
-    /requires agent:yueran as assignee/,
+    /requires the configured gateway Agent as assignee/,
+  );
+});
+
+test('does not silently bind the universal gateway to a deployment-specific Agent', () => {
+  const mapper = createTaskV2MemberMapper({ appId: APP_ID });
+  assert.throws(
+    () => mapper.map(coreTask()),
+    /no Feishu App mapping: agent:yueran/,
   );
 });
 
@@ -165,7 +174,7 @@ test('creates one native Task, returns its URL, preserves the Card link, and upd
   const projection = createTaskV2Projection({
     core: harness.core,
     gateway,
-    memberMapper: createTaskV2MemberMapper({ appId: APP_ID }),
+    memberMapper: createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }),
   });
 
   assert.deepEqual(await projection.publishBatch({ deliveries: [delivery()] }), [{
@@ -193,7 +202,7 @@ test('recovers a remote create after the short client_token window and rejects d
   const recoveredHarness = fakeCore();
   const recovered = createTaskV2Projection({
     core: recoveredHarness.core,
-    memberMapper: createTaskV2MemberMapper({ appId: APP_ID }),
+    memberMapper: createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }),
     gateway: {
       async findTasksByCoreTaskId() {
         return [{ guid: 'guid-orphan', url: 'https://task/guid-orphan' }];
@@ -210,7 +219,7 @@ test('recovers a remote create after the short client_token window and rejects d
 
   const duplicate = createTaskV2Projection({
     core: fakeCore().core,
-    memberMapper: createTaskV2MemberMapper({ appId: APP_ID }),
+    memberMapper: createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }),
     gateway: {
       async findTasksByCoreTaskId() {
         return [
@@ -234,7 +243,7 @@ test('platform failure leaves Core intact for retry and a GUID conflict is perma
   outage.retryable = true;
   const projection = createTaskV2Projection({
     core: retryHarness.core,
-    memberMapper: createTaskV2MemberMapper({ appId: APP_ID }),
+    memberMapper: createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }),
     gateway: {
       async findTasksByCoreTaskId() { return []; },
       async createTask() { throw outage; },
@@ -252,7 +261,7 @@ test('platform failure leaves Core intact for retry and a GUID conflict is perma
   });
   const conflict = createTaskV2Projection({
     core: conflictHarness.core,
-    memberMapper: createTaskV2MemberMapper({ appId: APP_ID }),
+    memberMapper: createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }),
     gateway: {
       async findTasksByCoreTaskId() { return []; },
       async createTask() { return { guid: 'guid-shared', url: 'https://task/guid-shared' }; },
@@ -431,7 +440,7 @@ test('SDK Adapter uses tenant Task v2 create/patch/member calls with client_toke
     } } },
   };
   const gateway = createSdkTaskV2Gateway({ client });
-  const members = createTaskV2MemberMapper({ appId: APP_ID }).map(coreTask());
+  const members = createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }).map(coreTask());
   const created = await gateway.createTask({
     task: coreTask(), members, clientToken: 'zt2_create',
   });
@@ -470,7 +479,7 @@ test('SDK Adapter does not complete an already-completed native Task again on Co
     version: 4,
     updatedAt: '2026-08-26T11:00:00.000Z',
   });
-  const members = createTaskV2MemberMapper({ appId: APP_ID }).map(task);
+  const members = createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }).map(task);
   const current = sdkTask({
     summary: task.title,
     description: `${task.description}\n\nZylos Core Task: ${task.id}`,

@@ -26,7 +26,7 @@ function createClient({ conversion = true, interactiveFailure = false } = {}) {
     const content = payload.data?.content;
     const parsed = typeof content === 'string' ? JSON.parse(content) : content;
     if (interactiveFailure && parsed?.schema === '2.0') {
-      throw new Error('interactive unavailable');
+      return { code: 230001, msg: 'interactive unavailable' };
     }
     messages += 1;
     return { code: 0, data: { message_id: `om_response_${messages}` } };
@@ -209,6 +209,93 @@ test('sends proactive text as the same completed response card without a placeho
   assert.equal(card.body.elements[1].content, output);
 }));
 
+test('persists proactive delivery intent and retries the same Feishu UUID after an unknown outcome', () => withState(async stateDirectory => {
+  const attempts = [];
+  let loseFirstResponse = true;
+  const { client, calls } = createClient();
+  const originalCreate = client.im.message.create;
+  client.im.message.create = async payload => {
+    attempts.push(payload.data.uuid);
+    if (loseFirstResponse) {
+      loseFirstResponse = false;
+      throw new Error('response lost after Feishu accepted the card');
+    }
+    return originalCreate(payload);
+  };
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  const request = {
+    requestId: 'c4.delivery.4821',
+    target: target(),
+    output: '稳定投递的主动消息',
+  };
+
+  await assert.rejects(
+    stream.sendCompleted(request),
+    error => error?.code === 'FEISHU_DELIVERY_OUTCOME_UNKNOWN',
+  );
+  const pending = JSON.parse(fs.readFileSync(
+    path.join(stateDirectory, fs.readdirSync(stateDirectory).find(name => name.endsWith('.json'))),
+    'utf8',
+  ));
+  assert.equal(pending.delivery.status, 'pending');
+  assert.equal(pending.output, request.output);
+
+  const recovered = await stream.sendCompleted(request);
+  assert.equal(recovered.replayed, false);
+  assert.deepEqual(attempts, [attempts[0], attempts[0]]);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+}));
+
+test('uses one idempotent plain fallback only after Feishu explicitly rejects a proactive card', () => withState(async stateDirectory => {
+  const { client, calls } = createClient({ interactiveFailure: true });
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    logger: { warn() {} },
+  });
+  const request = {
+    requestId: 'c4.delivery.explicit-reject',
+    target: target(),
+    output: '纯文本安全降级',
+  };
+
+  const delivered = await stream.sendCompleted(request);
+  const replay = await stream.sendCompleted(request);
+  const textSends = calls.filter(([, payload]) => Object.hasOwn(JSON.parse(payload.data.content), 'text'));
+
+  assert.equal(delivered.mode, 'plain_text');
+  assert.equal(replay.replayed, true);
+  assert.equal(textSends.length, 1);
+  assert.equal(JSON.parse(textSends[0][1].data.content).text, request.output);
+}));
+
+test('treats a completed pre-v2 state without delivery metadata as an already-sent replay', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  const request = {
+    requestId: 'assistant.feishu.legacy-completed',
+    target: target(),
+    output: '旧版已发送回答',
+  };
+  await stream.sendCompleted(request);
+  const filePath = path.join(
+    stateDirectory,
+    fs.readdirSync(stateDirectory).find(name => name.endsWith('.json')),
+  );
+  const legacy = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  delete legacy.delivery;
+  delete legacy.outputHash;
+  delete legacy.terminalAt;
+  delete legacy.terminalTombstone;
+  legacy.output = request.output;
+  fs.writeFileSync(filePath, `${JSON.stringify(legacy)}\n`);
+
+  const replay = await stream.sendCompleted(request);
+  assert.equal(replay.replayed, true);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+}));
+
 test('streams public reasoning in its own card region without mixing it into the answer', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
@@ -256,6 +343,10 @@ test('streams public reasoning in its own card region without mixing it into the
   ));
   assert.equal(finalState.publicReasoning, '');
   assert.deepEqual(finalState.progress, []);
+  assert.equal(finalState.output, undefined);
+  assert.match(finalState.outputHash, /^[a-f0-9]{64}$/);
+  assert.equal(finalState.terminalTombstone, true);
+  assert.equal(JSON.stringify(finalState).includes('这是最终答案。'), false);
 }));
 
 test('keeps a bounded, de-duplicated public progress trace across restart', () => withState(async stateDirectory => {
@@ -506,6 +597,45 @@ test('falls back to plain text when interactive creation fails and sends one ter
   });
   assert.equal(textSends.length, 2);
   assert.equal(JSON.parse(textSends[1][1].data.content).text, '纯文本降级答案');
+}));
+
+test('does not send a second plain message when placeholder delivery has an unknown outcome', () => withState(async stateDirectory => {
+  const attempts = [];
+  let loseFirstResponse = true;
+  const { client, calls } = createClient();
+  const originalCreate = client.im.message.create;
+  client.im.message.create = async payload => {
+    attempts.push(payload.data.uuid);
+    if (loseFirstResponse) {
+      loseFirstResponse = false;
+      throw new Error('socket closed after upload');
+    }
+    return originalCreate(payload);
+  };
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    logger: { warn() {} },
+  });
+
+  await assert.rejects(
+    stream.open({ requestId: 'assistant.feishu.om_1', target: target() }),
+    error => error?.code === 'FEISHU_DELIVERY_OUTCOME_UNKNOWN',
+  );
+  assert.equal(calls.filter(([name]) => name === 'send').length, 0);
+
+  const recovered = await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  assert.equal(recovered.replayed, false);
+  assert.deepEqual(attempts, [attempts[0], attempts[0]]);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+  const persisted = JSON.parse(fs.readFileSync(
+    fs.readdirSync(stateDirectory).find(name => name.endsWith('.json'))
+      ? path.join(stateDirectory, fs.readdirSync(stateDirectory).find(name => name.endsWith('.json')))
+      : '',
+    'utf8',
+  ));
+  assert.equal(persisted.delivery.status, 'sent');
 }));
 
 test('keeps the sent placeholder and repairs CardKit conversion without sending a second placeholder', () => withState(async stateDirectory => {

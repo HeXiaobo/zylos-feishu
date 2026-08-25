@@ -79,17 +79,18 @@ test('fails open with a readable, cached short label when Feishu lookup is unava
   assert.doesNotMatch(JSON.stringify(first), /ou_0123456789/);
 });
 
-test('renders the known logical agent as a colleague-facing name without a contact lookup', async () => {
+test('renders deployment-configured Agent labels without a contact lookup', async () => {
   const resolver = createTaskCardIdentityResolver({
     client: {},
     clock: () => 1_000,
     ttlMs: 100,
     maxEntries: 2,
+    agentLabels: { 'agent:mylos': 'Mylos（AI）' },
   });
 
-  assert.deepEqual(await resolver.resolve(task('agent:yueran')), {
-    owner: '玥然（AI）',
-    acceptor: '玥然（AI）',
-    assignee: '玥然（AI）',
+  assert.deepEqual(await resolver.resolve(task('agent:mylos')), {
+    owner: 'Mylos（AI）',
+    acceptor: 'Mylos（AI）',
+    assignee: 'Mylos（AI）',
   });
 });

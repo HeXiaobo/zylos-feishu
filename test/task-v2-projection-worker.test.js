@@ -55,13 +55,19 @@ test('production runtime shares one App identity and an injectable durable statu
     async addMembers() {}, async removeMembers() {}, async list() {},
   };
   const runtime = createTaskV2ProjectionRuntime({
-    env: { FEISHU_APP_ID: 'cli_yueran' },
+    env: { FEISHU_APP_ID: 'cli_gateway', ZYLOS_AGENT_ID: 'agent:mylos' },
     client: { task: { v2: { task: taskApi } } },
     statusInbox,
   });
 
-  assert.equal(runtime.appId, 'cli_yueran');
+  assert.equal(runtime.appId, 'cli_gateway');
   assert.equal(runtime.statusInbox, statusInbox);
+  assert.deepEqual(runtime.memberMapper.map({
+    ownerId: 'ou_owner', acceptorId: 'ou_owner', assigneeId: 'agent:mylos',
+  }), [
+    { id: 'ou_owner', type: 'user', role: 'follower' },
+    { id: 'cli_gateway', type: 'app', role: 'assignee' },
+  ]);
 });
 
 test('registers a separately named Task v2 projection with explicit history policy', () => {
@@ -88,7 +94,7 @@ test('one worker cycle injects the Core batch worker and always closes Core', as
       },
       async updateTask() { throw new Error('unexpected update'); },
     },
-    memberMapper: createTaskV2MemberMapper({ appId: 'cli_yueran' }),
+    memberMapper: createTaskV2MemberMapper({ appId: 'cli_yueran', agentId: 'agent:yueran' }),
     openCore: () => harness.core,
     async processBatch(options) {
       assert.equal(options.projection, TASK_V2_PROJECTION);
@@ -138,7 +144,7 @@ test('one worker cycle drains the durable reverse-status inbox after outbound se
       async updateTask() { throw new Error('unexpected update'); },
       async getTask() { throw new Error('unlinked event must not read Feishu'); },
     },
-    memberMapper: createTaskV2MemberMapper({ appId: 'cli_yueran' }),
+    memberMapper: createTaskV2MemberMapper({ appId: 'cli_yueran', agentId: 'agent:yueran' }),
     openCore: () => harness.core,
     async processBatch() {
       return { projection: TASK_V2_PROJECTION, idle: true };

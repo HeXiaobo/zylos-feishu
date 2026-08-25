@@ -13,7 +13,6 @@
  */
 
 import dotenv from 'dotenv';
-import { randomUUID } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
@@ -25,6 +24,10 @@ import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile,
 import { initMention, buildMentionContent, buildMentionMarkdown } from '../src/lib/mention.js';
 import { getClient } from '../src/lib/client.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
+import {
+  completedCardFailureAction,
+  requestIdForC4Delivery,
+} from '../src/lib/c4-delivery-policy.js';
 import {
   createCoreFirstTaskCommentReply,
   createCoreTaskV2CommentMapping,
@@ -184,23 +187,28 @@ async function sendText(endpoint, text) {
   const isDM = type === 'p2p';
 
   if (useCard) {
-    const replyToMessageId = chooseReplyTarget(parsedEndpoint, { isFirstChunk: true }) || null;
-    const cardText = convertAtMentionsForCard(buildMentionMarkdown(text));
-    try {
-      const responseStream = createConversationResponseStream({ client: getClient() });
-      await responseStream.sendCompleted({
-        requestId: `assistant.feishu.proactive.${randomUUID()}`,
-        target: {
-          chatId,
-          chatType: isDM ? 'p2p' : 'group',
-          replyToMessageId,
-        },
-        output: cardText,
-      });
-      return;
-    } catch (error) {
-      if ((error.deliveredParts || 0) > 0) throw error;
-      console.log('[feishu] Completed card send failed, falling back to text:', error.message);
+    const requestId = requestIdForC4Delivery(process.env);
+    if (!requestId) {
+      console.warn('[feishu] Unified card skipped: Core did not provide a stable C4 delivery identity');
+    } else {
+      const replyToMessageId = chooseReplyTarget(parsedEndpoint, { isFirstChunk: true }) || null;
+      const cardText = convertAtMentionsForCard(buildMentionMarkdown(text));
+      try {
+        const responseStream = createConversationResponseStream({ client: getClient() });
+        await responseStream.sendCompleted({
+          requestId,
+          target: {
+            chatId,
+            chatType: isDM ? 'p2p' : 'group',
+            replyToMessageId,
+          },
+          output: cardText,
+        });
+        return;
+      } catch (error) {
+        if (completedCardFailureAction(error) !== 'fallback_text') throw error;
+        console.log('[feishu] Completed card send failed, falling back to text:', error.message);
+      }
     }
   }
 
@@ -451,8 +459,10 @@ async function send() {
           });
           streamed = result.handled === true;
         } catch (error) {
-          if (error?.code === 'ASSISTANT_TERMINAL_CONFLICT') throw error;
-          console.warn(`[feishu] Same-card completion failed; using full-answer fallback: ${error.message}`);
+          // The placeholder already owns this assistant request. Any error here
+          // is retried against that same durable stream; emitting a fresh
+          // message would risk a duplicate after an ambiguous Feishu outcome.
+          throw error;
         }
       }
 

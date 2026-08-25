@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Persist response-card delivery intent before sending, retry ambiguous Feishu outcomes with the same UUID, and use a single idempotent plain fallback only after explicit card rejection.
+- Derive proactive card identity from Core's stable `C4_DELIVERY_ID`; sends without a durable identity degrade safely instead of inventing a new UUID on every process invocation.
+- Compact terminal response-stream state to a hash-only tombstone so full answers and public work summaries are not retained indefinitely.
+- Remove the universal Task v2 and card-label defaults for a specific Agent; deployment identity now comes from `ZYLOS_AGENT_ID`, `FEISHU_TASK_V2_AGENT_APP_IDS`, and `ZYLOS_AGENT_LABELS`.
+
+### Changed
+- Require `c4.assistant-response-stream >= 2`, which is supplied only by the paired turn-safe Core release.
+
 ## [0.3.7-3ai.5] - 2026-08-26
 
 ### Fixed

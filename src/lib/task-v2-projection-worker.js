@@ -109,6 +109,7 @@ export function createTaskV2ProjectionRuntime({ env = process.env, client, statu
     gateway: createSdkTaskV2Gateway({ client: client ?? getClient() }),
     memberMapper: createTaskV2MemberMapper({
       appId,
+      agentId: env.ZYLOS_AGENT_ID?.trim() || null,
       agentAppIds: parseAgentAppIds(env.FEISHU_TASK_V2_AGENT_APP_IDS),
       requireGatewayAppAssignee: true,
     }),

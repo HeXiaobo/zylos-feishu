@@ -3,10 +3,7 @@ const DEFAULT_MAX_ENTRIES = 512;
 const MAX_TTL_MS = 24 * 60 * 60_000;
 const MAX_CACHE_ENTRIES = 10_000;
 const MAX_DISPLAY_NAME_LENGTH = 128;
-const OPTION_FIELDS = new Set(['client', 'clock', 'ttlMs', 'maxEntries']);
-const KNOWN_AGENT_LABELS = new Map([
-  ['agent:yueran', '玥然（AI）'],
-]);
+const OPTION_FIELDS = new Set(['client', 'clock', 'ttlMs', 'maxEntries', 'agentLabels']);
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -22,10 +19,10 @@ function readableSuffix(identity) {
     .slice(-6) || '未知';
 }
 
-function readableFallback(identity) {
+function readableFallback(identity, agentLabels = new Map()) {
   if (identity === null) return '未分配';
   if (identity.startsWith('agent:')) {
-    return KNOWN_AGENT_LABELS.get(identity) ?? `AI 员工（…${readableSuffix(identity)}）`;
+    return agentLabels.get(identity) ?? `AI 员工（…${readableSuffix(identity)}）`;
   }
   return `飞书成员（…${readableSuffix(identity)}）`;
 }
@@ -78,11 +75,19 @@ function normalizeOptions(input) {
   if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > MAX_CACHE_ENTRIES) {
     throw new TypeError(`maxEntries must be an integer from 1 to ${MAX_CACHE_ENTRIES}`);
   }
-  return { client, clock, ttlMs, maxEntries };
+  const rawAgentLabels = options.agentLabels ?? {};
+  requireRecord(rawAgentLabels, 'agentLabels');
+  const agentLabels = new Map(Object.entries(rawAgentLabels).map(([identity, label]) => {
+    if (!identity.startsWith('agent:')) throw new TypeError(`agentLabels contains invalid identity: ${identity}`);
+    const normalized = normalizedName(label);
+    if (normalized === null) throw new TypeError(`agentLabels.${identity} must be a readable name`);
+    return [identity, normalized];
+  }));
+  return { client, clock, ttlMs, maxEntries, agentLabels };
 }
 
 export function createTaskCardIdentityResolver(input) {
-  const { client, clock, ttlMs, maxEntries } = normalizeOptions(input);
+  const { client, clock, ttlMs, maxEntries, agentLabels } = normalizeOptions(input);
   const cache = new Map();
   const inFlight = new Map();
 
@@ -112,7 +117,7 @@ export function createTaskCardIdentityResolver(input) {
   async function resolveIdentity(identity) {
     if (identity === null) return '未分配';
     if (typeof identity !== 'string' || identity.trim() === '') return '未知成员';
-    if (identity.startsWith('agent:')) return readableFallback(identity);
+    if (identity.startsWith('agent:')) return readableFallback(identity, agentLabels);
 
     const now = readNow();
     const cached = readCached(identity, now);

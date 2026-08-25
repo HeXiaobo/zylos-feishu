@@ -18,6 +18,7 @@ const SDK_OPTION_FIELDS = Object.freeze([
   'issueTaskActionContext',
   'clock',
   'actionContextTtlMs',
+  'agentLabels',
 ]);
 const CREATE_REQUEST_FIELDS = Object.freeze(['target', 'task', 'idempotencyKey']);
 const UPDATE_REQUEST_FIELDS = Object.freeze([
@@ -172,10 +173,18 @@ export function createTaskCardProjectionPublisher(input) {
 
 export function createSdkTaskCardProjectionPublisher(input) {
   const options = requireRecord(input, 'SDK task card projection publisher options');
-  requireExactFields(options, SDK_OPTION_FIELDS, 'SDK task card projection publisher options');
+  requireFieldsWithOptional(
+    options,
+    SDK_OPTION_FIELDS.filter(field => field !== 'agentLabels'),
+    ['agentLabels'],
+    'SDK task card projection publisher options',
+  );
   const client = requireRecord(options.client, 'client');
   const delivery = createCardKitTaskCardDelivery({ client });
-  const identityResolver = createTaskCardIdentityResolver({ client });
+  const identityResolver = createTaskCardIdentityResolver({
+    client,
+    agentLabels: options.agentLabels,
+  });
   const sendMessage = async (receiveId, content, receiveIdType, msgType, sendOptions) => {
     if (msgType !== 'interactive') {
       throw new TypeError('task card message type must be interactive');

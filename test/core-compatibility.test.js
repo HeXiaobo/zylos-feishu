@@ -29,7 +29,7 @@ test('accepts a Core that satisfies every required protocol', (t) => {
     protocols: {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
-      'c4.assistant-response-stream': 1,
+      'c4.assistant-response-stream': 2,
       'work-intake': 1,
       'commitment-core': 1,
       'projection-outbox': 1,
@@ -64,6 +64,7 @@ test('reports every missing or outdated protocol before upgrade', (t) => {
   assert.deepEqual(result.errors, [
     'Protocol c4.reply requires >= 2, found 1',
     'Protocol c4.reply.argv-compat requires >= 1, found missing',
+    'Protocol c4.assistant-response-stream requires >= 2, found 1',
     'Protocol work-intake requires >= 1, found missing',
     'Protocol commitment-core requires >= 1, found missing',
     'Protocol projection-outbox requires >= 1, found missing',
