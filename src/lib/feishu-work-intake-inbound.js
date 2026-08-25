@@ -47,6 +47,18 @@ function normalizeMention(input, index) {
   };
 }
 
+export function hasExactBotMention(mentions, { botOpenId, botAppId }) {
+  if (!Array.isArray(mentions)) return false;
+  const trustedIds = new Set([botOpenId, botAppId]
+    .filter((id) => typeof id === 'string' && id !== '')
+    .map(String));
+  if (trustedIds.size === 0) return false;
+  return mentions.some((mention) => {
+    const mentionId = mention?.id?.open_id || mention?.id?.app_id || null;
+    return mentionId !== null && trustedIds.has(String(mentionId));
+  });
+}
+
 export function createFeishuWorkIntakeInboundAdapter(input) {
   const options = requireRecord(input, 'Feishu WorkIntake adapter options');
   requireExactFields(options, OPTION_FIELDS, 'Feishu WorkIntake adapter options');

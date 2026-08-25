@@ -27,7 +27,7 @@
 
 - **Talk through Feishu** — your AI agent speaks Feishu, both private chats and group conversations
 - **Explicit group activation** — group messages are processed only when the bot is @mentioned
-- **Zero-config start** — first message auto-binds you as admin, no setup wizards
+- **Trusted owner setup** — owner identity is explicitly configured; inbound messages cannot claim admin
 - **Rich Feishu integration** — documents, spreadsheets, calendar — not just messaging
 
 ## Getting Started
@@ -98,6 +98,9 @@ WorkIntake is opt-in. Set `workIntake.enabled` in
 Non-owner policies require an exact tenant match and every decision is appended
 to `logs/member-access-audit.jsonl`. Group intake always requires @mention;
 the old smart/no-mention behavior is not used by this build.
+Stable confirmation data is persisted to a local `0600` outbox before delivery.
+Each attempt signs a fresh card, and transient failures or process restarts retry
+with the same Feishu UUID.
 
 ## Documentation
 

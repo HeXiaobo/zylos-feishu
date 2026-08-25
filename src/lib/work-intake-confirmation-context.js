@@ -8,18 +8,7 @@ const CLAIM_FIELDS = new Set([
   'sourceKey',
   'senderId',
   'endpoint',
-  'originalText',
-  'taskDraft',
   'expiresAt',
-]);
-const TASK_FIELDS = new Set([
-  'title',
-  'description',
-  'ownerId',
-  'acceptorId',
-  'assigneeId',
-  'dueText',
-  'riskLevel',
 ]);
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const MAX_TOKEN_LENGTH = 8_192;
@@ -51,11 +40,6 @@ function requireText(value, field, maxLength = 4_000) {
   return value;
 }
 
-function optionalText(value, field, maxLength) {
-  if (value === null) return null;
-  return requireText(value, field, maxLength);
-}
-
 function readNow(clock) {
   const now = clock();
   if (!Number.isSafeInteger(now) || now < 0) throw new TypeError('clock must return Unix epoch milliseconds');
@@ -71,23 +55,12 @@ function normalizeClaims(input, now) {
   if (!Number.isSafeInteger(claims.expiresAt) || claims.expiresAt <= now) {
     throw new TypeError('expiresAt must be a future Unix epoch millisecond');
   }
-  const task = requireRecord(claims.taskDraft, 'WorkIntake TaskDraft');
-  requireExactFields(task, TASK_FIELDS, 'WorkIntake TaskDraft');
   const channel = requireText(claims.channel, 'channel', 64);
   const messageId = requireText(claims.messageId, 'messageId', 256);
   const sourceKey = requireText(claims.sourceKey, 'sourceKey', 512);
   const senderId = requireText(claims.senderId, 'senderId', 256);
   if (sourceKey !== `${channel}:${messageId}:work-intake:r${claims.intentRevision}`) {
     throw new TypeError('sourceKey must be derived from message_id + intent_revision');
-  }
-  if (task.ownerId !== senderId || task.acceptorId !== senderId) {
-    throw new TypeError('TaskDraft owner and acceptor must be the human sender');
-  }
-  if (
-    task.assigneeId === 'agent:yueran'
-    && !/(?:交给|让|请|麻烦|安排)\s*@?玥然|@?玥然\s*(?:来|负责|处理|完成|跟进|整理|帮)/u.test(claims.originalText)
-  ) {
-    throw new TypeError('agent:yueran requires an explicit assignment to 玥然');
   }
   return {
     channel,
@@ -96,16 +69,6 @@ function normalizeClaims(input, now) {
     sourceKey,
     senderId,
     endpoint: requireText(claims.endpoint, 'endpoint', 2_000),
-    originalText: requireText(claims.originalText, 'originalText', 4_000),
-    taskDraft: {
-      title: requireText(task.title, 'TaskDraft.title', 256),
-      description: optionalText(task.description, 'TaskDraft.description', 4_000),
-      ownerId: requireText(task.ownerId, 'TaskDraft.ownerId', 256),
-      acceptorId: requireText(task.acceptorId, 'TaskDraft.acceptorId', 256),
-      assigneeId: optionalText(task.assigneeId, 'TaskDraft.assigneeId', 256),
-      dueText: optionalText(task.dueText, 'TaskDraft.dueText', 100),
-      riskLevel: requireText(task.riskLevel, 'TaskDraft.riskLevel', 32),
-    },
     expiresAt: claims.expiresAt,
   };
 }

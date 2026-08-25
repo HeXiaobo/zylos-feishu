@@ -23,7 +23,7 @@ export const DEFAULT_CONFIG = {
     encrypt_key: '',
     verification_token: ''
   },
-  // Owner (primary partner) - auto-bound on first private chat
+  // Owner (primary partner) - must be explicitly configured by a trusted operator
   owner: {
     bound: false,
     user_id: '',
@@ -108,7 +108,7 @@ export function loadConfig() {
           }
         } else {
           // Pre-whitelist era config → default to owner (safest default).
-          // Owner binding handles bootstrap: first DM user becomes owner.
+          // An unconfigured owner fails closed; inbound messages never bootstrap ownership.
           config.dmPolicy = 'owner';
         }
       }

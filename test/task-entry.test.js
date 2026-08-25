@@ -183,6 +183,25 @@ test('passes a channel-neutral WorkIntake envelope to C4 without a task envelope
   }), /mutually exclusive/);
 });
 
+test('passes a confirmation choice to the Core-owned WorkIntake resolver', () => {
+  const confirmationRequest = {
+    sourceKey: 'feishu:om_confirm:work-intake:r1',
+    action: 'create_task',
+    actorId: 'ou_sender',
+  };
+  const args = buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_chat|type:p2p|msg:om_confirm',
+    content: '[WorkIntake confirmation]',
+    workIntakeConfirmation: confirmationRequest,
+  });
+  assert.deepEqual(args.slice(-4), [
+    '--work-intake-confirmation-json', JSON.stringify(confirmationRequest),
+    '--content', '[WorkIntake confirmation]',
+  ]);
+});
+
 test('verifies an explicit complete action and binds the trusted event actor before invoking Core', () => {
   const contexts = createTaskActionContextSigner({
     secret: SECRET,

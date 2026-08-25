@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createMemberAccessPolicy } from '../src/lib/work-intake-access.js';
+import {
+  createMemberAccessPolicy,
+  decideLegacyDmAccess,
+  trustedOwnerIds,
+} from '../src/lib/work-intake-access.js';
 
 function policy(mode, overrides = {}) {
   return {
@@ -86,4 +90,42 @@ test('rejects malformed or dangerously broad policies', () => {
   assert.throws(() => access(policy('departments')), /requires at least one/);
   assert.throws(() => access({ ...policy('tenant_members'), tenantKey: '' }), /non-empty/);
   assert.throws(() => access({ ...policy('owner'), extra: true }), /unsupported/);
+});
+
+test('an unbound owner is denied instead of being implicitly claimed by the first DM sender', () => {
+  assert.deepEqual(decideLegacyDmAccess({
+    ownerBound: false,
+    ownerMatched: false,
+    policy: 'owner',
+    allowFrom: [],
+    userId: 'u_first_sender',
+    openId: 'ou_first_sender',
+  }), {
+    allowed: false,
+    reasonCode: 'ACCESS_OWNER_NOT_CONFIGURED',
+  });
+  assert.deepEqual(decideLegacyDmAccess({
+    ownerBound: false,
+    ownerMatched: true,
+    policy: 'owner',
+    allowFrom: [],
+    userId: 'u_stale_owner_field',
+    openId: 'ou_stale_owner_field',
+  }), {
+    allowed: false,
+    reasonCode: 'ACCESS_OWNER_NOT_CONFIGURED',
+  });
+});
+
+test('only an explicitly bound owner contributes trusted policy identities', () => {
+  assert.deepEqual(trustedOwnerIds({
+    bound: false,
+    user_id: 'u_untrusted',
+    open_id: 'ou_untrusted',
+  }), []);
+  assert.deepEqual(trustedOwnerIds({
+    bound: true,
+    user_id: '  ',
+    open_id: 'ou_owner',
+  }), ['ou_owner']);
 });

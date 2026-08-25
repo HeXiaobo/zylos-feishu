@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createFeishuWorkIntakeInboundAdapter } from '../src/lib/feishu-work-intake-inbound.js';
+import {
+  createFeishuWorkIntakeInboundAdapter,
+  hasExactBotMention,
+} from '../src/lib/feishu-work-intake-inbound.js';
 
 const adapter = createFeishuWorkIntakeInboundAdapter({
   intentRevision: 1,
@@ -59,6 +62,16 @@ test('group WorkIntake is disabled without @玥然 and enabled with a bot mentio
     candidateIds: ['ou_wang'],
     kind: 'human',
   }]);
+});
+
+test('@所有人 is not an exact bot mention', () => {
+  const botIdentity = { botOpenId: 'ou_yueran', botAppId: 'cli_yueran' };
+  assert.equal(hasExactBotMention([
+    { key: '@_all', id: { open_id: 'all' }, name: '所有人' },
+  ], botIdentity), false);
+  assert.equal(hasExactBotMention([
+    { key: '@_user_1', id: { open_id: 'ou_yueran' }, name: '玥然' },
+  ], botIdentity), true);
 });
 
 test('rejects malformed or SDK-leaking normalized input', () => {

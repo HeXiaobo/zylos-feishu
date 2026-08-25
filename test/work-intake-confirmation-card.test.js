@@ -82,7 +82,7 @@ test('renders the required create/chat/edit confirmation choices', () => {
   assert.equal(new Set(buttons.map((button) => button.behaviors[0].value.context)).size, 1);
 });
 
-test('trusted create callback maps to a stable Core envelope based on message + revision', () => {
+test('trusted callback sends only a stable confirmation command to Core', () => {
   const { context } = cardAndContext();
   const route = parseWorkIntakeConfirmationAction(
     callback('work_intake_create_task', context),
@@ -90,31 +90,24 @@ test('trusted create callback maps to a stable Core envelope based on message + 
   );
   assert.equal(route.kind, 'work-intake-confirmation');
   assert.equal(route.action, 'create_task');
-  assert.deepEqual(route.taskEnvelope, {
-    idempotencyKey: 'feishu:om_confirm:work-intake:r1',
-    source: {
-      channel: 'feishu',
-      externalId: 'om_confirm',
-      senderId: 'ou_sender',
-    },
-    task: {
-      title: '跟一下这个事',
-      description: null,
-      ownerId: 'ou_sender',
-      acceptorId: 'ou_sender',
-      assigneeId: null,
-    },
+  assert.deepEqual(route.confirmationRequest, {
+    sourceKey: 'feishu:om_confirm:work-intake:r1',
+    action: 'create_task',
+    actorId: 'ou_sender',
   });
+  assert.equal(Object.hasOwn(route, 'taskEnvelope'), false);
+  assert.equal(Object.hasOwn(route.claims, 'taskDraft'), false);
+  assert.equal(Object.hasOwn(route.claims, 'originalText'), false);
   assert.equal(isWorkIntakeConfirmationAction(callback('work_intake_create_task', context)), true);
 });
 
-test('retry and duplicate clicks always produce the same task idempotency key', async () => {
+test('retry and duplicate clicks always produce the same Core confirmation key', async () => {
   const { context } = cardAndContext();
   const calls = [];
   const runtime = createWorkIntakeConfirmationRuntime({
     verifyContext: (token) => signer.verify(token),
     executeDecision: async (route) => {
-      calls.push(route.taskEnvelope.idempotencyKey);
+      calls.push(route.confirmationRequest.sourceKey);
       return { queued: true };
     },
   });
@@ -124,13 +117,14 @@ test('retry and duplicate clicks always produce the same task idempotency key', 
   assert.deepEqual(new Set(calls), new Set(['feishu:om_confirm:work-intake:r1']));
 });
 
-test('chat-only and edit callbacks never carry a task envelope', () => {
+test('chat-only and edit callbacks carry only their Core confirmation choice', () => {
   const { context } = cardAndContext();
   for (const action of ['work_intake_chat_only', 'work_intake_edit']) {
     const route = parseWorkIntakeConfirmationAction(callback(action, context), {
       verifyContext: (token) => signer.verify(token),
     });
-    assert.equal(route.taskEnvelope, null);
+    assert.equal(Object.hasOwn(route, 'taskEnvelope'), false);
+    assert.equal(route.confirmationRequest.action, action.replace('work_intake_', ''));
   }
 });
 

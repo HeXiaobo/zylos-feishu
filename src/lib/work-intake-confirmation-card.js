@@ -90,24 +90,6 @@ function normalizeCallbackEvent(input) {
   return { actorId, action: actionName, context: requireText(value.context, 'WorkIntake callback context', 8_192) };
 }
 
-function toTaskEnvelope(claims) {
-  return {
-    idempotencyKey: claims.sourceKey,
-    source: {
-      channel: claims.channel,
-      externalId: claims.messageId,
-      senderId: claims.senderId,
-    },
-    task: {
-      title: claims.taskDraft.title,
-      description: claims.taskDraft.description,
-      ownerId: claims.taskDraft.ownerId,
-      acceptorId: claims.taskDraft.acceptorId,
-      assigneeId: claims.taskDraft.assigneeId,
-    },
-  };
-}
-
 function button(definition, context) {
   return {
     tag: 'button',
@@ -149,8 +131,6 @@ export function createWorkIntakeConfirmationCardRenderer(input) {
         sourceKey: decision.sourceKey,
         senderId: envelope.sender.id,
         endpoint: requireText(request.endpoint, 'WorkIntake confirmation endpoint', 2_000),
-        originalText: envelope.text,
-        taskDraft: decision.taskDraft,
         expiresAt: now + options.contextTtlMs,
       });
       const card = {
@@ -202,7 +182,11 @@ export function parseWorkIntakeConfirmationAction(input, { verifyContext }) {
     action,
     actorId: callback.actorId,
     claims,
-    taskEnvelope: action === 'create_task' ? toTaskEnvelope(claims) : null,
+    confirmationRequest: Object.freeze({
+      sourceKey: claims.sourceKey,
+      action,
+      actorId: callback.actorId,
+    }),
   });
 }
 
