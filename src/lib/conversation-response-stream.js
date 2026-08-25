@@ -34,6 +34,48 @@ const SAFE_PROGRESS = Object.freeze({
   organizing: '正在整理结果',
   recovering: '工具调用未成功，正在安全恢复',
 });
+const PUBLIC_ACTION_PROGRESS = Object.freeze({
+  analyze_request: Object.freeze({ started: '正在分析问题' }),
+  read_sources: Object.freeze({
+    started: '正在读取相关资料',
+    completed: '相关资料已读取',
+  }),
+  search_sources: Object.freeze({
+    started: '正在查找相关信息',
+    completed: '已找到相关信息',
+  }),
+  query_data: Object.freeze({
+    started: '正在核对相关数据',
+    completed: '相关数据已核对',
+  }),
+  update_content: Object.freeze({
+    started: '正在整理内容更新',
+    completed: '内容更新已完成',
+  }),
+  execute_operation: Object.freeze({
+    started: '正在执行所需操作',
+    completed: '所需操作已完成',
+  }),
+  communicate: Object.freeze({
+    started: '正在处理消息与通知',
+    completed: '消息与通知已处理',
+  }),
+  organize_result: Object.freeze({
+    started: '正在整理回答',
+    completed: '回答已整理',
+  }),
+  coordinate_work: Object.freeze({
+    started: '正在协调并行工作',
+    completed: '并行工作已汇总',
+  }),
+  prepare_workflow: Object.freeze({
+    started: '正在准备所需工作流',
+    completed: '工作流已准备',
+  }),
+  recover_tool: Object.freeze({
+    failed: '操作遇到问题，正在调整方案',
+  }),
+});
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -117,12 +159,17 @@ function splitUtf8(text, maxBytes) {
   return segments;
 }
 
+function publicProgressText(payload) {
+  const actionText = PUBLIC_ACTION_PROGRESS[payload?.action]?.[payload?.status];
+  return actionText || SAFE_PROGRESS[payload?.stage] || null;
+}
+
 function phaseForEvent(event) {
   switch (event.type) {
     case 'AssistantRequestAccepted': return '✅ 已接收';
     case 'RunQueued': return '⏳ 排队中';
     case 'RunStarted': return '▶️ 已开始处理';
-    case 'ProgressUpdated': return SAFE_PROGRESS[event.payload?.stage] || null;
+    case 'ProgressUpdated': return publicProgressText(event.payload);
     case 'RunCompleted': return '✅ 已完成';
     case 'RunFailed': return event.payload?.retryable
       ? '⚠️ 本次处理未完成，可重试'
@@ -133,7 +180,7 @@ function phaseForEvent(event) {
 
 function progressForEvent(event) {
   if (event.type === 'RunStarted') return '正在分析问题';
-  if (event.type === 'ProgressUpdated') return SAFE_PROGRESS[event.payload?.stage] || null;
+  if (event.type === 'ProgressUpdated') return publicProgressText(event.payload);
   return null;
 }
 

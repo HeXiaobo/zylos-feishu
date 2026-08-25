@@ -193,6 +193,36 @@ test('keeps a bounded, de-duplicated public progress trace across restart', () =
   assert.match(trace, /正在分析问题[\s\S]*正在读取资料[\s\S]*正在查询数据/);
 }));
 
+test('renders fixed public action progress without exposing model-authored summaries', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'RunStarted'),
+      event(2, 'ProgressUpdated', {
+        stage: 'searching',
+        action: 'search_sources',
+        status: 'started',
+        summary: 'private model text must not render',
+      }),
+      event(3, 'ProgressUpdated', {
+        stage: 'searching',
+        action: 'search_sources',
+        status: 'completed',
+        summary: 'another private model text must not render',
+      }),
+      event(4, 'RunCompleted', { output: '完成' }),
+    ],
+  });
+
+  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const trace = finalCard.body.elements[2].content;
+  assert.match(trace, /正在分析问题[\s\S]*正在查找相关信息[\s\S]*已找到相关信息/);
+  assert.equal(JSON.stringify(finalCard).includes('private model text'), false);
+}));
+
 test('swaps to continuation cards only when the verified answer exceeds one card', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({
