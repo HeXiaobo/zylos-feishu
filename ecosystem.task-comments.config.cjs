@@ -18,7 +18,6 @@ module.exports = {
     env: {
       NODE_ENV: 'production',
       ZYLOS_DIR,
-      FEISHU_TASK_COMMENTS_ENABLED: '1',
       FEISHU_TASK_COMMENTS_WORKER_AUTOSTART: '1',
     },
     autorestart: true,

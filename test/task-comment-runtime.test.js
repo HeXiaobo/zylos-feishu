@@ -411,6 +411,68 @@ test('outbound reply ledger prevents duplicate replies and suppresses the exact 
   }
 });
 
+test('worker adopts a matching echo while outbound delivery is still pending', async () => {
+  const harness = createHarness();
+  try {
+    harness.store.beginOutbound({
+      appId: APP_ID,
+      taskGuid: 'task-guid-1',
+      replyToCommentId: 'comment-human',
+      content: 'Answer racing with the event stream.',
+      idempotencyKey: 'agent-reply-racing-1',
+    });
+    await enqueueHandler(harness.store)(event({
+      event_id: 'evt-agent-racing-echo',
+      comment_id: 'comment-agent-racing',
+    }));
+    let coreCalls = 0;
+    let wakes = 0;
+    const worker = createTaskCommentWorker({
+      appId: APP_ID,
+      store: harness.store,
+      commentApi: {
+        async getComment() {
+          return {
+            kind: 'found',
+            comment: foundComment({
+              id: 'comment-agent-racing',
+              content: 'Answer racing with the event stream.',
+              replyToCommentId: 'comment-human',
+            }),
+          };
+        },
+      },
+      taskMapping: {
+        async resolve() {
+          return { taskId: 'core-task-1', wakeTarget: { agentId: 'agent:yueran' } };
+        },
+      },
+      conversation: { async record() { coreCalls += 1; } },
+      async wakeAgent() { wakes += 1; },
+      workerId: 'worker-racing-echo',
+    });
+
+    const result = await worker.processOnce();
+    assert.equal(result.results[0].outcome, 'echo_suppressed');
+    assert.equal(coreCalls, 0);
+    assert.equal(wakes, 0);
+    const delivery = harness.store.queryOutbound({
+      appId: APP_ID,
+      idempotencyKey: 'agent-reply-racing-1',
+    });
+    assert.equal(delivery.status, 'sent');
+    assert.equal(delivery.commentId, 'comment-agent-racing');
+    assert.equal(delivery.lastError, null);
+    assert.equal(harness.store.finishOutbound({
+      appId: APP_ID,
+      idempotencyKey: 'agent-reply-racing-1',
+      commentId: 'comment-agent-racing',
+    }).status, 'sent');
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('ambiguous outbound failure is dead-lettered and automatic replay cannot duplicate the reply', async () => {
   const harness = createHarness();
   try {
@@ -444,6 +506,18 @@ test('ambiguous outbound failure is dead-lettered and automatic replay cannot du
       }).status,
       'dead_letter',
     );
+    assert.equal(harness.store.adoptOutboundComment({
+      appId: APP_ID,
+      taskGuid: 'task-guid-1',
+      replyToCommentId: 'comment-human',
+      content: 'A possibly delivered answer',
+      commentId: 'comment-found-by-event',
+    }).status, 'sent');
+    assert.deepEqual(await adapter.reply(request), {
+      created: false,
+      commentId: 'comment-found-by-event',
+    });
+    assert.equal(sends, 1);
   } finally {
     harness.cleanup();
   }
@@ -507,6 +581,51 @@ test('reconciliation covers long-connection gaps, non-App tasks, completion grac
     assert.equal(result.skippedGrace, 1);
     assert.equal(result.enqueued, 3, 'two visible comments plus one missing-comment tombstone');
     assert.equal((await reconciler.runOnce()).skippedInterval, 2);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('reconciliation isolates a poisoned mapping and continues with the remaining tasks', async () => {
+  const harness = createHarness();
+  try {
+    const listed = [];
+    const reconciler = createTaskCommentReconciler({
+      appId: APP_ID,
+      store: harness.store,
+      clock: () => '2026-08-25T10:00:00.000Z',
+      commentApi: {
+        async listComments({ taskGuid }) {
+          listed.push(taskGuid);
+          if (taskGuid === 'task-guid-poison') throw new Error('forbidden task');
+          return [foundComment({ id: 'comment-healthy', resourceId: taskGuid })];
+        },
+      },
+      taskMapping: {
+        async list() {
+          return [
+            {
+              taskId: 'core-poison', taskGuid: 'task-guid-poison', state: 'in_progress',
+              updatedAt: '2026-08-25T09:00:00.000Z', eventCoverage: 'app',
+            },
+            {
+              taskId: 'core-healthy', taskGuid: 'task-guid-healthy', state: 'review',
+              updatedAt: '2026-08-25T09:00:00.000Z', eventCoverage: 'app',
+            },
+          ];
+        },
+      },
+    });
+
+    const result = await reconciler.runOnce();
+    assert.deepEqual(listed, ['task-guid-poison', 'task-guid-healthy']);
+    assert.equal(result.considered, 2);
+    assert.equal(result.reconciled, 1);
+    assert.equal(result.failed, 1);
+    assert.deepEqual(result.failures, [{
+      taskGuid: 'task-guid-poison',
+      error: 'forbidden task',
+    }]);
   } finally {
     harness.cleanup();
   }

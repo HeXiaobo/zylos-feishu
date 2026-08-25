@@ -507,6 +507,53 @@ export function openTaskCommentStore({ dbPath, clock = () => new Date().toISOStr
     return toOutboundView(selectOutbound.get(normalizedAppId, normalizedKey));
   }
 
+  const adoptOutboundCommentTransaction = database.transaction((rawComment) => {
+    const comment = requireRecord(rawComment, 'outbound echo');
+    const normalized = {
+      appId: requireText(comment.appId, 'outbound echo.appId'),
+      taskGuid: requireText(comment.taskGuid, 'outbound echo.taskGuid'),
+      replyToCommentId: optionalText(
+        comment.replyToCommentId,
+        'outbound echo.replyToCommentId',
+      ),
+      content: requireText(comment.content, 'outbound echo.content', 20_000),
+      commentId: requireText(comment.commentId, 'outbound echo.commentId'),
+    };
+    const existingComment = database.prepare(`
+      SELECT * FROM feishu_task_comment_outbound
+      WHERE app_id = ? AND comment_id = ? AND status = 'sent'
+    `).get(normalized.appId, normalized.commentId);
+    if (existingComment) return toOutboundView(existingComment);
+    const candidates = database.prepare(`
+      SELECT * FROM feishu_task_comment_outbound
+      WHERE app_id = ? AND task_guid = ?
+        AND reply_to_comment_id IS ? AND content = ?
+        AND status IN ('pending', 'dead_letter')
+      ORDER BY created_at, idempotency_key
+      LIMIT 2
+    `).all(
+      normalized.appId,
+      normalized.taskGuid,
+      normalized.replyToCommentId,
+      normalized.content,
+    );
+    if (candidates.length !== 1) return null;
+    const now = currentInstant(clock);
+    const updated = database.prepare(`
+      UPDATE feishu_task_comment_outbound
+      SET status = 'sent', comment_id = ?, last_error = NULL, updated_at = ?
+      WHERE app_id = ? AND idempotency_key = ?
+        AND status IN ('pending', 'dead_letter')
+    `).run(
+      normalized.commentId,
+      now,
+      normalized.appId,
+      candidates[0].idempotency_key,
+    );
+    if (updated.changes !== 1) return null;
+    return toOutboundView(selectOutbound.get(normalized.appId, candidates[0].idempotency_key));
+  });
+
   function recordObserved({ appId, taskGuid, commentId, updatedAt }) {
     const normalized = {
       appId: requireText(appId, 'observed comment.appId'),
@@ -712,6 +759,9 @@ export function openTaskCommentStore({ dbPath, clock = () => new Date().toISOStr
     },
     finishOutbound,
     failOutbound,
+    adoptOutboundComment(comment) {
+      return adoptOutboundCommentTransaction.immediate(comment);
+    },
     queryOutbound({ appId, idempotencyKey }) {
       return toOutboundView(selectOutbound.get(
         requireText(appId, 'outbound query.appId'),

@@ -70,6 +70,7 @@ export function createTaskCommentWorker({
   requireFunction(store?.acknowledge, 'task comment store.acknowledge');
   requireFunction(store?.fail, 'task comment store.fail');
   requireFunction(store?.isOutboundComment, 'task comment store.isOutboundComment');
+  requireFunction(store?.adoptOutboundComment, 'task comment store.adoptOutboundComment');
   requireFunction(store?.recordObserved, 'task comment store.recordObserved');
   requireFunction(commentApi?.getComment, 'commentApi.getComment');
   requireFunction(taskMapping?.resolve, 'taskMapping.resolve');
@@ -94,7 +95,22 @@ export function createTaskCommentWorker({
     }
     if (read.kind === 'found') {
       const comment = requireRecord(read.comment, 'Task v2 comment');
-      if (store.isOutboundComment({ appId: normalizedAppId, commentId: comment.id })) {
+      if (comment.resourceId && comment.resourceId !== entry.taskGuid) {
+        const error = new Error('Task v2 comment belongs to another task');
+        error.retryable = false;
+        throw error;
+      }
+      const outbound = store.isOutboundComment({
+        appId: normalizedAppId,
+        commentId: comment.id,
+      }) || store.adoptOutboundComment({
+        appId: normalizedAppId,
+        taskGuid: entry.taskGuid,
+        replyToCommentId: comment.replyToCommentId,
+        content: comment.content,
+        commentId: comment.id,
+      });
+      if (outbound) {
         store.recordObserved({
           appId: normalizedAppId,
           taskGuid: entry.taskGuid,
@@ -102,11 +118,6 @@ export function createTaskCommentWorker({
           updatedAt: comment.updatedAt,
         });
         return { outcome: 'echo_suppressed', commentId: comment.id };
-      }
-      if (comment.resourceId && comment.resourceId !== entry.taskGuid) {
-        const error = new Error('Task v2 comment belongs to another task');
-        error.retryable = false;
-        throw error;
       }
       if (comment.resourceType && comment.resourceType !== 'task') {
         const error = new Error('Task v2 comment belongs to a non-Task resource');

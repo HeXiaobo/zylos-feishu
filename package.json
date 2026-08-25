@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/index.js",
     "cli": "node src/cli.js",
-    "task-comments:once": "FEISHU_TASK_COMMENTS_ENABLED=1 node src/lib/task-comment-worker.js run --once",
+    "task-comments:once": "node src/lib/task-comment-worker.js run --once",
     "test": "node --test"
   },
   "larkCli": {

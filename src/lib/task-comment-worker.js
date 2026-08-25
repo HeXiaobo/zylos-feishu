@@ -14,6 +14,7 @@ import {
   createCoreTaskV2CommentMapping,
 } from './task-comment-production.js';
 import { createTaskCommentWorker } from './task-comment-runtime.js';
+import { requireTaskCommentsEnabled } from './task-comment-runtime-policy.js';
 import { openTaskCommentStore } from './task-comment-store.js';
 import {
   createFeishuNotificationAdapter,
@@ -194,10 +195,27 @@ export async function runTaskCommentCycle({
   requireFunction(worker?.processOnce, 'Task comment worker.processOnce');
   requireFunction(reconciler?.runOnce, 'Task comment reconciler.runOnce');
   requireFunction(notifications?.flushOnce, 'Task notification adapter.flushOnce');
+  async function settle(operation) {
+    try {
+      return await operation();
+    } catch (error) {
+      return Object.freeze({
+        failed: true,
+        error: String(error?.message ?? error ?? 'unknown Task comment cycle failure'),
+      });
+    }
+  }
+  const comments = await settle(() => worker.processOnce({ limit: commentLimit }));
+  const reconciliation = await settle(
+    () => reconciler.runOnce({ limit: reconciliationLimit }),
+  );
+  const notificationResult = await settle(
+    () => notifications.flushOnce({ limit: notificationLimit }),
+  );
   return Object.freeze({
-    comments: await worker.processOnce({ limit: commentLimit }),
-    reconciliation: await reconciler.runOnce({ limit: reconciliationLimit }),
-    notifications: await notifications.flushOnce({ limit: notificationLimit }),
+    comments,
+    reconciliation,
+    notifications: notificationResult,
   });
 }
 
@@ -231,9 +249,7 @@ export async function superviseTaskComments({
 
 async function main(args = process.argv.slice(2), env = process.env) {
   dotenv.config({ path: path.join(env.HOME || os.homedir(), 'zylos/.env') });
-  if (env.FEISHU_TASK_COMMENTS_ENABLED !== '1') {
-    throw new Error('FEISHU_TASK_COMMENTS_ENABLED=1 is required');
-  }
+  requireTaskCommentsEnabled(env);
   const once = args.length === 2 && args[0] === 'run' && args[1] === '--once';
   if (!once && !(args.length === 1 && args[0] === 'run')) {
     throw new TypeError('usage: task-comment-worker.js run [--once]');

@@ -25,9 +25,11 @@ import { initMention, buildMentionContent, buildMentionMarkdown } from '../src/l
 import { getClient } from '../src/lib/client.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
 import {
+  createCoreFirstTaskCommentReply,
+  createCoreTaskV2CommentMapping,
   parseTaskCommentReplyEndpoint,
-  taskCommentReplyIdempotencyKey,
 } from '../src/lib/task-comment-production.js';
+import { isTaskCommentsEnabled } from '../src/lib/task-comment-runtime-policy.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -443,7 +445,7 @@ async function recordOutgoing(text) {
 async function send() {
   try {
     if (taskCommentReplyEndpoint) {
-      if (process.env.FEISHU_TASK_COMMENTS_ENABLED !== '1') {
+      if (!isTaskCommentsEnabled(process.env)) {
         throw new Error('Task comment replies are disabled');
       }
       if (mediaMatch) throw new Error('Task comment replies currently support text only');
@@ -452,31 +454,40 @@ async function send() {
         { openTaskCommentStore },
         { createTaskCommentReplyAdapter },
         { createSdkTaskV2CommentApi },
+        { loadTaskCommentReplyCoreDependencies },
       ] = await Promise.all([
         import('../src/lib/client.js'),
         import('../src/lib/task-comment-store.js'),
         import('../src/lib/task-comment-runtime.js'),
         import('../src/lib/task-v2-comment-api.js'),
+        import('../src/lib/task-comment-core-dependencies.js'),
       ]);
       const appId = getCredentials().app_id;
       if (!appId) throw new Error('FEISHU_APP_ID is required for Task comment replies');
-      const store = openTaskCommentStore({ dbPath: path.join(DATA_DIR, 'task-comments.db') });
+      const scopedTaskCommentReplyEndpoint = parseTaskCommentReplyEndpoint(rawEndpoint, { appId });
+      const { openCore } = await loadTaskCommentReplyCoreDependencies({ env: process.env });
+      const core = openCore();
+      let store;
       try {
+        store = openTaskCommentStore({ dbPath: path.join(DATA_DIR, 'task-comments.db') });
         const adapter = createTaskCommentReplyAdapter({
           appId,
           store,
           commentApi: createSdkTaskV2CommentApi({ client: getClient() }),
         });
-        await adapter.reply({
-          ...taskCommentReplyEndpoint,
+        const outbound = createCoreFirstTaskCommentReply({
+          appId,
+          taskMapping: createCoreTaskV2CommentMapping({ core }),
+          conversation: core.conversation,
+          replyAdapter: adapter,
+        });
+        await outbound.reply({
+          ...scopedTaskCommentReplyEndpoint,
           content: message,
-          idempotencyKey: taskCommentReplyIdempotencyKey({
-            ...taskCommentReplyEndpoint,
-            content: message,
-          }),
         });
       } finally {
-        store.close();
+        store?.close();
+        core.close();
       }
     } else {
       const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;

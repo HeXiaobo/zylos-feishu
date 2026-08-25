@@ -99,59 +99,74 @@ export function createTaskCommentReconciler({
         skippedGrace: 0,
         enqueued: 0,
         businessDuplicates: 0,
+        failed: 0,
+        failures: [],
       };
       for (const rawMapping of rawMappings.slice(0, limit)) {
-        const mapping = normalizeMapping(rawMapping);
         result.considered += 1;
-        if (
-          TERMINAL_STATES.has(mapping.state)
-          && millisecondsBetween(now, mapping.updatedAt) > completedGraceMs
-        ) {
-          result.skippedGrace += 1;
-          continue;
-        }
-        const lastReconciledAt = store.getLastReconciledAt({
-          appId: normalizedAppId,
-          taskGuid: mapping.taskGuid,
-        });
-        if (
-          lastReconciledAt
-          && millisecondsBetween(now, lastReconciledAt) < activeIntervalMs
-        ) {
-          result.skippedInterval += 1;
-          continue;
-        }
-        const comments = await commentApi.listComments({ taskGuid: mapping.taskGuid });
-        if (!Array.isArray(comments)) throw new TypeError('commentApi.listComments must return an array');
-        const currentIds = new Set();
-        for (const comment of comments) {
-          const event = createReconciliationInboxEvent({
+        let mapping;
+        try {
+          mapping = normalizeMapping(rawMapping);
+          if (
+            TERMINAL_STATES.has(mapping.state)
+            && millisecondsBetween(now, mapping.updatedAt) > completedGraceMs
+          ) {
+            result.skippedGrace += 1;
+            continue;
+          }
+          const lastReconciledAt = store.getLastReconciledAt({
             appId: normalizedAppId,
             taskGuid: mapping.taskGuid,
-            comment,
-            now,
           });
-          currentIds.add(event.commentId);
-          const receipt = store.enqueue(event);
-          if (receipt.accepted) result.enqueued += 1;
-          else result.businessDuplicates += 1;
-        }
-        for (const observed of store.listObserved({
-          appId: normalizedAppId,
-          taskGuid: mapping.taskGuid,
-        })) {
-          if (currentIds.has(observed.commentId)) continue;
-          const receipt = store.enqueue(createReconciliationDeleteEvent({
+          if (
+            lastReconciledAt
+            && millisecondsBetween(now, lastReconciledAt) < activeIntervalMs
+          ) {
+            result.skippedInterval += 1;
+            continue;
+          }
+          const comments = await commentApi.listComments({ taskGuid: mapping.taskGuid });
+          if (!Array.isArray(comments)) {
+            throw new TypeError('commentApi.listComments must return an array');
+          }
+          const currentIds = new Set();
+          for (const comment of comments) {
+            const event = createReconciliationInboxEvent({
+              appId: normalizedAppId,
+              taskGuid: mapping.taskGuid,
+              comment,
+              now,
+            });
+            currentIds.add(event.commentId);
+            const receipt = store.enqueue(event);
+            if (receipt.accepted) result.enqueued += 1;
+            else result.businessDuplicates += 1;
+          }
+          for (const observed of store.listObserved({
             appId: normalizedAppId,
             taskGuid: mapping.taskGuid,
-            commentId: observed.commentId,
-            now,
-          }));
-          if (receipt.accepted) result.enqueued += 1;
-          else result.businessDuplicates += 1;
+          })) {
+            if (currentIds.has(observed.commentId)) continue;
+            const receipt = store.enqueue(createReconciliationDeleteEvent({
+              appId: normalizedAppId,
+              taskGuid: mapping.taskGuid,
+              commentId: observed.commentId,
+              now,
+            }));
+            if (receipt.accepted) result.enqueued += 1;
+            else result.businessDuplicates += 1;
+          }
+          store.markReconciled({ appId: normalizedAppId, taskGuid: mapping.taskGuid });
+          result.reconciled += 1;
+        } catch (error) {
+          result.failed += 1;
+          result.failures.push({
+            taskGuid: typeof mapping?.taskGuid === 'string'
+              ? mapping.taskGuid
+              : String(rawMapping?.taskGuid ?? '<invalid mapping>'),
+            error: String(error?.message ?? error ?? 'unknown reconciliation failure'),
+          });
         }
-        store.markReconciled({ appId: normalizedAppId, taskGuid: mapping.taskGuid });
-        result.reconciled += 1;
       }
       return result;
     },

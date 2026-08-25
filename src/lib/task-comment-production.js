@@ -25,6 +25,16 @@ function requireFunction(value, field) {
   return value;
 }
 
+function stableKey(prefix, values) {
+  return `${prefix}:${createHash('sha256').update(JSON.stringify(values)).digest('base64url')}`;
+}
+
+function canonicalInstant(value, field) {
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(parsed.valueOf())) throw new TypeError(`${field} must be a valid instant`);
+  return parsed.toISOString();
+}
+
 function encodeOpaque(value) {
   return Buffer.from(requireText(value, 'reply endpoint identity'), 'utf8').toString('base64url');
 }
@@ -45,40 +55,150 @@ function permanentMappingError(message) {
   return error;
 }
 
-export function createTaskCommentReplyEndpoint({ taskGuid, replyToCommentId }) {
-  return `${REPLY_ENDPOINT_PREFIX}|task:${encodeOpaque(taskGuid)}`
+export function createTaskCommentReplyEndpoint({ appId, taskGuid, replyToCommentId }) {
+  return `${REPLY_ENDPOINT_PREFIX}|app:${encodeOpaque(appId)}`
+    + `|task:${encodeOpaque(taskGuid)}`
     + `|comment:${encodeOpaque(replyToCommentId)}`;
 }
 
-export function parseTaskCommentReplyEndpoint(endpoint) {
+export function parseTaskCommentReplyEndpoint(endpoint, { appId: expectedAppId } = {}) {
   if (typeof endpoint !== 'string' || !endpoint.startsWith(`${REPLY_ENDPOINT_PREFIX}|`)) {
     return null;
   }
   const parts = endpoint.split('|');
-  if (parts.length !== 3 || !parts[1].startsWith('task:') || !parts[2].startsWith('comment:')) {
+  if (
+    parts.length !== 4
+    || !parts[1].startsWith('app:')
+    || !parts[2].startsWith('task:')
+    || !parts[3].startsWith('comment:')
+  ) {
     throw new TypeError('Task comment reply endpoint is malformed');
   }
-  return Object.freeze({
-    taskGuid: decodeOpaque(parts[1].slice(5), 'Task comment taskGuid'),
-    replyToCommentId: decodeOpaque(parts[2].slice(8), 'Task comment replyToCommentId'),
-  });
+  const parsed = {
+    appId: decodeOpaque(parts[1].slice(4), 'Task comment appId'),
+    taskGuid: decodeOpaque(parts[2].slice(5), 'Task comment taskGuid'),
+    replyToCommentId: decodeOpaque(parts[3].slice(8), 'Task comment replyToCommentId'),
+  };
+  if (expectedAppId !== undefined && parsed.appId !== requireText(expectedAppId, 'expected appId')) {
+    throw new TypeError('Task comment reply endpoint belongs to another Feishu app');
+  }
+  return Object.freeze(parsed);
 }
 
-export function taskCommentReplyIdempotencyKey({ taskGuid, replyToCommentId, content }) {
+export function taskCommentReplyIdempotencyKey({ appId, taskGuid, replyToCommentId, content }) {
   const normalized = [
+    requireText(appId, 'Task comment reply appId'),
     requireText(taskGuid, 'Task comment reply taskGuid'),
     requireText(replyToCommentId, 'Task comment reply parent ID'),
     requireText(content, 'Task comment reply content', 20_000),
   ];
-  return `task-comment-reply:${createHash('sha256')
-    .update(JSON.stringify(normalized))
-    .digest('base64url')}`;
+  return stableKey('task-comment-reply', normalized);
+}
+
+export function createCoreFirstTaskCommentReply({
+  appId,
+  taskMapping,
+  conversation,
+  replyAdapter,
+  clock = () => new Date(),
+}) {
+  const normalizedAppId = requireText(appId, 'Core-first Task comment appId');
+  requireFunction(taskMapping?.resolve, 'Task comment mapping.resolve');
+  requireFunction(conversation?.query, 'Core conversation.query');
+  requireFunction(conversation?.record, 'Core conversation.record');
+  requireFunction(replyAdapter?.reply, 'Task comment reply adapter.reply');
+  requireFunction(clock, 'Core-first Task comment clock');
+
+  function verifyExisting(existing, expected) {
+    const comment = requireRecord(existing, 'existing Core Agent comment');
+    for (const field of ['actorId', 'body', 'replyToCommentId']) {
+      if (comment[field] !== expected[field]) {
+        const error = new Error(`existing Core Agent comment has conflicting ${field}`);
+        error.code = 'IDEMPOTENCY_CONFLICT';
+        throw error;
+      }
+    }
+    return requireText(comment.lastEventId, 'existing Core Agent comment lastEventId');
+  }
+
+  return Object.freeze({
+    async reply(rawRequest) {
+      const request = requireRecord(rawRequest, 'Core-first Task comment reply');
+      const normalized = {
+        taskGuid: requireText(request.taskGuid, 'Task comment reply taskGuid'),
+        replyToCommentId: requireText(
+          request.replyToCommentId,
+          'Task comment reply parent ID',
+        ),
+        content: requireText(request.content, 'Task comment reply content', 20_000),
+      };
+      const mapping = requireRecord(await taskMapping.resolve({
+        appId: normalizedAppId,
+        taskGuid: normalized.taskGuid,
+      }), 'Task GUID mapping');
+      const taskId = requireText(mapping.taskId, 'Task GUID mapping.taskId');
+      const actorId = requireText(
+        mapping.wakeTarget?.agentId,
+        'Task GUID mapping Agent assignee',
+      );
+      if (!actorId.startsWith('agent:')) {
+        throw permanentMappingError(`Task comment reply target is not an Agent: ${actorId}`);
+      }
+      const replyToCommentId = stableKey('external-comment', [
+        normalizedAppId,
+        normalized.replyToCommentId,
+      ]);
+      const commentId = stableKey('agent-comment', [
+        normalizedAppId,
+        normalized.taskGuid,
+        normalized.replyToCommentId,
+        normalized.content,
+      ]);
+      const coreKey = taskCommentReplyIdempotencyKey({
+        appId: normalizedAppId,
+        ...normalized,
+      });
+      const expected = {
+        actorId,
+        body: normalized.content,
+        replyToCommentId,
+      };
+      let existing = conversation.query({ taskId, commentId });
+      let coreEventId;
+      if (existing) {
+        coreEventId = verifyExisting(existing, expected);
+      } else {
+        try {
+          const result = await conversation.record({
+            type: 'AddComment',
+            taskId,
+            commentId,
+            ...expected,
+            occurredAt: canonicalInstant(clock(), 'Core-first Task comment clock result'),
+            idempotencyKey: `${coreKey}:core`,
+          });
+          coreEventId = requireText(result?.event?.id, 'Core Agent comment event ID');
+        } catch (error) {
+          if (error?.code !== 'IDEMPOTENCY_CONFLICT') throw error;
+          existing = conversation.query({ taskId, commentId });
+          if (!existing) throw error;
+          coreEventId = verifyExisting(existing, expected);
+        }
+      }
+      const projection = await replyAdapter.reply({
+        ...normalized,
+        idempotencyKey: `task-comment-core-event:${coreEventId}`,
+      });
+      return Object.freeze({ coreEventId, projection });
+    },
+  });
 }
 
 export function createCoreTaskV2CommentMapping({ core }) {
   const canonical = requireRecord(core, 'Commitment Core');
   requireFunction(canonical.query, 'core.query');
   requireFunction(canonical.externalLinks?.query, 'core.externalLinks.query');
+  let listCursor = null;
 
   function taskForLink(link) {
     const task = canonical.query({ taskId: requireText(link.taskId, 'Task v2 link.taskId') });
@@ -86,22 +206,25 @@ export function createCoreTaskV2CommentMapping({ core }) {
     return task;
   }
 
+  function mappingFor(task, link) {
+    return Object.freeze({
+      taskId: requireText(task.id, 'Core task.id'),
+      taskGuid: requireText(link.externalId, 'Task v2 link.externalId'),
+      state: requireText(task.state, 'Core task.state'),
+      updatedAt: requireText(task.updatedAt, 'Core task.updatedAt'),
+      eventCoverage: 'app',
+    });
+  }
+
   return Object.freeze({
     async resolve({ taskGuid }) {
       const guid = requireText(taskGuid, 'Task v2 taskGuid');
-      const links = canonical.externalLinks.query({
+      const link = canonical.externalLinks.query({
         backend: TASK_V2_LINK_BACKEND,
         externalId: guid,
-        limit: 2,
       });
-      if (!Array.isArray(links) || links.length !== 1) {
-        throw permanentMappingError(
-          links?.length > 1
-            ? `multiple Core tasks map to Task v2 GUID: ${guid}`
-            : `Task v2 GUID is not linked to Core: ${guid}`,
-        );
-      }
-      const task = taskForLink(links[0]);
+      if (!link) throw permanentMappingError(`Task v2 GUID is not linked to Core: ${guid}`);
+      const task = taskForLink(requireRecord(link, 'Task v2 ExternalLink'));
       return Object.freeze({
         taskId: task.id,
         wakeTarget: typeof task.assigneeId === 'string' && task.assigneeId.startsWith('agent:')
@@ -113,18 +236,45 @@ export function createCoreTaskV2CommentMapping({ core }) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
         throw new TypeError('Task v2 mapping limit must be between 1 and 100');
       }
-      const links = canonical.externalLinks.query({ backend: TASK_V2_LINK_BACKEND, limit });
-      if (!Array.isArray(links)) throw new TypeError('core.externalLinks.query must return an array');
-      return links.map((link) => {
-        const task = taskForLink(link);
-        return Object.freeze({
-          taskId: task.id,
-          taskGuid: requireText(link.externalId, 'Task v2 link.externalId'),
-          state: requireText(task.state, 'Core task.state'),
-          updatedAt: requireText(task.updatedAt, 'Core task.updatedAt'),
-          eventCoverage: 'app',
-        });
-      });
+      const mappings = [];
+      let cursor = listCursor;
+      while (mappings.length < limit) {
+        const tasks = canonical.query({ limit: 100, ...(cursor ? { cursor } : {}) });
+        if (!Array.isArray(tasks)) throw new TypeError('core.query list mode must return an array');
+        if (tasks.length === 0) {
+          listCursor = null;
+          break;
+        }
+        for (const [index, rawTask] of tasks.entries()) {
+          const task = requireRecord(rawTask, 'Core task list item');
+          listCursor = {
+            updatedAt: requireText(task.updatedAt, 'Core task.updatedAt'),
+            taskId: requireText(task.id, 'Core task.id'),
+          };
+          const links = canonical.externalLinks.query({
+            taskId: task.id,
+            backend: TASK_V2_LINK_BACKEND,
+            limit: 2,
+          });
+          if (!Array.isArray(links)) {
+            throw new TypeError('core.externalLinks.query task mode must return an array');
+          }
+          if (links.length > 1) {
+            throw permanentMappingError(`multiple Task v2 GUIDs map to Core Task: ${task.id}`);
+          }
+          if (links.length === 1) mappings.push(mappingFor(task, links[0]));
+          if (mappings.length === limit) {
+            if (index === tasks.length - 1 && tasks.length < 100) listCursor = null;
+            return mappings;
+          }
+        }
+        if (tasks.length < 100) {
+          listCursor = null;
+          break;
+        }
+        cursor = listCursor;
+      }
+      return mappings;
     },
   });
 }
@@ -157,6 +307,7 @@ export function createC4TaskCommentWake({ queue }) {
       idempotencyKey: requireText(wake.idempotencyKey, 'Task comment Agent wake.idempotencyKey'),
       channel: 'feishu',
       endpointId: createTaskCommentReplyEndpoint({
+        appId: replyContext.appId,
         taskGuid: replyContext.taskGuid,
         replyToCommentId: replyContext.replyToCommentId,
       }),

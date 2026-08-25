@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import packageJson from '../package.json' with { type: 'json' };
 
 const require = createRequire(import.meta.url);
 
@@ -23,6 +24,17 @@ test('ordinary Feishu ecosystem cannot implicitly start task projection', () => 
     Object.hasOwn(ordinaryFeishu.env, 'COMMITMENT_FEISHU_TASK_V2_ENABLED'),
     false,
   );
+  assert.equal(Object.hasOwn(ordinaryFeishu.env, 'FEISHU_TASK_COMMENTS_ENABLED'), false);
+});
+
+test('Task comment processes consume capability flags from the shared dotenv config', () => {
+  const ecosystem = require('../ecosystem.task-comments.config.cjs');
+  const [comments] = ecosystem.apps;
+
+  assert.equal(comments.env.FEISHU_TASK_COMMENTS_WORKER_AUTOSTART, '1');
+  assert.equal(Object.hasOwn(comments.env, 'FEISHU_TASK_COMMENTS_ENABLED'), false);
+  assert.equal(Object.hasOwn(comments.env, 'COMMITMENT_FEISHU_TASK_V2_ENABLED'), false);
+  assert.doesNotMatch(packageJson.scripts['task-comments:once'], /FEISHU_TASK_COMMENTS_ENABLED=/);
 });
 
 test('ships Task v2 as a second explicit projection process', () => {
