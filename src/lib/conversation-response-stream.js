@@ -428,7 +428,13 @@ export function createConversationResponseStream({
 
   async function render(state, { terminal = false, purpose = 'event' } = {}) {
     if (state.mode === 'plain_text') {
-      if (terminal && !state.plainTerminalSent) {
+      const terminalFingerprint = terminal
+        ? createHash('sha256')
+          .update(`${state.status}\0${state.output}`)
+          .digest('hex')
+          .slice(0, 20)
+        : null;
+      if (terminal && state.plainTerminalFingerprint !== terminalFingerprint) {
         const text = state.status === 'completed'
           ? (state.output || '处理完成。')
           : state.phase;
@@ -436,9 +442,10 @@ export function createConversationResponseStream({
           client,
           state.target,
           text,
-          stableToken(state.requestId, 'plain-terminal'),
+          stableToken(state.requestId, `plain-terminal:${terminalFingerprint}`),
         );
         state.plainTerminalSent = true;
+        state.plainTerminalFingerprint = terminalFingerprint;
         save(state);
       }
       return;
@@ -561,6 +568,7 @@ export function createConversationResponseStream({
             lastRenderedAt: clock(),
             compatibilityTerminal: false,
             plainTerminalSent: false,
+            plainTerminalFingerprint: null,
             cards: [],
           };
         }
@@ -577,6 +585,7 @@ export function createConversationResponseStream({
             lastRenderedAt: clock(),
             compatibilityTerminal: false,
             plainTerminalSent: false,
+            plainTerminalFingerprint: null,
             cards: [{
               part: 0,
               messageId,
@@ -626,6 +635,12 @@ export function createConversationResponseStream({
         const events = request.events
           .map(event => validateEvent(event, requestId))
           .sort((left, right) => left.sequence - right.sequence);
+        const compatibility = state.compatibilityTerminal
+          ? { status: state.status, output: state.output, phase: state.phase }
+          : null;
+        let canonicalStatus = compatibility ? null : state.status;
+        let canonicalPhase = compatibility ? state.phase : null;
+        let canonicalOutput = compatibility ? (state.durableOutput || '') : null;
         let changed = false;
         let terminal = false;
         let containsDelta = false;
@@ -635,34 +650,65 @@ export function createConversationResponseStream({
             throw new Error(`assistant response event gap: expected ${state.lastEventSequence + 1}, received ${event.sequence}`);
           }
           const phase = phaseForEvent(event);
-          if (phase) state.phase = phase;
-          if (event.type === 'AssistantRequestAccepted') state.status = 'accepted';
-          if (event.type === 'RunQueued') state.status = 'queued';
-          if (event.type === 'RunStarted') state.status = 'started';
-          if (event.type === 'OutputDelta') {
-            state.output += event.payload.delta;
-            containsDelta = true;
-          }
-          if (event.type === 'RunCompleted') {
-            state.output = event.payload.output;
-            state.status = 'completed';
-            terminal = true;
-          }
-          if (event.type === 'RunFailed') {
-            state.status = 'failed';
-            terminal = true;
+          if (compatibility) {
+            if (phase) canonicalPhase = phase;
+            if (event.type === 'AssistantRequestAccepted') canonicalStatus = 'accepted';
+            if (event.type === 'RunQueued') canonicalStatus = 'queued';
+            if (event.type === 'RunStarted') canonicalStatus = 'started';
+            if (event.type === 'OutputDelta') {
+              canonicalOutput += event.payload.delta;
+              containsDelta = true;
+            }
+            if (event.type === 'RunCompleted') {
+              canonicalOutput = event.payload.output;
+              canonicalStatus = 'completed';
+              terminal = true;
+            }
+            if (event.type === 'RunFailed') {
+              canonicalStatus = 'failed';
+              terminal = true;
+            }
+          } else {
+            if (phase) state.phase = phase;
+            if (event.type === 'AssistantRequestAccepted') state.status = 'accepted';
+            if (event.type === 'RunQueued') state.status = 'queued';
+            if (event.type === 'RunStarted') state.status = 'started';
+            if (event.type === 'OutputDelta') {
+              state.output += event.payload.delta;
+              containsDelta = true;
+            }
+            if (event.type === 'RunCompleted') {
+              state.output = event.payload.output;
+              state.status = 'completed';
+              terminal = true;
+            }
+            if (event.type === 'RunFailed') {
+              state.status = 'failed';
+              terminal = true;
+            }
           }
           state.lastEventSequence = event.sequence;
           changed = true;
         }
         if (!changed) return { handled: true, replayed: true, status: state.status };
 
-        // A compatibility completion may have already closed the same card before
-        // the durable terminal event arrives.  Advance the event cursor without
-        // reopening or duplicating the answer.
-        if (state.compatibilityTerminal && ['completed', 'failed'].includes(state.status)) {
-          save(state);
-          return { handled: true, replayed: false, status: state.status };
+        if (compatibility) {
+          state.durableOutput = canonicalOutput;
+          if (!terminal) {
+            save(state);
+            return { handled: true, replayed: false, status: compatibility.status };
+          }
+          const sameTerminal = canonicalStatus === compatibility.status
+            && canonicalOutput === compatibility.output;
+          state.status = canonicalStatus;
+          state.phase = canonicalPhase;
+          state.output = canonicalOutput;
+          state.compatibilityTerminal = false;
+          delete state.durableOutput;
+          if (sameTerminal) {
+            save(state);
+            return { handled: true, replayed: false, status: state.status };
+          }
         }
 
         const elapsed = clock() - state.lastRenderedAt;

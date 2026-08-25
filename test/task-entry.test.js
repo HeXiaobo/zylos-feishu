@@ -203,6 +203,27 @@ test('passes a confirmation choice to the Core-owned WorkIntake resolver', () =>
   ]);
 });
 
+test('passes a delivered confirmation effect to the Core-owned effect acknowledger', () => {
+  const effect = {
+    sourceKey: 'feishu:om_confirm:work-intake:r1',
+    action: 'edit',
+    actorId: 'ou_sender',
+    effectKey: 'feishu:om_confirm:work-intake:r1:edit-guidance',
+    capability: 'wic1.payload.signature',
+  };
+  const args = buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_chat|type:p2p|msg:om_confirm',
+    content: '[WorkIntake confirmation effect]',
+    workIntakeConfirmationEffect: effect,
+  });
+  assert.deepEqual(args.slice(-4), [
+    '--work-intake-confirmation-effect-json', JSON.stringify(effect),
+    '--content', '[WorkIntake confirmation effect]',
+  ]);
+});
+
 test('verifies an explicit complete action and binds the trusted event actor before invoking Core', () => {
   const contexts = createTaskActionContextSigner({
     secret: SECRET,

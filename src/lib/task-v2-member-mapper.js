@@ -40,8 +40,15 @@ function deduplicateMembers(members) {
  * owners and distinct acceptors as followers, a human assignee as a user, and
  * a logical Agent assignee as the configured App identity.
  */
-export function createTaskV2MemberMapper({ appId, agentAppIds = {} } = {}) {
+export function createTaskV2MemberMapper({
+  appId,
+  agentAppIds = {},
+  requireGatewayAppAssignee = false,
+} = {}) {
   const gatewayAppId = requireText(appId, 'appId');
+  if (typeof requireGatewayAppAssignee !== 'boolean') {
+    throw new TypeError('requireGatewayAppAssignee must be a boolean');
+  }
   const configuredAgents = requireRecord(agentAppIds, 'agentAppIds');
   const agentIds = new Map(Object.entries(configuredAgents).map(([agentId, mappedAppId]) => {
     if (!AGENT_ID.test(agentId)) throw new TypeError(`invalid Agent identity: ${agentId}`);
@@ -68,7 +75,15 @@ export function createTaskV2MemberMapper({ appId, agentAppIds = {} } = {}) {
           members.push(Object.freeze({ id: mappedAppId, type: 'app', role: 'assignee' }));
         }
       }
-      return Object.freeze(deduplicateMembers(members));
+      const result = deduplicateMembers(members);
+      if (requireGatewayAppAssignee && !result.some(member => (
+        member.type === 'app'
+        && member.role === 'assignee'
+        && member.id === gatewayAppId
+      ))) {
+        throw new TypeError('Task v2 MVP requires agent:yueran as assignee for crash-safe recovery');
+      }
+      return Object.freeze(result);
     },
   });
 }

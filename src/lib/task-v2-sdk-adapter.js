@@ -1,7 +1,7 @@
 const USER_ID_TYPE = 'open_id';
 const MARKER_SCHEMA = 'zylos.task-v2-projection/v1';
 const PERMANENT_FEISHU_CODES = new Set([99992402]);
-const MAX_SEARCH_PAGES = 1_000;
+const MAX_LIST_PAGES = 1_000;
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -181,7 +181,7 @@ function patchPayload(task, current) {
 export function createSdkTaskV2Gateway({ client } = {}) {
   const sdk = requireRecord(client, 'client');
   const taskApi = sdk.task?.v2?.task;
-  for (const operation of ['create', 'patch', 'get', 'addMembers', 'removeMembers', 'search']) {
+  for (const operation of ['create', 'patch', 'get', 'addMembers', 'removeMembers', 'list']) {
     if (typeof taskApi?.[operation] !== 'function') {
       throw new TypeError(`client.task.v2.task.${operation} must be a function`);
     }
@@ -266,39 +266,49 @@ export function createSdkTaskV2Gateway({ client } = {}) {
         const seenTaskGuids = new Set();
         const seenPageTokens = new Set();
         let pageToken;
-        for (let page = 0; page < MAX_SEARCH_PAGES; page += 1) {
-          const response = await taskApi.search({
+        for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
+          const response = await taskApi.list({
             params: {
               user_id_type: USER_ID_TYPE,
+              type: 'my_tasks',
               page_size: 50,
               ...(pageToken ? { page_token: pageToken } : {}),
             },
-            data: { query: `Zylos Core Task: ${expectedId}` },
           });
-          if (response?.code !== 0) taskFromResponse(response, 'search');
+          if (response?.code !== 0) {
+            throw new FeishuTaskV2Error(response?.msg || 'Feishu Task v2 list failed', {
+              code: response?.code,
+              retryable: !PERMANENT_FEISHU_CODES.has(response?.code),
+            });
+          }
           const candidates = response?.data?.items ?? [];
           for (const candidate of candidates) {
-            const taskGuid = requireText(candidate.id, 'Task v2 search item id');
+            const taskGuid = requireText(candidate.guid, 'Task v2 list item guid');
             if (seenTaskGuids.has(taskGuid)) continue;
             seenTaskGuids.add(taskGuid);
+            // list(my_tasks) includes extra in production. Filter on that
+            // marker before the authoritative get, avoiding one API request
+            // for every unrelated task visible to the App.
+            const listedMarker = parseTaskMarker(candidate.extra);
+            if (candidate.extra !== undefined && listedMarker?.coreTaskId !== expectedId) continue;
             const snapshot = await getTask(taskGuid);
             if (snapshot.coreTaskId === expectedId) tasks.push(snapshot);
           }
           if (!response?.data?.has_more) return tasks;
-          const nextPageToken = requireText(response?.data?.page_token, 'Task v2 search page_token');
+          const nextPageToken = requireText(response?.data?.page_token, 'Task v2 list page_token');
           if (seenPageTokens.has(nextPageToken)) {
-            throw new FeishuTaskV2Error('Feishu Task v2 search repeated a page token', {
+            throw new FeishuTaskV2Error('Feishu Task v2 list repeated a page token', {
               retryable: false,
             });
           }
           seenPageTokens.add(nextPageToken);
           pageToken = nextPageToken;
         }
-        throw new FeishuTaskV2Error('Feishu Task v2 search exceeded the page safety limit', {
+        throw new FeishuTaskV2Error('Feishu Task v2 list exceeded the page safety limit', {
           retryable: false,
         });
       } catch (error) {
-        return wrapSdkFailure('search', error);
+        return wrapSdkFailure('list', error);
       }
     },
   });

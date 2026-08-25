@@ -28,6 +28,7 @@ import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { createTaskActionContextSigner } from './lib/task-action-context.js';
 import { getClient } from './lib/client.js';
 import { createConversationResponseStream } from './lib/conversation-response-stream.js';
+import { isRetryableC4Failure } from './lib/c4-retry-policy.js';
 import { resolveZylosCli } from './lib/zylos-cli-resolver.js';
 import {
   createTaskCardActionRuntime,
@@ -50,6 +51,7 @@ import {
   hasExactBotMention,
 } from './lib/feishu-work-intake-inbound.js';
 import { createWorkIntakeConfirmationContextSigner } from './lib/work-intake-confirmation-context.js';
+import { createWorkIntakeConfirmationCapabilityIssuer } from './lib/work-intake-confirmation-capability.js';
 import {
   createWorkIntakeConfirmationCardRenderer,
   createWorkIntakeConfirmationRuntime,
@@ -65,6 +67,12 @@ import {
   TASK_V2_STATUS_EVENT,
 } from './lib/task-v2-runtime-policy.js';
 import { initializeTaskCommentIntake } from './lib/task-comment-intake.js';
+import { isTaskCommentsEnabled } from './lib/task-comment-runtime-policy.js';
+import {
+  openInboundEventInbox,
+  processInboundEventInboxOnce,
+} from './lib/inbound-event-inbox.js';
+import { normalizeInboundMessageEvent } from './lib/inbound-message-event.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -93,6 +101,18 @@ if (process.env.FEISHU_WORK_INTAKE_CONTEXT_SECRET) {
   }
 }
 
+let workIntakeConfirmationCapabilityIssuer = null;
+if (process.env.C4_WORK_INTAKE_CAPABILITY_SECRET) {
+  try {
+    workIntakeConfirmationCapabilityIssuer = createWorkIntakeConfirmationCapabilityIssuer({
+      secret: process.env.C4_WORK_INTAKE_CAPABILITY_SECRET,
+      clock: Date.now,
+    });
+  } catch (error) {
+    console.error(`[feishu] WorkIntake confirmation capabilities disabled: ${error.message}`);
+  }
+}
+
 // Bot identity (fetched at startup)
 let botOpenId = '';
 let botAppId = '';
@@ -104,6 +124,9 @@ let webhookServer = null;
 let isShuttingDown = false;
 let taskCommentStore = null;
 let taskCommentEventHandlers = Object.freeze({});
+let inboundEventInbox = null;
+let inboundDrainPromise = null;
+let inboundDrainInterval = null;
 
 // Initialize
 let config = getConfig();
@@ -152,37 +175,6 @@ const workIntakeConfirmationRetryInterval = setInterval(() => {
 // State files
 const CURSORS_PATH = path.join(DATA_DIR, 'group-cursors.json');
 const USER_CACHE_PATH = path.join(DATA_DIR, 'user-cache.json');
-
-// ============================================================
-// Message deduplication (shared by websocket and webhook modes)
-// ============================================================
-const DEDUP_TTL = 5 * 60 * 1000; // 5 minutes
-const processedMessages = new Map();
-
-function isDuplicate(messageId) {
-  if (!messageId) return false;
-  if (processedMessages.has(messageId)) {
-    console.log(`[feishu] Duplicate message_id ${messageId}, skipping`);
-    return true;
-  }
-  processedMessages.set(messageId, Date.now());
-  // Cleanup old entries
-  if (processedMessages.size > 200) {
-    const now = Date.now();
-    for (const [id, ts] of processedMessages) {
-      if (now - ts > DEDUP_TTL) processedMessages.delete(id);
-    }
-  }
-  return false;
-}
-
-// Periodic cleanup of expired dedup entries (avoids accumulation in low-traffic chats)
-const dedupCleanupInterval = setInterval(() => {
-  const now = Date.now();
-  for (const [id, ts] of processedMessages) {
-    if (now - ts > DEDUP_TTL) processedMessages.delete(id);
-  }
-}, DEDUP_TTL);
 
 console.log(`[feishu] Config loaded, enabled: ${config.enabled}`);
 
@@ -786,13 +778,23 @@ function getGroupName(chatId) {
  * Feishu replaces @mentions with @_user_1, @_user_2, etc. in the raw text.
  * The mentions array contains the mapping: { key: "@_user_1", name: "Name", id: { ... } }
  */
-function resolveMentions(text, mentions, { stripBot = false, botOpenId: botId } = {}) {
+function resolveMentions(
+  text,
+  mentions,
+  {
+    stripBot = false,
+    botOpenId: botOpenIdValue = botOpenId,
+    botAppId: botAppIdValue = botAppId,
+  } = {},
+) {
   if (!text || !mentions || !Array.isArray(mentions) || mentions.length === 0) return text;
 
   let resolved = text;
   for (const m of mentions) {
     if (!m.key) continue;
-    const isBotMention = botId && (m.id?.open_id === botId || m.id?.app_id === botId);
+    const mentionIds = [m.id?.open_id, m.id?.app_id].filter(Boolean).map(String);
+    const botIds = [botOpenIdValue, botAppIdValue].filter(Boolean).map(String);
+    const isBotMention = botIds.some(id => mentionIds.includes(id));
     if (stripBot && isBotMention) {
       resolved = resolved.replace(new RegExp(m.key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*', 'g'), '');
     } else if (m.name) {
@@ -833,14 +835,18 @@ function assistantRequestId(messageId) {
   return `assistant.feishu.${digest}`;
 }
 
-async function openConversationResponse({ chatId, chatType, messageId, rootId, parentId }) {
-  const request = {
+function buildAssistantRequest(messageId) {
+  return Object.freeze({
     requestId: assistantRequestId(messageId),
     sourceId: String(messageId),
-  };
+  });
+}
+
+async function openConversationResponse({ chatId, chatType, messageId, rootId, parentId, request }) {
+  const responseRequest = request || buildAssistantRequest(messageId);
   try {
     await getConversationResponseStream().open({
-      requestId: request.requestId,
+      requestId: responseRequest.requestId,
       target: {
         chatId,
         chatType,
@@ -849,12 +855,18 @@ async function openConversationResponse({ chatId, chatType, messageId, rootId, p
           : null,
       },
     });
-    return request;
+    return responseRequest;
   } catch (error) {
     console.warn(`[feishu] Failed to open immediate response card: ${error.message}`);
     return null;
   }
   return null;
+}
+
+function requiresAssistantResponse({ assistantRequest, workIntakeEnvelope, response }) {
+  if (!assistantRequest) return false;
+  if (!workIntakeEnvelope) return true;
+  return !['create_task', 'confirm'].includes(response?.workIntake?.decision);
 }
 
 function failConversationResponse(request) {
@@ -872,7 +884,7 @@ function failConversationResponse(request) {
  * Send message to Claude via C4 (with 1 retry on unexpected failure).
  * Explicit task intents atomically carry their normalized envelope.
  */
-function sendToC4(
+async function sendToC4(
   source,
   endpoint,
   content,
@@ -880,8 +892,7 @@ function sendToC4(
   { taskEnvelope, workIntakeEnvelope, assistantRequest, onSuccess } = {},
 ) {
   if (!content) {
-    console.error('[feishu] sendToC4 called with empty content');
-    return;
+    throw new TypeError('sendToC4 content must be non-empty');
   }
   const childEnv = { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET };
   const args = buildC4ReceiveArgs({
@@ -894,60 +905,54 @@ function sendToC4(
     workIntakeEnvelope,
   });
 
-  const notifySuccess = (stdout) => {
-    if (!onSuccess) return;
-    try {
-      Promise.resolve(onSuccess(parseC4Response(stdout))).catch((error) => {
-        console.error(`[feishu] C4 success handler failed: ${error.message}`);
-      });
-    } catch (error) {
-      console.error(`[feishu] C4 success handler failed: ${error.message}`);
-    }
-  };
-
-  execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
-    if (!error) {
-      const response = parseC4Response(stdout);
-      if (assistantRequest && response?.assistantResponse?.requestId !== assistantRequest.requestId) {
-        console.warn('[feishu] C4 accepted the message without opening its response stream');
-        if (onReject) onReject('assistant response stream was not accepted');
+  const runOnce = () => new Promise((resolve, reject) => {
+    execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
+      if (!error) {
+        resolve({ stdout, response: parseC4Response(stdout) });
         return;
       }
-      console.log(`[feishu] Sent to C4: ${content.substring(0, 50)}...`);
-      notifySuccess(stdout);
-      return;
-    }
-    const response = parseC4Response(error.stdout || stdout);
-    if (response && response.ok === false && response.error?.message) {
-      console.warn(`[feishu] C4 rejected (${response.error.code}): ${response.error.message}`);
-      if (onReject) onReject(response.error.message);
-      return;
-    }
-    console.warn(`[feishu] C4 send failed, retrying in 2s: ${error.message}`);
-    setTimeout(() => {
-      execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (retryError, retryStdout) => {
-        if (!retryError) {
-          const retryResponse = parseC4Response(retryStdout);
-          if (assistantRequest && retryResponse?.assistantResponse?.requestId !== assistantRequest.requestId) {
-            console.error('[feishu] C4 retry succeeded without opening its response stream');
-            if (onReject) onReject('assistant response stream was not accepted');
-            return;
-          }
-          console.log(`[feishu] Sent to C4 (retry): ${content.substring(0, 50)}...`);
-          notifySuccess(retryStdout);
-          return;
-        }
-        const retryResponse = parseC4Response(retryError.stdout || retryStdout);
-        if (retryResponse && retryResponse.ok === false && retryResponse.error?.message) {
-          console.error(`[feishu] C4 rejected after retry (${retryResponse.error.code}): ${retryResponse.error.message}`);
-          if (onReject) onReject(retryResponse.error.message);
-        } else {
-          console.error(`[feishu] C4 send failed after retry: ${retryError.message}`);
-          if (onReject) onReject();
-        }
-      });
-    }, 2000);
+      const response = parseC4Response(error.stdout || stdout);
+      const failure = new Error(response?.error?.message || error.message || 'C4 receive failed');
+      failure.code = response?.error?.code || 'C4_TRANSPORT_FAILED';
+      failure.retryable = isRetryableC4Failure(response);
+      reject(failure);
+    });
   });
+
+  let delivered;
+  try {
+    delivered = await runOnce();
+  } catch (firstError) {
+    if (!firstError.retryable) {
+      console.warn(`[feishu] C4 rejected (${firstError.code}): ${firstError.message}`);
+      if (onReject) await onReject(firstError.message);
+      throw firstError;
+    }
+    console.warn(`[feishu] C4 send failed, retrying in 2s: ${firstError.message}`);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    try {
+      delivered = await runOnce();
+    } catch (retryError) {
+      console.error(`[feishu] C4 send failed after retry (${retryError.code}): ${retryError.message}`);
+      if (onReject) await onReject(retryError.message);
+      throw retryError;
+    }
+  }
+
+  const response = delivered.response;
+  if (
+    requiresAssistantResponse({ assistantRequest, workIntakeEnvelope, response })
+    && response?.assistantResponse?.requestId !== assistantRequest.requestId
+  ) {
+    const failure = new Error('assistant response stream was not accepted');
+    failure.code = 'ASSISTANT_RESPONSE_NOT_ACCEPTED';
+    failure.retryable = true;
+    if (onReject) await onReject(failure.message);
+    throw failure;
+  }
+  if (onSuccess) await onSuccess(response);
+  console.log(`[feishu] Sent to C4: ${content.substring(0, 50)}...`);
+  return response;
 }
 
 function executeC4Receive(args) {
@@ -991,7 +996,10 @@ function executeTaskAction(taskAction) {
       }
       const response = parseC4Response(error.stdout || stdout);
       const message = response?.error?.message || error.message;
-      reject(new Error(message));
+      const failure = new Error(message);
+      failure.code = response?.error?.code || 'TASK_ACTION_TRANSPORT_FAILED';
+      failure.retryable = isRetryableC4Failure(response);
+      reject(failure);
     });
   });
 }
@@ -1017,27 +1025,72 @@ function getWorkIntakeConfirmationCardRenderer() {
 }
 
 async function executeWorkIntakeConfirmation(route) {
+  if (!workIntakeConfirmationCapabilityIssuer) {
+    throw new Error('Core WorkIntake confirmation capabilities are not configured');
+  }
+  const capability = workIntakeConfirmationCapabilityIssuer.issue({
+    sourceKey: route.confirmationRequest.sourceKey,
+    action: route.confirmationRequest.action,
+    actorId: route.confirmationRequest.actorId,
+    expiresAt: route.claims.expiresAt,
+    nonce: `${route.claims.messageId}:${route.action}:${route.actorId}`,
+  });
   const args = buildC4ReceiveArgs({
     receiverPath: C4_RECEIVE,
     source: route.claims.channel,
     endpoint: route.claims.endpoint,
     content: '[Feishu WorkIntake confirmation]',
-    workIntakeConfirmation: route.confirmationRequest,
+    workIntakeConfirmation: { ...route.confirmationRequest, capability },
   });
   const result = await executeC4Receive(args);
-  if (route.action === 'edit' && !result?.workIntakeConfirmation?.replayed) {
+  if (
+    route.action === 'edit'
+    && result?.workIntakeConfirmation?.effectStatus === 'pending'
+  ) {
+    const effectKey = result.workIntakeConfirmation.effectKey;
+    if (typeof effectKey !== 'string' || effectKey === '') {
+      throw new Error('Core returned no WorkIntake edit effect key');
+    }
     const [chatId, ...metadata] = route.claims.endpoint.split('|');
     const chatType = metadata.find((part) => part.startsWith('type:'))?.slice(5);
     const prompt = '请重新发送修改后的交办；新消息会使用新的 message_id 重新判断。';
-    await (chatType === 'p2p'
-      ? sendMessage(chatId, prompt, 'chat_id', 'text')
-      : replyToMessage(route.claims.messageId, prompt));
+    const deliveryUuid = `zwi_${crypto.createHash('sha256')
+      .update(effectKey)
+      .digest('hex')
+      .slice(0, 40)}`;
+    const editDelivery = await (chatType === 'p2p'
+      ? sendMessage(chatId, prompt, 'chat_id', 'text', { uuid: deliveryUuid })
+      : replyToMessage(route.claims.messageId, prompt, 'text', { uuid: deliveryUuid }));
+    if (!editDelivery?.success) {
+      throw new Error(editDelivery?.message || 'WorkIntake edit guidance delivery failed');
+    }
+    const effectCapability = workIntakeConfirmationCapabilityIssuer.issue({
+      sourceKey: route.confirmationRequest.sourceKey,
+      action: 'edit',
+      actorId: route.confirmationRequest.actorId,
+      expiresAt: route.claims.expiresAt,
+      nonce: `effect:${crypto.createHash('sha256').update(effectKey).digest('hex')}`,
+    });
+    const effectArgs = buildC4ReceiveArgs({
+      receiverPath: C4_RECEIVE,
+      source: route.claims.channel,
+      endpoint: route.claims.endpoint,
+      content: '[Feishu WorkIntake confirmation effect]',
+      workIntakeConfirmationEffect: {
+        sourceKey: route.confirmationRequest.sourceKey,
+        action: 'edit',
+        actorId: route.confirmationRequest.actorId,
+        effectKey,
+        capability: effectCapability,
+      },
+    });
+    await executeC4Receive(effectArgs);
   }
   return result;
 }
 
 function getWorkIntakeConfirmationRuntime() {
-  if (!workIntakeConfirmationContextSigner) {
+  if (!workIntakeConfirmationContextSigner || !workIntakeConfirmationCapabilityIssuer) {
     throw new Error('signed WorkIntake confirmations are not configured');
   }
   if (!workIntakeConfirmationRuntime) {
@@ -1158,17 +1211,27 @@ async function handleAuthorizedTaskInput({
     threadId,
   );
   addTypingIndicator(messageId);
-  executeTaskAction(route)
-    .then(() => console.log(`[feishu] Applied ${route.command.type} to ${route.command.taskId}`))
-    .catch((error) => {
-      console.error(`[feishu] Task action failed: ${error.message}`);
-      sendThreadAwareMessage(
-        chatId,
-        'Task action rejected. Refresh the task state and try again.',
-        { chatType, rootId, parentId, messageId },
-      ).catch(e => console.error('[feishu] task action reject reply failed:', e.message));
-    })
-    .finally(() => removeTypingIndicator(messageId));
+  try {
+    await executeTaskAction(route);
+    console.log(`[feishu] Applied ${route.command.type} to ${route.command.taskId}`);
+  } catch (error) {
+    console.error(`[feishu] Task action failed: ${error.message}`);
+    const retrying = error.retryable !== false;
+    const replyUuid = `zta_${crypto.createHash('sha256')
+      .update(`${messageId}:${error.code || 'TASK_ACTION_FAILED'}`)
+      .digest('hex')
+      .slice(0, 40)}`;
+    await sendThreadAwareMessage(
+      chatId,
+      retrying
+        ? '任务操作暂未完成，系统正在自动重试。'
+        : '任务状态已变化，请刷新任务后重试。',
+      { chatType, rootId, parentId, messageId, uuid: replyUuid },
+    );
+    if (retrying) throw error;
+  } finally {
+    removeTypingIndicator(messageId);
+  }
   return { handled: true, route };
 }
 
@@ -1230,9 +1293,11 @@ function buildNaturalWorkIntakeEnvelope({
   timestamp,
 }) {
   if (!config.workIntake?.enabled) return null;
-  if (!config.memberAccessPolicy || !workIntakeConfirmationContextSigner) {
+  if (!config.memberAccessPolicy
+    || !workIntakeConfirmationContextSigner
+    || !workIntakeConfirmationCapabilityIssuer) {
     if (!workIntakeConfigurationWarningEmitted) {
-      console.error('[feishu] WorkIntake disabled: memberAccessPolicy and FEISHU_WORK_INTAKE_CONTEXT_SECRET are required');
+      console.error('[feishu] WorkIntake disabled: memberAccessPolicy, FEISHU_WORK_INTAKE_CONTEXT_SECRET, and C4_WORK_INTAKE_CAPABILITY_SECRET are required');
       workIntakeConfigurationWarningEmitted = true;
     }
     return null;
@@ -1265,19 +1330,40 @@ async function handleWorkIntakeResult(response, {
   chatType,
   rootId,
   parentId,
+  assistantRequest,
 }) {
   if (!workIntakeResultHandler) {
     workIntakeResultHandler = createWorkIntakeResultHandler({
-      sendTaskReceipt: ({ title, context }) => sendThreadAwareMessage(
-        context.chatId,
-        `已登记任务：${title}`,
-        {
+      sendTaskReceipt: async ({ title, deliveryUuid, context }) => {
+        const delivered = await sendThreadAwareMessage(
+          context.chatId,
+          `已登记任务：${title}`,
+          {
+            chatType: context.chatType,
+            rootId: context.rootId,
+            parentId: context.parentId,
+            messageId: context.messageId,
+            uuid: deliveryUuid,
+          },
+        );
+        return { success: delivered };
+      },
+      startAssistantResponse: async ({ requestId, context }) => {
+        if (context.assistantRequest?.requestId !== requestId) {
+          return { success: false, message: 'assistant request mismatch' };
+        }
+        const opened = await openConversationResponse({
+          chatId: context.chatId,
           chatType: context.chatType,
+          messageId: context.messageId,
           rootId: context.rootId,
           parentId: context.parentId,
-          messageId: context.messageId,
-        },
-      ),
+          request: context.assistantRequest,
+        });
+        return opened
+          ? { success: true, requestId }
+          : { success: false, message: 'assistant response card unavailable' };
+      },
       sendConfirmationCard: ({ confirmation, deliveryKey, deliveryUuid, context }) => (
         workIntakeConfirmationDelivery.send({
           deliveryKey,
@@ -1298,6 +1384,7 @@ async function handleWorkIntakeResult(response, {
     chatType,
     rootId,
     parentId,
+    assistantRequest,
   });
 }
 
@@ -1692,9 +1779,15 @@ async function isDmAllowed(userId, openId, sender) {
 // main view), so this must be chat-type-aware — hence chatType is required.
 // Delegates the target decision to chooseReplyTarget (via sendThreadAware) so it
 // stays consistent with the outbound send routing.
-async function sendThreadAwareMessage(chatId, text, { chatType, rootId, parentId, messageId } = {}) {
+async function sendThreadAwareMessage(chatId, text, {
+  chatType,
+  rootId,
+  parentId,
+  messageId,
+  uuid,
+} = {}) {
   return sendThreadAware(
-    { chatId, text, chatType, rootId, parentId, messageId },
+    { chatId, text, chatType, rootId, parentId, messageId, uuid },
     { replyToMessage, sendMessage },
   );
 }
@@ -1730,9 +1823,6 @@ async function handleMessage(data) {
 
   // DEBUG: log threading fields for analysis
   console.log(`[feishu] DEBUG threading: msg=${messageId} root=${rootId} parent=${parentId} thread=${threadId} upper=${upperMessageId}`);
-
-  // Unified dedup check (both websocket and webhook modes)
-  if (isDuplicate(messageId)) return;
 
   // F2 deliberately does not listen to whole-group conversation. A group
   // message must @玥然 before content parsing, logging, history, downloads, or
@@ -1828,9 +1918,6 @@ async function handleMessage(data) {
   if (chatType === 'p2p') {
     let assistantRequest = null;
     if (extracted.deferredMergeForwardId) {
-      // A merge-forward fetch is remote and may be slow.  It cannot be an
-      // explicit text task command, so acknowledge it before fetching content.
-      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
       text = await resolveMergeForwardText(extracted);
       logText = text;
     }
@@ -1852,9 +1939,6 @@ async function handleMessage(data) {
     });
     if (taskInput.handled) return;
     const taskRoute = taskInput.route;
-    if (!assistantRequest && taskRoute?.kind !== 'task-intent') {
-      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
-    }
 
     if (taskRoute?.kind === 'task-intent') {
       logText = `[task intent] ${taskRoute.taskEnvelope.task.title}`;
@@ -1898,6 +1982,8 @@ async function handleMessage(data) {
 
     // Handle images (lazy download: only when message is being sent to C4)
     if (imageKeys.length > 0) {
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+      if (assistantRequest) removeTypingIndicator(messageId);
       const mediaPaths = [];
       for (const imgKey of imageKeys) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1910,15 +1996,17 @@ async function handleMessage(data) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('p2p', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, [], mediaPaths[0], { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
         const msg = formatMessage('p2p', senderName, '[image download failed]', [], null, { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
       }
       return;
     }
 
     if (fileKey) {
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+      if (assistantRequest) removeTypingIndicator(messageId);
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       let localPath = null;
       try {
@@ -1929,10 +2017,10 @@ async function handleMessage(data) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('p2p', senderName, `[file: ${fileName}]`, [], localPath, { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
         const msg = formatMessage('p2p', senderName, `[file download failed: ${fileName}]`, [], null, { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
       }
       return;
     }
@@ -1947,23 +2035,38 @@ async function handleMessage(data) {
         mentionedBot: false,
         timestamp: data._timestamp || null,
       });
-    sendToC4('feishu', endpoint, msg, rejectReply, {
+    if (workIntakeEnvelope) {
+      assistantRequest = buildAssistantRequest(messageId);
+    } else if (taskRoute?.kind !== 'task-intent') {
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+      if (assistantRequest) removeTypingIndicator(messageId);
+    }
+    await sendToC4('feishu', endpoint, msg, rejectReply, {
       taskEnvelope: taskRoute?.kind === 'task-intent'
         ? taskRoute.taskEnvelope
         : undefined,
       workIntakeEnvelope: workIntakeEnvelope || undefined,
       assistantRequest: assistantRequest || undefined,
       onSuccess: workIntakeEnvelope
-        ? (response) => handleWorkIntakeResult(response, {
-          inboundEnvelope: workIntakeEnvelope,
-          endpoint,
-          messageId,
-          chatId,
-          chatType,
-          rootId,
-          parentId,
-        })
-        : undefined,
+        ? async (response) => {
+          try {
+            return await handleWorkIntakeResult(response, {
+              inboundEnvelope: workIntakeEnvelope,
+              endpoint,
+              messageId,
+              chatId,
+              chatType,
+              rootId,
+              parentId,
+              assistantRequest,
+            });
+          } finally {
+            removeTypingIndicator(messageId);
+          }
+        }
+        : taskRoute?.kind === 'task-intent'
+          ? () => removeTypingIndicator(messageId)
+          : undefined,
     });
     return;
   }
@@ -1974,9 +2077,6 @@ async function handleMessage(data) {
     const senderIsOwner = senderIsOwnerAtIngress;
 
     let assistantRequest = null;
-    if (extracted.deferredMergeForwardId && mentioned) {
-      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
-    }
     if (extracted.deferredMergeForwardId) {
       text = await resolveMergeForwardText(extracted);
       logText = text;
@@ -2002,9 +2102,6 @@ async function handleMessage(data) {
     });
     if (taskInput.handled) return;
     const taskRoute = taskInput.route;
-    if (!assistantRequest && taskRoute?.kind !== 'task-intent') {
-      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
-    }
 
     if (taskRoute?.kind === 'task-intent') {
       logText = `[task intent] ${taskRoute.taskEnvelope.task.title}`;
@@ -2054,6 +2151,8 @@ async function handleMessage(data) {
 
     // Handle images (lazy download: only for messages being sent to C4)
     if (imageKeys.length > 0) {
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+      if (assistantRequest) removeTypingIndicator(messageId);
       const mediaPaths = [];
       for (const imgKey of imageKeys) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -2066,7 +2165,7 @@ async function handleMessage(data) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('group', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, contextMessages, mediaPaths[0], { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
         groupRejectReply();
       }
@@ -2074,6 +2173,8 @@ async function handleMessage(data) {
     }
 
     if (fileKey) {
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+      if (assistantRequest) removeTypingIndicator(messageId);
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       let localPath = null;
       try {
@@ -2084,7 +2185,7 @@ async function handleMessage(data) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('group', senderName, `[file: ${fileName}]${cleanText ? ' ' + cleanText : ''}`, contextMessages, localPath, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
         groupRejectReply();
       }
@@ -2101,25 +2202,69 @@ async function handleMessage(data) {
         mentionedBot: mentioned,
         timestamp: data._timestamp || null,
       });
-    sendToC4('feishu', endpoint, msg, groupRejectReply, {
+    if (workIntakeEnvelope) {
+      assistantRequest = buildAssistantRequest(messageId);
+    } else if (taskRoute?.kind !== 'task-intent') {
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+      if (assistantRequest) removeTypingIndicator(messageId);
+    }
+    await sendToC4('feishu', endpoint, msg, groupRejectReply, {
       taskEnvelope: taskRoute?.kind === 'task-intent'
         ? taskRoute.taskEnvelope
         : undefined,
       workIntakeEnvelope: workIntakeEnvelope || undefined,
       assistantRequest: assistantRequest || undefined,
       onSuccess: workIntakeEnvelope
-        ? (response) => handleWorkIntakeResult(response, {
-          inboundEnvelope: workIntakeEnvelope,
-          endpoint,
-          messageId,
-          chatId,
-          chatType,
-          rootId,
-          parentId,
-        })
-        : undefined,
+        ? async (response) => {
+          try {
+            return await handleWorkIntakeResult(response, {
+              inboundEnvelope: workIntakeEnvelope,
+              endpoint,
+              messageId,
+              chatId,
+              chatType,
+              rootId,
+              parentId,
+              assistantRequest,
+            });
+          } finally {
+            removeTypingIndicator(messageId);
+          }
+        }
+        : taskRoute?.kind === 'task-intent'
+          ? () => removeTypingIndicator(messageId)
+          : undefined,
     });
   }
+}
+
+function persistInboundMessage(data, eventId = null) {
+  if (!inboundEventInbox) throw new Error('Feishu inbound inbox is not initialized');
+  return inboundEventInbox.receive(normalizeInboundMessageEvent(data, eventId));
+}
+
+function drainInboundMessages() {
+  if (!inboundEventInbox || isShuttingDown) return Promise.resolve(null);
+  if (inboundDrainPromise) return inboundDrainPromise;
+  inboundDrainPromise = processInboundEventInboxOnce({
+    inbox: inboundEventInbox,
+    workerId: `zylos-feishu:${process.pid}`,
+    // Claim one row at a time so later rows cannot expire inside a shared
+    // sequential batch while an earlier C4 call uses its bounded retries.
+    leaseMs: 300_000,
+    limit: 1,
+    baseRetryDelayMs: 2_000,
+    maxRetryDelayMs: 60_000,
+    handleMessage,
+  }).then((summary) => {
+    if (summary.claimed > 0) {
+      console.log(`[feishu] Inbound inbox claimed=${summary.claimed} committed=${summary.committed} failed=${summary.failed} deadLettered=${summary.deadLettered}`);
+    }
+    return summary;
+  }).finally(() => {
+    inboundDrainPromise = null;
+  });
+  return inboundDrainPromise;
 }
 
 // ============================================================
@@ -2140,11 +2285,10 @@ function startWebSocket(creds) {
   wsClient.start({
     eventDispatcher: new Lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data) => {
-        try {
-          await handleMessage(data);
-        } catch (err) {
-          console.error(`[feishu] Error handling message: ${err.message}`);
-        }
+        persistInboundMessage(data, data.event_id || data.header?.event_id || null);
+        void drainInboundMessages().catch((err) => {
+          console.error(`[feishu] Inbound inbox drain failed: ${err.message}`);
+        });
       },
       ...taskV2EventHandlers,
       ...taskCardEventHandlers,
@@ -2222,6 +2366,28 @@ function startWebhook(creds) {
         return res.status(503).json({ error: 'Task comment intake unavailable' });
       }
     }
+    if (eventType === 'im.message.receive_v1') {
+      if (!event.event?.message || !event.event?.sender) {
+        console.warn('[feishu] Malformed message event: missing event.message or event.sender');
+        return res.status(400).json({ error: 'Malformed message event' });
+      }
+      const data = {
+        message: event.event.message,
+        sender: event.event.sender,
+        _timestamp: event.header.create_time,
+      };
+      try {
+        persistInboundMessage(data, event.header?.event_id || null);
+      } catch (error) {
+        console.error(`[feishu] Inbound inbox write failed: ${error.message}`);
+        return res.status(503).json({ error: 'Inbound message intake unavailable' });
+      }
+      res.status(200).json({ code: 0 });
+      void drainInboundMessages().catch((error) => {
+        console.error(`[feishu] Inbound inbox drain failed: ${error.message}`);
+      });
+      return;
+    }
     let callback;
     try {
       callback = await routeVerifiedWebhookEvent(
@@ -2240,30 +2406,7 @@ function startWebhook(creds) {
       return res.status(callback.statusCode).json(callback.body);
     }
 
-    // routeVerifiedWebhookEvent immediately resolves ordinary callbacks so
-    // message processing continues after the acknowledgement is sent.
     res.status(callback.statusCode).json(callback.body);
-
-    // Handle message event asynchronously
-    if (eventType === 'im.message.receive_v1') {
-      // Validate required payload shape
-      if (!event.event?.message || !event.event?.sender) {
-        console.warn('[feishu] Malformed message event: missing event.message or event.sender');
-        return;
-      }
-      // Dedup is handled inside handleMessage() (unified for both modes)
-
-      // Normalize data shape to match WSClient format for shared handleMessage
-      const data = {
-        message: event.event.message,
-        sender: event.event.sender,
-        _timestamp: event.header.create_time
-      };
-      handleMessage(data).catch(err => {
-        console.error(`[feishu] Error handling message: ${err.message}`);
-      });
-      return;
-    }
   });
 
   // Health check
@@ -2338,7 +2481,7 @@ function shutdown() {
 
   console.log(`[feishu] Shutting down...`);
 
-  clearInterval(dedupCleanupInterval);
+  if (inboundDrainInterval) clearInterval(inboundDrainInterval);
   clearInterval(typingCheckInterval);
   clearInterval(userCachePersistInterval);
   clearInterval(workIntakeConfirmationRetryInterval);
@@ -2358,10 +2501,19 @@ function shutdown() {
     wsClient.close({ force: false });
   }
 
+  let finalized = false;
   const finalizeExit = () => {
-    taskCommentStore?.close();
-    taskCommentStore = null;
-    process.exit(0);
+    if (finalized) return;
+    finalized = true;
+    Promise.resolve(inboundDrainPromise).catch((error) => {
+      console.error(`[feishu] Inbound drain did not finish cleanly: ${error.message}`);
+    }).finally(() => {
+      inboundEventInbox?.close();
+      inboundEventInbox = null;
+      taskCommentStore?.close();
+      taskCommentStore = null;
+      process.exit(0);
+    });
   };
   if (webhookServer) {
     webhookServer.close(() => finalizeExit());
@@ -2385,8 +2537,19 @@ if (!creds.app_id || !creds.app_secret) {
 // Fetch bot identity, then start the selected transport
 (async () => {
   try {
+    inboundEventInbox = openInboundEventInbox({
+      dbPath: path.join(DATA_DIR, 'inbound-events.db'),
+      maxAttempts: 5,
+    });
+  } catch (err) {
+    console.error(`[feishu] Inbound inbox failed to initialize: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
     const taskCommentIntake = await initializeTaskCommentIntake({
-      enabled: process.env.FEISHU_TASK_COMMENTS_ENABLED === '1',
+      enabled: isTaskCommentsEnabled(process.env),
       appId: creds.app_id,
       dbPath: path.join(DATA_DIR, 'task-comments.db'),
       onError(error) {
@@ -2431,6 +2594,21 @@ if (!creds.app_id || !creds.app_secret) {
     const creds2 = getCredentials();
     botAppId = creds2.app_id || '';
   } catch {}
+
+  try {
+    await drainInboundMessages();
+    inboundDrainInterval = setInterval(() => {
+      void drainInboundMessages().catch((error) => {
+        console.error(`[feishu] Inbound inbox drain failed: ${error.message}`);
+      });
+    }, 1_000);
+  } catch (err) {
+    console.error(`[feishu] Inbound inbox recovery failed: ${err.message}`);
+    process.exitCode = 1;
+    inboundEventInbox?.close();
+    inboundEventInbox = null;
+    return;
+  }
 
   // Start selected transport
   if (connectionMode === 'webhook') {

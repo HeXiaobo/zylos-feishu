@@ -28,7 +28,7 @@
 import { chooseReplyTarget } from './reply-target.js';
 
 export async function sendThreadAware(
-  { chatId, text, chatType, rootId, parentId, messageId } = {},
+  { chatId, text, chatType, rootId, parentId, messageId, uuid } = {},
   { replyToMessage, sendMessage } = {},
 ) {
   const replyTarget = chooseReplyTarget({
@@ -39,12 +39,12 @@ export async function sendThreadAware(
   });
   if (replyTarget) {
     try {
-      const replyResult = await replyToMessage(replyTarget, text);
+      const replyResult = await replyToMessage(replyTarget, text, 'text', { uuid });
       if (replyResult && replyResult.success) return true;
     } catch {
       // fall through to the base send below
     }
   }
-  const result = await sendMessage(chatId, text);
+  const result = await sendMessage(chatId, text, 'chat_id', 'text', { uuid });
   return !!(result && result.success);
 }

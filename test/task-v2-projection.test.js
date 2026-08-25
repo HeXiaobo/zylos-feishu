@@ -134,6 +134,14 @@ test('maps owner/acceptor followers and Agent or human assignees without changin
     () => mapper.map(coreTask({ assigneeId: 'agent:unmapped' })),
     /no Feishu App mapping/,
   );
+  const crashSafeMapper = createTaskV2MemberMapper({
+    appId: APP_ID,
+    requireGatewayAppAssignee: true,
+  });
+  assert.throws(
+    () => crashSafeMapper.map(coreTask({ assigneeId: 'ou_executor' })),
+    /requires agent:yueran as assignee/,
+  );
 });
 
 test('creates one native Task, returns its URL, preserves the Card link, and updates by GUID', async () => {
@@ -416,9 +424,9 @@ test('SDK Adapter uses tenant Task v2 create/patch/member calls with client_toke
         calls.push(['removeMembers', payload]);
         return response(sdkTask());
       },
-      async search(payload) {
-        calls.push(['search', payload]);
-        return { code: 0, data: { items: [{ id: 'guid-sdk' }] } };
+      async list(payload) {
+        calls.push(['list', payload]);
+        return { code: 0, data: { items: [sdkTask()] } };
       },
     } } },
   };
@@ -452,6 +460,7 @@ test('SDK Adapter uses tenant Task v2 create/patch/member calls with client_toke
   const found = await gateway.findTasksByCoreTaskId('task-1');
   assert.equal(found.length, 1);
   assert.equal(found[0].guid, 'guid-sdk');
+  assert.equal(calls.find(([name]) => name === 'list')[1].params.type, 'my_tasks');
 });
 
 test('SDK Adapter does not complete an already-completed native Task again on Core acceptance', async () => {
@@ -488,7 +497,7 @@ test('SDK Adapter does not complete an already-completed native Task again on Co
       },
       async addMembers() { throw new Error('unexpected addMembers'); },
       async removeMembers() { throw new Error('unexpected removeMembers'); },
-      async search() { throw new Error('unexpected search'); },
+      async list() { throw new Error('unexpected list'); },
     } } },
   };
 
@@ -504,8 +513,8 @@ test('SDK Adapter does not complete an already-completed native Task again on Co
   assert.deepEqual(calls[0].data.update_fields, ['extra']);
 });
 
-test('SDK Adapter searches every Task page before deciding create-after-crash recovery is empty', async () => {
-  const searches = [];
+test('SDK Adapter lists every bot-visible Task page before deciding create-after-crash recovery is empty', async () => {
+  const lists = [];
   const response = task => ({ code: 0, data: { task } });
   const client = {
     task: { v2: { task: {
@@ -513,17 +522,28 @@ test('SDK Adapter searches every Task page before deciding create-after-crash re
       async patch() { throw new Error('unexpected patch'); },
       async addMembers() { throw new Error('unexpected addMembers'); },
       async removeMembers() { throw new Error('unexpected removeMembers'); },
-      async search(payload) {
-        searches.push(payload);
+      async list(payload) {
+        lists.push(payload);
         if (!payload.params.page_token) {
           return {
             code: 0,
-            data: { items: [{ id: 'guid-other' }], has_more: true, page_token: 'page-2' },
+            data: {
+              items: [sdkTask({
+                guid: 'guid-other',
+                extra: JSON.stringify({
+                  schema: 'zylos.task-v2-projection/v1',
+                  coreTaskId: 'task-other',
+                  coreTaskVersion: 1,
+                }),
+              })],
+              has_more: true,
+              page_token: 'page-2',
+            },
           };
         }
         return {
           code: 0,
-          data: { items: [{ id: 'guid-target' }], has_more: false },
+          data: { items: [sdkTask({ guid: 'guid-target' })], has_more: false },
         };
       },
       async get({ path }) {
@@ -543,5 +563,7 @@ test('SDK Adapter searches every Task page before deciding create-after-crash re
   const found = await createSdkTaskV2Gateway({ client }).findTasksByCoreTaskId('task-1');
 
   assert.deepEqual(found.map(task => task.guid), ['guid-target']);
-  assert.deepEqual(searches.map(call => call.params.page_token ?? null), [null, 'page-2']);
+  assert.deepEqual(lists.map(call => call.params.page_token ?? null), [null, 'page-2']);
+  assert.equal(lists.every(call => call.params.type === 'my_tasks'), true);
+  assert.equal(lists.length, 2);
 });

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 const OPTION_FIELDS = new Set([
   'sendConfirmationCard',
   'sendTaskReceipt',
+  'startAssistantResponse',
 ]);
 
 function requireRecord(value, field) {
@@ -45,14 +46,36 @@ export function createWorkIntakeResultHandler(input) {
       const workIntake = response?.workIntake;
       if (!workIntake) return Object.freeze({ handled: false });
       const request = requireRecord(context, 'WorkIntake result context');
+      if (workIntake.decision === 'chat_only') {
+        const requestId = requireText(
+          response?.assistantResponse?.requestId,
+          'WorkIntake assistant response requestId',
+        );
+        const expectedRequest = requireRecord(
+          request.assistantRequest,
+          'WorkIntake assistant request',
+        );
+        if (requestId !== requireText(expectedRequest.requestId, 'WorkIntake assistant requestId')) {
+          throw new Error('WorkIntake assistant response requestId mismatch');
+        }
+        const result = await options.startAssistantResponse({ requestId, context: request });
+        requireSuccess(result, 'WorkIntake assistant response start');
+        return Object.freeze({ handled: true, replayed: Boolean(workIntake.replayed) });
+      }
       if (workIntake.decision === 'create_task') {
-        if (workIntake.replayed) return Object.freeze({ handled: true, replayed: true });
+        const sourceKey = requireText(workIntake.sourceKey, 'WorkIntake sourceKey');
+        const deliveryKey = `${sourceKey}:task-receipt`;
         const result = await options.sendTaskReceipt({
           title: requireText(workIntake.taskDraft?.title, 'WorkIntake task title'),
+          deliveryKey,
+          deliveryUuid: `zwi_${createHash('sha256')
+            .update(deliveryKey)
+            .digest('hex')
+            .slice(0, 40)}`,
           context: request,
         });
         requireSuccess(result, 'WorkIntake task receipt delivery');
-        return Object.freeze({ handled: true, replayed: false });
+        return Object.freeze({ handled: true, replayed: Boolean(workIntake.replayed) });
       }
       if (workIntake.decision !== 'confirm') {
         return Object.freeze({ handled: false });

@@ -110,6 +110,7 @@ export function createTaskV2ProjectionRuntime({ env = process.env, client, statu
     memberMapper: createTaskV2MemberMapper({
       appId,
       agentAppIds: parseAgentAppIds(env.FEISHU_TASK_V2_AGENT_APP_IDS),
+      requireGatewayAppAssignee: true,
     }),
     statusInbox: statusInbox ?? createTaskV2StatusInbox({
       directory: path.join(zylosDir, 'components/feishu/task-v2-status-inbox'),

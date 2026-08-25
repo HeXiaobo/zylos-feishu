@@ -52,7 +52,7 @@ test('production runtime shares one App identity and an injectable durable statu
   const statusInbox = { pending() {}, ack() {}, fail() {} };
   const taskApi = {
     async create() {}, async patch() {}, async get() {},
-    async addMembers() {}, async removeMembers() {}, async search() {},
+    async addMembers() {}, async removeMembers() {}, async list() {},
   };
   const runtime = createTaskV2ProjectionRuntime({
     env: { FEISHU_APP_ID: 'cli_yueran' },

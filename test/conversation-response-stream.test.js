@@ -425,6 +425,66 @@ test('legacy full-answer completion finalizes the existing card and durable term
   assert.equal(calls.length, apiCallCount, 'durable replay must not reopen or duplicate a closed compatibility card');
 }));
 
+test('canonical Core completion corrects an earlier local ambiguous failure on the same card', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.fail({ requestId: 'assistant.feishu.om_1', retryable: true });
+  const callsAfterLocalFailure = calls.length;
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'AssistantRequestAccepted', { sourceId: 'om_1' }),
+      event(2, 'RunQueued'),
+      event(3, 'RunStarted'),
+    ],
+  });
+  assert.equal(calls.length, callsAfterLocalFailure, 'nonterminal replay must not mutate a locally closed card');
+
+  const completed = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(4, 'RunCompleted', { output: 'Core 的最终答案' })],
+  });
+  assert.equal(completed.status, 'completed');
+  const finalUpdate = calls.filter(([name]) => name === 'update').at(-1)[1];
+  const finalCard = JSON.parse(finalUpdate.data.card.data);
+  assert.equal(finalCard.body.elements[0].content, '✅ 已完成');
+  assert.equal(finalCard.body.elements[1].content, 'Core 的最终答案');
+}));
+
+test('canonical Core completion corrects an earlier local failure in plain-text fallback', () => withState(async stateDirectory => {
+  const { client, calls } = createClient({ interactiveFailure: true });
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    logger: { warn() {} },
+  });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.fail({ requestId: 'assistant.feishu.om_1', retryable: true });
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'AssistantRequestAccepted', { sourceId: 'om_1' }),
+      event(2, 'RunQueued'),
+      event(3, 'RunStarted'),
+      event(4, 'RunCompleted', { output: 'Core 的纯文本最终答案' }),
+    ],
+  });
+
+  const texts = calls.flatMap(([, payload]) => {
+    const content = JSON.parse(payload.data?.content || '{}');
+    return typeof content.text === 'string' ? [content.text] : [];
+  });
+  assert.deepEqual(texts, [
+    '已接收，正在处理…',
+    '⚠️ 本次处理未完成，可重试',
+    'Core 的纯文本最终答案',
+  ]);
+}));
+
 test('legacy compatibility completion cannot overwrite an existing terminal result', () => withState(async stateDirectory => {
   const { client } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });

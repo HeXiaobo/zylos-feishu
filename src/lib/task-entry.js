@@ -125,6 +125,7 @@ export function buildC4ReceiveArgs({
   assistantRequest,
   workIntakeEnvelope,
   workIntakeConfirmation,
+  workIntakeConfirmationEffect,
 }) {
   if (taskEnvelope && assistantRequest) {
     throw new TypeError('taskEnvelope and assistantRequest are mutually exclusive');
@@ -152,7 +153,18 @@ export function buildC4ReceiveArgs({
   if (workIntakeConfirmation) {
     args.push('--work-intake-confirmation-json', JSON.stringify(workIntakeConfirmation));
   }
-  if ([taskEnvelope, workIntakeEnvelope, workIntakeConfirmation].filter(Boolean).length > 1) {
+  if (workIntakeConfirmationEffect) {
+    args.push(
+      '--work-intake-confirmation-effect-json',
+      JSON.stringify(workIntakeConfirmationEffect),
+    );
+  }
+  if ([
+    taskEnvelope,
+    workIntakeEnvelope,
+    workIntakeConfirmation,
+    workIntakeConfirmationEffect,
+  ].filter(Boolean).length > 1) {
     throw new TypeError('task and WorkIntake protocols are mutually exclusive');
   }
   args.push('--content', content);
