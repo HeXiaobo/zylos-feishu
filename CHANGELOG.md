@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-3ai.3] - 2026-08-25
+
+### Changed
+- The fail-closed pre-install/pre-upgrade check now requires Core's `c4.reply.argv-compat` capability, preventing a paired rollout from proceeding against a Core version that can disconnect older endpoint-addressed reply callers.
+
 ## [0.3.7-3ai.2] - 2026-08-25
 
 ### Added

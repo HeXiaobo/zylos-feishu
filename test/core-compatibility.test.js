@@ -25,9 +25,10 @@ test('accepts a Core that satisfies every required protocol', (t) => {
   const cli = fakeZylos(t, {
     schemaVersion: 1,
     product: 'zylos-core',
-    release: '0.7.2-3ai.2',
+    release: '0.7.2-3ai.3',
     protocols: {
       'c4.reply': 2,
+      'c4.reply.argv-compat': 1,
       'c4.assistant-response-stream': 1,
       'work-intake': 1,
       'commitment-core': 1,
@@ -41,7 +42,7 @@ test('accepts a Core that satisfies every required protocol', (t) => {
 
   assert.equal(result.ok, true);
   assert.deepEqual(result.errors, []);
-  assert.equal(result.core.release, '0.7.2-3ai.2');
+  assert.equal(result.core.release, '0.7.2-3ai.3');
 });
 
 test('reports every missing or outdated protocol before upgrade', (t) => {
@@ -62,6 +63,7 @@ test('reports every missing or outdated protocol before upgrade', (t) => {
   assert.equal(result.ok, false);
   assert.deepEqual(result.errors, [
     'Protocol c4.reply requires >= 2, found 1',
+    'Protocol c4.reply.argv-compat requires >= 1, found missing',
     'Protocol work-intake requires >= 1, found missing',
     'Protocol commitment-core requires >= 1, found missing',
     'Protocol projection-outbox requires >= 1, found missing',

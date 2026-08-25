@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.7-3ai.2
+version: 0.3.7-3ai.3
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),
@@ -170,6 +170,10 @@ bytes in `~/zylos/.env`. The projection runtime loads Feishu credentials and
 this signing secret inside the component; Commitment Core receives only the
 narrow publisher Interface. Cards use Card JSON 2.0, stable create UUIDs, Core
 task versions as CardKit update sequences, and signed callback contexts.
+
+The paired release's pre-install/pre-upgrade gate also requires Core's
+`c4.reply.argv-compat` capability, so rolling upgrades cannot disconnect older
+endpoint-addressed reply callers.
 
 The paired Core/Feishu release requires Node.js 20.20.0 or newer. Before the
 canary, grant `task:task:read`, `task:task:write`, and task-comment read/write
