@@ -56,6 +56,28 @@ test('routes an explicit create protocol to C4 with a normalized task envelope',
       '--content', '[Feishu DM] Creator said: create a task',
     ],
   );
+
+  assert.deepEqual(
+    buildC4ReceiveArgs({
+      receiverPath: '/opt/zylos/c4-receive.js',
+      source: 'feishu',
+      endpoint: 'oc_chat|type:p2p|msg:om_ordinary',
+      content: '[Feishu DM] Sender said: ordinary chat',
+      assistantRequest: {
+        requestId: 'assistant.feishu.om_ordinary',
+        sourceId: 'om_ordinary',
+      },
+    }),
+    [
+      '/opt/zylos/c4-receive.js',
+      '--channel', 'feishu',
+      '--endpoint', 'oc_chat|type:p2p|msg:om_ordinary',
+      '--json',
+      '--assistant-request-id', 'assistant.feishu.om_ordinary',
+      '--assistant-source-id', 'om_ordinary',
+      '--content', '[Feishu DM] Sender said: ordinary chat',
+    ],
+  );
 });
 
 test('recognizes only the explicit text protocol and leaves ordinary chat on the original C4 path', () => {

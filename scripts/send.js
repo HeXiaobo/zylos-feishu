@@ -22,6 +22,8 @@ import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
 import { initMention, buildMentionContent, buildMentionMarkdown } from '../src/lib/mention.js';
+import { getClient } from '../src/lib/client.js';
+import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -435,7 +437,24 @@ async function recordOutgoing(text) {
 
 async function send() {
   try {
-    if (mediaMatch) {
+    const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
+    let streamed = false;
+    if (assistantRequestId && !mediaMatch) {
+      try {
+        const responseStream = createConversationResponseStream({ client: getClient() });
+        const result = await responseStream.completeWithFullAnswer({
+          requestId: assistantRequestId,
+          output: message,
+        });
+        streamed = result.handled === true;
+      } catch (error) {
+        console.warn(`[feishu] Same-card completion failed; using full-answer fallback: ${error.message}`);
+      }
+    }
+
+    if (streamed) {
+      await recordOutgoing(message);
+    } else if (mediaMatch) {
       const [, mediaType, mediaPath] = mediaMatch;
       await sendMedia(mediaType, mediaPath);
       await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');

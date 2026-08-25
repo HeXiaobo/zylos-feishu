@@ -26,6 +26,8 @@ import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { createTaskActionContextSigner } from './lib/task-action-context.js';
+import { getClient } from './lib/client.js';
+import { createConversationResponseStream } from './lib/conversation-response-stream.js';
 import { resolveZylosCli } from './lib/zylos-cli-resolver.js';
 import {
   createTaskCardActionRuntime,
@@ -767,18 +769,71 @@ function resolveMentions(text, mentions, { stripBot = false, botOpenId: botId } 
  */
 function parseC4Response(stdout) {
   if (!stdout) return null;
+  const lines = stdout.trim().split('\n');
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!lines[index].startsWith('{')) continue;
+    try {
+      return JSON.parse(lines[index]);
+    } catch {
+      // Keep looking for an earlier structured line.
+    }
+  }
+  return null;
+}
+
+let conversationResponseStream = null;
+
+function getConversationResponseStream() {
+  if (!conversationResponseStream) {
+    conversationResponseStream = createConversationResponseStream({ client: getClient() });
+  }
+  return conversationResponseStream;
+}
+
+function assistantRequestId(messageId) {
+  const digest = crypto.createHash('sha256').update(String(messageId)).digest('hex').slice(0, 40);
+  return `assistant.feishu.${digest}`;
+}
+
+async function openConversationResponse({ chatId, chatType, messageId, rootId, parentId }) {
+  const request = {
+    requestId: assistantRequestId(messageId),
+    sourceId: String(messageId),
+  };
   try {
-    return JSON.parse(stdout.trim());
-  } catch {
+    await getConversationResponseStream().open({
+      requestId: request.requestId,
+      target: {
+        chatId,
+        chatType,
+        replyToMessageId: chatType === 'group'
+          ? (parentId || rootId || messageId)
+          : null,
+      },
+    });
+    return request;
+  } catch (error) {
+    console.warn(`[feishu] Failed to open immediate response card: ${error.message}`);
     return null;
   }
+}
+
+function failConversationResponse(request) {
+  if (!request) return Promise.resolve(false);
+  return getConversationResponseStream()
+    .fail({ requestId: request.requestId, retryable: true })
+    .then(result => result.handled)
+    .catch(error => {
+      console.warn(`[feishu] Failed to close response card after C4 rejection: ${error.message}`);
+      return false;
+    });
 }
 
 /**
  * Send message to Claude via C4 (with 1 retry on unexpected failure).
  * Explicit task intents atomically carry their normalized envelope.
  */
-function sendToC4(source, endpoint, content, onReject, { taskEnvelope } = {}) {
+function sendToC4(source, endpoint, content, onReject, { taskEnvelope, assistantRequest } = {}) {
   if (!content) {
     console.error('[feishu] sendToC4 called with empty content');
     return;
@@ -790,10 +845,17 @@ function sendToC4(source, endpoint, content, onReject, { taskEnvelope } = {}) {
     endpoint,
     content,
     taskEnvelope,
+    assistantRequest,
   });
 
   execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
     if (!error) {
+      const response = parseC4Response(stdout);
+      if (assistantRequest && response?.assistantResponse?.requestId !== assistantRequest.requestId) {
+        console.warn('[feishu] C4 accepted the message without opening its response stream');
+        if (onReject) onReject('assistant response stream was not accepted');
+        return;
+      }
       console.log(`[feishu] Sent to C4: ${content.substring(0, 50)}...`);
       return;
     }
@@ -807,6 +869,12 @@ function sendToC4(source, endpoint, content, onReject, { taskEnvelope } = {}) {
     setTimeout(() => {
       execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (retryError, retryStdout) => {
         if (!retryError) {
+          const retryResponse = parseC4Response(retryStdout);
+          if (assistantRequest && retryResponse?.assistantResponse?.requestId !== assistantRequest.requestId) {
+            console.error('[feishu] C4 retry succeeded without opening its response stream');
+            if (onReject) onReject('assistant response stream was not accepted');
+            return;
+          }
           console.log(`[feishu] Sent to C4 (retry): ${content.substring(0, 50)}...`);
           return;
         }
@@ -816,6 +884,7 @@ function sendToC4(source, endpoint, content, onReject, { taskEnvelope } = {}) {
           if (onReject) onReject(retryResponse.error.message);
         } else {
           console.error(`[feishu] C4 send failed after retry: ${retryError.message}`);
+          if (onReject) onReject();
         }
       });
     }, 2000);
@@ -1441,7 +1510,11 @@ async function handleMessage(data) {
       return;
     }
 
+    let assistantRequest = null;
     if (extracted.deferredMergeForwardId) {
+      // A merge-forward fetch is remote and may be slow.  It cannot be an
+      // explicit text task command, so acknowledge it before fetching content.
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
       text = await resolveMergeForwardText(extracted);
       logText = text;
     }
@@ -1463,6 +1536,9 @@ async function handleMessage(data) {
     });
     if (taskInput.handled) return;
     const taskRoute = taskInput.route;
+    if (!assistantRequest && taskRoute?.kind !== 'task-intent') {
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+    }
 
     if (taskRoute?.kind === 'task-intent') {
       logText = `[task intent] ${taskRoute.taskEnvelope.task.title}`;
@@ -1470,8 +1546,8 @@ async function handleMessage(data) {
 
     await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
 
-    // Add typing indicator
-    addTypingIndicator(messageId);
+    // The response card itself is the acknowledgement for ordinary Agent chat.
+    if (!assistantRequest) addTypingIndicator(messageId);
 
     // Fetch context: thread context for topic messages, quoted content for replies
     if (threadId) {
@@ -1489,9 +1565,18 @@ async function handleMessage(data) {
     const senderName = await resolveUserName(senderUserId, senderOpenId);
     const cleanText = resolveMentions(text, mentions);
     const threadRootId = threadId ? rootId : null;
-    const rejectReply = (errMsg) => {
+    const rejectReply = () => {
       removeTypingIndicator(messageId);
-      sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
+      if (assistantRequest) {
+        failConversationResponse(assistantRequest).then(handled => {
+          if (!handled) {
+            sendThreadAwareMessage(chatId, '处理未完成，请稍后重试。', { chatType, rootId, parentId, messageId })
+              .catch(e => console.error('[feishu] reject reply failed:', e.message));
+          }
+        });
+        return;
+      }
+      sendThreadAwareMessage(chatId, '处理未完成，请稍后重试。', { chatType, rootId, parentId, messageId })
         .catch(e => console.error('[feishu] reject reply failed:', e.message));
     };
 
@@ -1509,10 +1594,10 @@ async function handleMessage(data) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('p2p', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, [], mediaPaths[0], { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply);
+        sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
         const msg = formatMessage('p2p', senderName, '[image download failed]', [], null, { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply);
+        sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
       }
       return;
     }
@@ -1528,10 +1613,10 @@ async function handleMessage(data) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('p2p', senderName, `[file: ${fileName}]`, [], localPath, { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply);
+        sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
         const msg = formatMessage('p2p', senderName, `[file download failed: ${fileName}]`, [], null, { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply);
+        sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
       }
       return;
     }
@@ -1541,6 +1626,7 @@ async function handleMessage(data) {
       taskEnvelope: taskRoute?.kind === 'task-intent'
         ? taskRoute.taskEnvelope
         : undefined,
+      assistantRequest: assistantRequest || undefined,
     });
     return;
   }
@@ -1581,6 +1667,10 @@ async function handleMessage(data) {
       return;
     }
 
+    let assistantRequest = null;
+    if (extracted.deferredMergeForwardId && mentioned) {
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+    }
     if (extracted.deferredMergeForwardId) {
       text = await resolveMergeForwardText(extracted);
       logText = text;
@@ -1614,6 +1704,9 @@ async function handleMessage(data) {
     });
     if (taskInput.handled) return;
     const taskRoute = taskInput.route;
+    if (!assistantRequest && !smartNoMention && taskRoute?.kind !== 'task-intent') {
+      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+    }
 
     if (taskRoute?.kind === 'task-intent') {
       logText = `[task intent] ${taskRoute.taskEnvelope.task.title}`;
@@ -1627,7 +1720,7 @@ async function handleMessage(data) {
     updateCursor(chatId, messageId);
 
     // Smart mode without @mention may skip reply entirely ([SKIP]), so do not show typing.
-    if (!smartNoMention) {
+    if (!smartNoMention && !assistantRequest) {
       addTypingIndicator(messageId);
     }
 
@@ -1648,9 +1741,18 @@ async function handleMessage(data) {
     const cleanText = resolveMentions(text, mentions);
     const cleanLogText = resolveMentions(logText, mentions);
     const threadRootId = threadId ? rootId : null;
-    const groupRejectReply = (errMsg) => {
+    const groupRejectReply = () => {
       removeTypingIndicator(messageId);
-      sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
+      if (assistantRequest) {
+        failConversationResponse(assistantRequest).then(handled => {
+          if (!handled) {
+            sendThreadAwareMessage(chatId, '处理未完成，请稍后重试。', { chatType, rootId, parentId, messageId })
+              .catch(e => console.error('[feishu] reject reply failed:', e.message));
+          }
+        });
+        return;
+      }
+      sendThreadAwareMessage(chatId, '处理未完成，请稍后重试。', { chatType, rootId, parentId, messageId })
         .catch(e => console.error('[feishu] reject reply failed:', e.message));
     };
 
@@ -1658,7 +1760,7 @@ async function handleMessage(data) {
     if (imageKeys.length > 0) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || '[image]', contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
         return;
       }
 
@@ -1674,11 +1776,9 @@ async function handleMessage(data) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('group', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, contextMessages, mediaPaths[0], { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
-        removeTypingIndicator(messageId);
-        sendThreadAwareMessage(chatId, 'Image download failed. Please resend the image.', { chatType, rootId, parentId, messageId })
-          .catch(e => console.error('[feishu] image error reply failed:', e.message));
+        groupRejectReply();
       }
       return;
     }
@@ -1686,7 +1786,7 @@ async function handleMessage(data) {
     if (fileKey) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || `[file: ${fileName}]`, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
         return;
       }
 
@@ -1700,11 +1800,9 @@ async function handleMessage(data) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('group', senderName, `[file: ${fileName}]${cleanText ? ' ' + cleanText : ''}`, contextMessages, localPath, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
-        removeTypingIndicator(messageId);
-        sendThreadAwareMessage(chatId, 'File download failed. Please resend the file.', { chatType, rootId, parentId, messageId })
-          .catch(e => console.error('[feishu] file error reply failed:', e.message));
+        groupRejectReply();
       }
       return;
     }
@@ -1714,6 +1812,7 @@ async function handleMessage(data) {
       taskEnvelope: taskRoute?.kind === 'task-intent'
         ? taskRoute.taskEnvelope
         : undefined,
+      assistantRequest: assistantRequest || undefined,
     });
   }
 }

@@ -19,6 +19,13 @@ const CREATE_PAYLOAD_FIELDS = Object.freeze([
 ]);
 const ACTION_PAYLOAD_FIELDS = Object.freeze(['action', 'context']);
 
+function requireRecord(value, field) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${field} must be an object`);
+  }
+  return value;
+}
+
 function parsePayload(payloadJson) {
   let payload;
   try {
@@ -113,7 +120,11 @@ export function buildC4ReceiveArgs({
   endpoint,
   content,
   taskEnvelope,
+  assistantRequest,
 }) {
+  if (taskEnvelope && assistantRequest) {
+    throw new TypeError('taskEnvelope and assistantRequest are mutually exclusive');
+  }
   const args = [
     receiverPath,
     '--channel', source,
@@ -122,6 +133,14 @@ export function buildC4ReceiveArgs({
   ];
   if (taskEnvelope) {
     args.push('--task-envelope-json', JSON.stringify(taskEnvelope));
+  }
+  if (assistantRequest) {
+    const request = requireRecord(assistantRequest, 'assistantRequest');
+    requirePayloadFields(request, ['requestId', 'sourceId'], ['requestId', 'sourceId']);
+    args.push(
+      '--assistant-request-id', requireText(request.requestId, 'assistantRequest.requestId'),
+      '--assistant-source-id', requireText(request.sourceId, 'assistantRequest.sourceId'),
+    );
   }
   args.push('--content', content);
   return args;
