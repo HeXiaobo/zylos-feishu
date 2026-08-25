@@ -62,7 +62,7 @@ export const DEFAULT_CONFIG = {
   // Message settings
   message: {
     context_messages: 10,
-    useMarkdownCard: false
+    useMarkdownCard: true
   }
 };
 
