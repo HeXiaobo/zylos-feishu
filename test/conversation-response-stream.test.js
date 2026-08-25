@@ -164,6 +164,64 @@ test('phase events stay visible while running and disappear when completion supp
   assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
 }));
 
+test('offers an on-demand copy action on long completed answers', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'AssistantRequestAccepted', { sourceId: 'om_1' }),
+      event(2, 'RunQueued'),
+      event(3, 'RunStarted'),
+      event(4, 'RunCompleted', { output: '这是一段需要方便复制的较长回答。'.repeat(12) }),
+    ],
+  });
+
+  const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const copyButton = card.body.elements.find(element => element.element_id === 'zylos_copy');
+  assert.deepEqual(copyButton, {
+    tag: 'button',
+    element_id: 'zylos_copy',
+    text: { tag: 'plain_text', content: '获取可复制文本' },
+    type: 'default',
+    width: 'fill',
+    behaviors: [{
+      type: 'callback',
+      value: {
+        action: 'assistant_response_copy',
+        requestId: 'assistant.feishu.om_1',
+      },
+    }],
+  });
+}));
+
+test('sends proactive text as the same completed response card without a placeholder', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  const output = '主动汇报也应该使用统一的完成卡片。';
+
+  const sent = await stream.sendCompleted({
+    requestId: 'assistant.feishu.proactive.1',
+    target: target(),
+    output,
+  });
+  const replay = await stream.sendCompleted({
+    requestId: 'assistant.feishu.proactive.1',
+    target: target(),
+    output,
+  });
+
+  assert.equal(sent.messageId, 'om_response_1');
+  assert.equal(replay.replayed, true);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+  assert.equal(calls.filter(([name]) => name === 'convert').length, 0);
+  const card = JSON.parse(calls.find(([name]) => name === 'send')[1].data.content);
+  assert.equal(card.config.streaming_mode, false);
+  assert.equal(card.body.elements[0].content, '✅ 已完成');
+  assert.equal(card.body.elements[1].content, output);
+}));
+
 test('streams public reasoning in its own card region without mixing it into the answer', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });

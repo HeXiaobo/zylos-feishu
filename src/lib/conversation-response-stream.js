@@ -7,12 +7,14 @@ import { DATA_DIR } from './config.js';
 const PHASE_ELEMENT_ID = 'zylos_phase';
 const ANSWER_ELEMENT_ID = 'zylos_answer';
 const PROGRESS_ELEMENT_ID = 'zylos_progress';
+const COPY_ELEMENT_ID = 'zylos_copy';
 const MAX_PROGRESS_STEPS = 8;
 const MAX_PUBLIC_REASONING_BYTES = 12_000;
 const MAX_REASONING_DELTA_BYTES = 64 * 1024;
 const MAX_CARD_BYTES = 30_000;
 const DEFAULT_ANSWER_BYTES_PER_CARD = 12_000;
 const DEFAULT_THROTTLE_MS = 250;
+const DEFAULT_COPY_ACTION_CHARACTERS = 120;
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 120_000;
@@ -234,7 +236,34 @@ function clearTransientProcess(state) {
   state.publicReasoning = '';
 }
 
-function renderCard({ phase, answer, progress = [], publicReasoning = '', streaming, part, totalParts }) {
+function copyButton(requestId) {
+  return {
+    tag: 'button',
+    element_id: COPY_ELEMENT_ID,
+    text: { tag: 'plain_text', content: '获取可复制文本' },
+    type: 'default',
+    width: 'fill',
+    behaviors: [{
+      type: 'callback',
+      value: { action: 'assistant_response_copy', requestId },
+    }],
+  };
+}
+
+function shouldOfferCopy(answer) {
+  return Array.from(answer || '').length >= DEFAULT_COPY_ACTION_CHARACTERS;
+}
+
+function renderCard({
+  phase,
+  answer,
+  progress = [],
+  publicReasoning = '',
+  streaming,
+  part,
+  totalParts,
+  copyRequestId = null,
+}) {
   const continuation = part > 0
     ? `\n\n_续 ${part + 1}${totalParts > 1 ? ` / ${totalParts}` : ''}_`
     : '';
@@ -270,6 +299,7 @@ function renderCard({ phase, answer, progress = [], publicReasoning = '', stream
               content: renderProcessTrace(progress, publicReasoning),
             }]
           : []),
+        ...(!streaming && copyRequestId ? [copyButton(copyRequestId)] : []),
       ],
     },
   };
@@ -295,7 +325,7 @@ function normalizeTarget(value) {
 
 async function sendMessage(client, target, msgType, content, uuid) {
   const data = { msg_type: msgType, content, uuid };
-  if (target.chatType === 'group') {
+  if (target.chatType === 'group' && target.replyToMessageId) {
     return requireSuccess(await client.im.message.reply({
       path: { message_id: target.replyToMessageId },
       data,
@@ -593,6 +623,12 @@ export function createConversationResponseStream({
         streaming: state.mode === 'cardkit' && !terminal && part === segments.length - 1,
         part,
         totalParts: segments.length,
+        copyRequestId: terminal
+          && state.status === 'completed'
+          && part === 0
+          && shouldOfferCopy(state.output)
+          ? state.requestId
+          : null,
       });
       if (JSON.stringify(cardState.rendered) !== JSON.stringify(card)) {
         await updateCard(state, cardState, card, purpose);
@@ -642,6 +678,101 @@ export function createConversationResponseStream({
   }
 
   return Object.freeze({
+    async sendCompleted(input) {
+      const request = requireRecord(input, 'completed response request');
+      requireExactFields(request, ['requestId', 'target', 'output'], 'completed response request');
+      const requestId = requireText(request.requestId, 'requestId');
+      const targetValue = requireRecord(request.target, 'target');
+      requireExactFields(targetValue, ['chatId', 'chatType', 'replyToMessageId'], 'target');
+      const target = {
+        chatId: requireText(targetValue.chatId, 'target.chatId'),
+        chatType: targetValue.chatType,
+        replyToMessageId: targetValue.replyToMessageId === null
+          ? null
+          : requireText(targetValue.replyToMessageId, 'target.replyToMessageId'),
+      };
+      if (!['p2p', 'group'].includes(target.chatType)) {
+        throw new TypeError('target.chatType is unsupported');
+      }
+      const output = typeof request.output === 'string' ? request.output : String(request.output || '');
+      const release = await acquireRequestLock(requestId);
+      try {
+        const existing = load(requestId);
+        if (existing) {
+          if (existing.status !== 'completed'
+            || existing.output !== output
+            || JSON.stringify(existing.target) !== JSON.stringify(target)) {
+            const error = new Error('completed response requestId already owns different content');
+            error.code = 'ASSISTANT_TERMINAL_CONFLICT';
+            throw error;
+          }
+          return {
+            handled: true,
+            replayed: true,
+            parts: existing.cards.length,
+            messageId: existing.cards[0]?.messageId || existing.plainMessageId,
+          };
+        }
+
+        const state = {
+          version: 1,
+          requestId,
+          target,
+          mode: 'ordinary_card',
+          status: 'completed',
+          phase: '✅ 已完成',
+          progress: [],
+          publicReasoning: '',
+          output,
+          lastEventSequence: 0,
+          lastRenderedAt: clock(),
+          compatibilityTerminal: false,
+          plainTerminalSent: false,
+          plainTerminalFingerprint: null,
+          cards: [],
+        };
+        const segments = splitUtf8(output, answerBytesPerCard);
+        try {
+          for (let part = 0; part < segments.length; part += 1) {
+            const card = renderCard({
+              phase: state.phase,
+              answer: segments[part],
+              streaming: false,
+              part,
+              totalParts: segments.length,
+              copyRequestId: part === 0 && shouldOfferCopy(output) ? requestId : null,
+            });
+            const messageId = await sendInteractive(
+              client,
+              target,
+              card,
+              stableToken(requestId, `completed:${part}`),
+            );
+            state.cards.push({
+              part,
+              messageId,
+              cardId: null,
+              nextSequence: 1,
+              closed: true,
+              rendered: card,
+            });
+            save(state);
+          }
+        } catch (error) {
+          error.deliveredParts = state.cards.length;
+          throw error;
+        }
+        return {
+          handled: true,
+          replayed: false,
+          parts: state.cards.length,
+          messageId: state.cards[0]?.messageId,
+        };
+      } finally {
+        release();
+      }
+    },
+
     async open(input) {
       const request = requireRecord(input, 'open response stream request');
       requireExactFields(request, ['requestId', 'target'], 'open response stream request');
