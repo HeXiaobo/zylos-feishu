@@ -133,7 +133,7 @@ test('opens once, coalesces real deltas, keeps sequence monotonic, and closes th
   assert.equal(finalCard.body.elements[1].element_id.length <= 20, true);
 }));
 
-test('phase events never fabricate answer deltas and completion may supply one full answer', () => withState(async stateDirectory => {
+test('phase events stay visible while running and disappear when completion supplies the answer', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({
     client,
@@ -161,8 +161,7 @@ test('phase events never fabricate answer deltas and completion may supply one f
   });
   const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
   assert.equal(finalCard.body.elements[1].content, '只有完整答案，没有伪造 token 流。');
-  assert.match(finalCard.body.elements[2].content, /公开推理摘要/);
-  assert.match(finalCard.body.elements[2].content, /不包含模型内部思维/);
+  assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
 }));
 
 test('streams public reasoning in its own card region without mixing it into the answer', () => withState(async stateDirectory => {
@@ -183,9 +182,11 @@ test('streams public reasoning in its own card region without mixing it into the
 
   const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
   assert.equal(card.body.elements[1].content, '这是答案。');
-  assert.match(card.body.elements[2].content, /处理思路（实时）/);
+  assert.match(card.body.elements[2].content, /处理过程（实时）/);
+  assert.match(card.body.elements[2].content, /正在分析问题[\s\S]*正在生成回答/);
+  assert.match(card.body.elements[2].content, /公开工作摘要/);
   assert.match(card.body.elements[2].content, /先核对任务边界。[\s\S]*再验证关键数据。/);
-  assert.match(card.body.elements[2].content, /不含系统隐藏思维/);
+  assert.match(card.body.elements[2].content, /不含模型隐藏思维/);
 
   const persisted = JSON.parse(fs.readFileSync(
     fs.readdirSync(stateDirectory)
@@ -195,6 +196,21 @@ test('streams public reasoning in its own card region without mixing it into the
   ));
   assert.equal(persisted.output, '这是答案。');
   assert.equal(persisted.publicReasoning, '先核对任务边界。\n再验证关键数据。\n');
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(7, 'RunCompleted', { output: '这是最终答案。' })],
+  });
+  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
+  const finalState = JSON.parse(fs.readFileSync(
+    fs.readdirSync(stateDirectory)
+      .filter(name => name.endsWith('.json'))
+      .map(name => path.join(stateDirectory, name))[0],
+    'utf8',
+  ));
+  assert.equal(finalState.publicReasoning, '');
+  assert.deepEqual(finalState.progress, []);
 }));
 
 test('keeps a bounded, de-duplicated public progress trace across restart', () => withState(async stateDirectory => {
@@ -214,16 +230,19 @@ test('keeps a bounded, de-duplicated public progress trace across restart', () =
   const second = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
   await second.apply({
     requestId: 'assistant.feishu.om_1',
-    events: [
-      event(6, 'ProgressUpdated', { stage: 'querying' }),
-      event(7, 'RunCompleted', { output: '完成' }),
-    ],
+    events: [event(6, 'ProgressUpdated', { stage: 'querying' })],
   });
 
-  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  const trace = finalCard.body.elements[2].content;
+  const runningCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const trace = runningCard.body.elements[2].content;
   assert.equal((trace.match(/正在读取资料/g) || []).length, 1);
   assert.match(trace, /正在分析问题[\s\S]*正在读取资料[\s\S]*正在查询数据/);
+  await second.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(7, 'RunCompleted', { output: '完成' })],
+  });
+  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
 }));
 
 test('renders fixed public action progress without exposing model-authored summaries', () => withState(async stateDirectory => {
@@ -246,14 +265,19 @@ test('renders fixed public action progress without exposing model-authored summa
         status: 'completed',
         summary: 'another private model text must not render',
       }),
-      event(4, 'RunCompleted', { output: '完成' }),
     ],
   });
 
-  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  const trace = finalCard.body.elements[2].content;
+  const runningCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const trace = runningCard.body.elements[2].content;
   assert.match(trace, /正在分析问题[\s\S]*正在查找相关信息[\s\S]*已找到相关信息/);
-  assert.equal(JSON.stringify(finalCard).includes('private model text'), false);
+  assert.equal(JSON.stringify(runningCard).includes('private model text'), false);
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(4, 'RunCompleted', { output: '完成' })],
+  });
+  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
 }));
 
 test('swaps to continuation cards only when the verified answer exceeds one card', () => withState(async stateDirectory => {
