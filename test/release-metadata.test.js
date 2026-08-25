@@ -12,13 +12,13 @@ describe('3AI release metadata', () => {
     const capabilities = JSON.parse(fs.readFileSync(path.join(ROOT, 'capabilities.json'), 'utf8'));
     const skill = fs.readFileSync(path.join(ROOT, 'SKILL.md'), 'utf8');
 
-    assert.equal(pkg.version, '0.3.7-3ai.3');
+    assert.equal(pkg.version, '0.3.7-3ai.4');
     assert.equal(lock.version, pkg.version);
     assert.equal(lock.packages[''].version, pkg.version);
     assert.equal(capabilities.release, pkg.version);
     assert.equal(pkg.repository.url, 'git+https://github.com/HeXiaobo/zylos-feishu.git');
     assert.equal(pkg.engines.node, '>=20.20.0');
-    assert.match(skill, /^version: 0\.3\.7-3ai\.3$/m);
+    assert.match(skill, /^version: 0\.3\.7-3ai\.4$/m);
     assert.match(skill, /^  repo: HeXiaobo\/zylos-feishu$/m);
     assert.match(skill, /^  branch: codex\/mylos-capability-bundle-rc$/m);
   });

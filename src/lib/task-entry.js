@@ -145,6 +145,7 @@ export function buildC4ReceiveArgs({
     args.push(
       '--assistant-request-id', requireText(request.requestId, 'assistantRequest.requestId'),
       '--assistant-source-id', requireText(request.sourceId, 'assistantRequest.sourceId'),
+      '--block-queue-until-idle',
     );
   }
   if (workIntakeEnvelope) {

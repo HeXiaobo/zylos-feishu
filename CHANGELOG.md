@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-3ai.4] - 2026-08-26
+
+### Fixed
+- Ordinary streamed replies now enter C4 with `--block-queue-until-idle`, keeping a second Feishu prompt durably queued until the active Mylos runtime turn settles instead of allowing two cards to compete for one runtime session.
+
 ## [0.3.7-3ai.3] - 2026-08-25
 
 ### Changed

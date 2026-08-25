@@ -76,6 +76,7 @@ test('routes an explicit create protocol to C4 with a normalized task envelope',
       '--json',
       '--assistant-request-id', 'assistant.feishu.om_ordinary',
       '--assistant-source-id', 'om_ordinary',
+      '--block-queue-until-idle',
       '--content', '[Feishu DM] Sender said: ordinary chat',
     ],
   );
