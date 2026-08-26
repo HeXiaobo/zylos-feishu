@@ -18,7 +18,14 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 // Load .env from ~/zylos/.env (absolute path, not cwd-dependent)
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
-import { getConfig, watchConfig, DATA_DIR, getCredentials, stopWatching } from './lib/config.js';
+import {
+  getConfig,
+  getStreamProcessDisplay,
+  watchConfig,
+  DATA_DIR,
+  getCredentials,
+  stopWatching,
+} from './lib/config.js';
 import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages } from './lib/message.js';
 import { getUserInfo } from './lib/contact.js';
 import { listChatMembers } from './lib/chat.js';
@@ -849,7 +856,10 @@ let conversationResponseStream = null;
 
 function getConversationResponseStream() {
   if (!conversationResponseStream) {
-    conversationResponseStream = createConversationResponseStream({ client: getClient() });
+    conversationResponseStream = createConversationResponseStream({
+      client: getClient(),
+      processDisplay: getStreamProcessDisplay(config),
+    });
   }
   return conversationResponseStream;
 }

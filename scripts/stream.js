@@ -6,6 +6,7 @@ import path from 'node:path';
 import dotenv from 'dotenv';
 
 import { getClient } from '../src/lib/client.js';
+import { getConfig, getStreamProcessDisplay } from '../src/lib/config.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
 import { createConversationResponseDelivery } from '../src/lib/conversation-response-delivery.js';
 
@@ -25,7 +26,10 @@ async function main() {
   try {
     const raw = await readStdin();
     const delivery = JSON.parse(raw);
-    const stream = createConversationResponseStream({ client: getClient() });
+    const stream = createConversationResponseStream({
+      client: getClient(),
+      processDisplay: getStreamProcessDisplay(getConfig()),
+    });
     const result = await createConversationResponseDelivery({ stream }).deliver(delivery);
     process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
   } catch (error) {
