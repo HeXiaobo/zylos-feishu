@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const EVENT_FIELDS = Object.freeze(['event_id', 'task_id', 'app_id']);
+const REQUIRED_EVENT_FIELDS = Object.freeze(['event_id', 'task_id', 'app_id']);
+const OPTIONAL_EVENT_FIELDS = Object.freeze(['event_types']);
 const MAX_EVENT_ID_LENGTH = 512;
 
 function requireRecord(value, field) {
@@ -30,13 +31,29 @@ function requirePositiveInteger(value, field) {
 function normalizeEvent(value) {
   const event = requireRecord(value, 'status event');
   const keys = Object.keys(event);
-  if (keys.length !== EVENT_FIELDS.length || !EVENT_FIELDS.every(key => keys.includes(key))) {
+  if (
+    !REQUIRED_EVENT_FIELDS.every(key => keys.includes(key))
+    || keys.some(key => !REQUIRED_EVENT_FIELDS.includes(key) && !OPTIONAL_EVENT_FIELDS.includes(key))
+  ) {
     throw new TypeError('status event contains unsupported or missing fields');
+  }
+  let eventTypes;
+  if (event.event_types !== undefined) {
+    if (!Array.isArray(event.event_types) || event.event_types.length === 0) {
+      throw new TypeError('status event.event_types must be a non-empty array');
+    }
+    eventTypes = event.event_types.map((eventType, index) => (
+      requireText(eventType, `status event.event_types[${index}]`)
+    ));
+    if (new Set(eventTypes).size !== eventTypes.length) {
+      throw new TypeError('status event.event_types must not contain duplicates');
+    }
   }
   return {
     event_id: requireText(event.event_id, 'status event.event_id'),
     task_id: requireText(event.task_id, 'status event.task_id'),
     app_id: requireText(event.app_id, 'status event.app_id'),
+    ...(eventTypes === undefined ? {} : { event_types: eventTypes }),
   };
 }
 

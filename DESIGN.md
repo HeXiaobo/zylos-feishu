@@ -331,7 +331,16 @@ does not mutate Core or depend on Core availability, and reconciliation can
 repair a missed reverse event from current native state.
 
 The Feishu App needs `task:task:read` and `task:task:write`, plus the
-`task.task.updated_v1` event subscription. F3 does not call comment APIs;
+`task.task.update_user_access_v2` event subscription. Before starting the
+long connection, the component calls the Task v2 subscription API with the
+same bot identity and fails closed if that relation cannot be established.
+Bot identity covers only Tasks for which the current App is responsible; a
+user's personally followed Tasks are not part of this managed real-time SLA.
+The current native envelope's `event_types` are retained in the durable inbox:
+only `task_completed_update` can enter the `SubmitForReview` path, while all
+other commit types return a reconciliation signal. The legacy
+`task.task.updated_v1` handler remains registered during migration. F3 does
+not call comment APIs;
 `task:comment:read` and `task:comment:write` belong to the later comment slice.
 
 ---

@@ -285,7 +285,10 @@ test('native completion submits for review exactly once and never accepts for th
     appId: APP_ID,
     gateway: { async getTask() { return { completedAt: '1787900000000' }; } },
   });
-  const event = { event_id: 'evt-complete-1', task_id: 'guid-1', app_id: APP_ID };
+  const event = {
+    header: { event_id: 'evt-complete-1', app_id: APP_ID },
+    event: { task_guid: 'guid-1', event_types: ['task_completed_update'] },
+  };
   const result = await handler.handle(event);
   assert.equal(result.status, 'submitted_for_review');
   assert.deepEqual(harness.commands.map(command => command.type), [
@@ -302,12 +305,66 @@ test('native completion submits for review exactly once and never accepts for th
     appId: APP_ID,
     gateway: { async getTask() { return { completedAt: '0' }; } },
   });
-  assert.equal((await uncompleted.handle({ ...event, event_id: 'evt-uncomplete' })).status, 'ignored_uncompleted');
+  assert.equal((await uncompleted.handle({
+    header: { event_id: 'evt-uncomplete', app_id: APP_ID },
+    event: { task_guid: 'guid-1', event_types: ['task_completed_update'] },
+  })).status, 'ignored_uncompleted');
 
   assert.equal((await handler.handle({
-    header: { event_id: 'evt-envelope', app_id: APP_ID },
-    event: { task_id: 'guid-1' },
+    event_id: 'evt-legacy',
+    task_id: 'guid-1',
+    app_id: APP_ID,
   })).status, 'already_in_review');
+});
+
+test('native non-completion commits signal reconciliation without mutating Core', async () => {
+  const harness = fakeCore();
+  const handler = createTaskV2StatusEventHandler({
+    core: harness.core,
+    appId: APP_ID,
+    gateway: { async getTask() { throw new Error('must not read completion state'); } },
+  });
+
+  assert.deepEqual(await handler.handle({
+    header: { event_id: 'evt-summary', app_id: APP_ID },
+    event: {
+      task_guid: 'guid-1',
+      event_types: ['task_summary_update'],
+    },
+  }), {
+    status: 'reconciliation_required',
+    taskGuid: 'guid-1',
+    eventTypes: ['task_summary_update'],
+  });
+  assert.deepEqual(harness.commands, []);
+});
+
+test('mixed native commits submit only completion and preserve a reconciliation signal', async () => {
+  const harness = fakeCore();
+  harness.core.externalLinks.link({
+    taskId: 'task-1', actorId: 'ou_owner', backend: TASK_V2_LINK_BACKEND,
+    externalId: 'guid-1', idempotencyKey: 'link-mixed-status',
+  });
+  const handler = createTaskV2StatusEventHandler({
+    core: harness.core,
+    appId: APP_ID,
+    gateway: { async getTask() { return { completedAt: '1787900000000' }; } },
+  });
+
+  const result = await handler.handle({
+    header: { event_id: 'evt-complete-summary', app_id: APP_ID },
+    event: {
+      task_guid: 'guid-1',
+      event_types: ['task_completed_update', 'task_summary_update'],
+    },
+  });
+
+  assert.equal(result.status, 'submitted_for_review');
+  assert.deepEqual(result.reconciliationEventTypes, ['task_summary_update']);
+  assert.deepEqual(harness.commands.map(command => command.type), [
+    'StartTask',
+    'SubmitForReview',
+  ]);
 });
 
 test('status event callback authenticates and durably enqueues without opening Core', () => {

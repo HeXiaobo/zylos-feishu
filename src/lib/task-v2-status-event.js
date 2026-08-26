@@ -14,6 +14,20 @@ function requireText(value, field) {
   return value.trim();
 }
 
+function normalizeEventTypes(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new TypeError('event.event_types must be a non-empty array');
+  }
+  const eventTypes = value.map((eventType, index) => (
+    requireText(eventType, `event.event_types[${index}]`)
+  ));
+  if (new Set(eventTypes).size !== eventTypes.length) {
+    throw new TypeError('event.event_types must not contain duplicates');
+  }
+  return Object.freeze(eventTypes);
+}
+
 export function normalizeTaskV2StatusEvent(eventInput) {
   const input = requireRecord(eventInput, 'Task v2 status event');
   const payload = input.event === undefined
@@ -22,10 +36,12 @@ export function normalizeTaskV2StatusEvent(eventInput) {
   const header = input.header === undefined
     ? {}
     : requireRecord(input.header, 'Task v2 status event.header');
+  const eventTypes = normalizeEventTypes(payload.event_types);
   return Object.freeze({
     event_id: requireText(payload.event_id ?? header.event_id, 'event.event_id'),
-    task_id: requireText(payload.task_id, 'event.task_id'),
+    task_id: requireText(payload.task_guid ?? payload.task_id, 'event.task_guid'),
     app_id: requireText(payload.app_id ?? header.app_id, 'event.app_id'),
+    ...(eventTypes === undefined ? {} : { event_types: eventTypes }),
   });
 }
 
@@ -36,6 +52,18 @@ function taskCommand(core, task, type, eventId, phase) {
     actorId: task.assigneeId ?? task.ownerId,
     idempotencyKey: `feishu-task-v2:${eventId}:${phase}`,
   }, task.version);
+}
+
+function withReconciliationSignal(result, eventTypes) {
+  const reconciliationEventTypes = eventTypes?.filter(
+    eventType => eventType !== 'task_completed_update',
+  ) ?? [];
+  return Object.freeze({
+    ...result,
+    ...(reconciliationEventTypes.length === 0
+      ? {}
+      : { reconciliationEventTypes: Object.freeze(reconciliationEventTypes) }),
+  });
 }
 
 export function createTaskV2StatusEventIngestor({ inbox, appId } = {}) {
@@ -87,15 +115,28 @@ export function createTaskV2StatusEventHandler({ core, gateway, appId } = {}) {
       if (event.app_id !== expectedAppId) {
         throw new TypeError('Task v2 status event belongs to another App');
       }
+      if (event.event_types && !event.event_types.includes('task_completed_update')) {
+        return Object.freeze({
+          status: 'reconciliation_required',
+          taskGuid,
+          eventTypes: event.event_types,
+        });
+      }
       const link = core.externalLinks.query({
         backend: TASK_V2_LINK_BACKEND,
         externalId: taskGuid,
       });
-      if (!link) return Object.freeze({ status: 'unlinked', taskGuid });
+      if (!link) return withReconciliationSignal(
+        { status: 'unlinked', taskGuid },
+        event.event_types,
+      );
 
       const remoteTask = await gateway.getTask(taskGuid);
       if (remoteTask.completedAt === null || remoteTask.completedAt === '0') {
-        return Object.freeze({ status: 'ignored_uncompleted', taskId: link.taskId, taskGuid });
+        return withReconciliationSignal(
+          { status: 'ignored_uncompleted', taskId: link.taskId, taskGuid },
+          event.event_types,
+        );
       }
       let task = core.query({ taskId: link.taskId });
       if (!task) throw new Error(`Core task not found for Task v2 GUID: ${taskGuid}`);
@@ -111,21 +152,21 @@ export function createTaskV2StatusEventHandler({ core, gateway, appId } = {}) {
         task = submitted.task;
       }
       if (task.state === 'review') {
-        return Object.freeze({
+        return withReconciliationSignal({
           status: commands.length > 0 ? 'submitted_for_review' : 'already_in_review',
           taskId: task.id,
           taskGuid,
           commands: Object.freeze(commands),
           state: task.state,
-        });
+        }, event.event_types);
       }
-      return Object.freeze({
+      return withReconciliationSignal({
         status: 'terminal_ignored',
         taskId: task.id,
         taskGuid,
         commands: Object.freeze(commands),
         state: task.state,
-      });
+      }, event.event_types);
     },
   });
 }

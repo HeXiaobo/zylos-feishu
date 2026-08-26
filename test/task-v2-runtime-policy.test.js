@@ -15,5 +15,11 @@ test('one explicit enable flag controls Task v2 outbound and reverse event capab
   const handle = async event => event;
   assert.deepEqual(createTaskV2EventHandlerEntries({ enabled: false, handle }), {});
   const enabled = createTaskV2EventHandlerEntries({ enabled: true, handle });
+  assert.deepEqual(Object.keys(enabled).sort(), [
+    'task.task.update_user_access_v2',
+    'task.task.updated_v1',
+  ]);
+  assert.equal(enabled['task.task.update_user_access_v2'], handle);
   assert.equal(enabled['task.task.updated_v1'], handle);
+  assert.equal(enabled['task.task.comment.updated_v1'], undefined);
 });

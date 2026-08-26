@@ -8,6 +8,49 @@ import {
   createTaskV2StatusInbox,
   processTaskV2StatusInboxOnce,
 } from '../src/lib/task-v2-status-inbox.js';
+import { createTaskV2StatusEventIngestor } from '../src/lib/task-v2-status-event.js';
+
+test('native Task v2 envelope is durably normalized before acknowledgement', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-native-event-'));
+  try {
+    const inbox = createTaskV2StatusInbox({
+      directory,
+      clock: () => 1_787_900_000_000,
+    });
+    const ingestor = createTaskV2StatusEventIngestor({
+      appId: 'cli_app',
+      inbox,
+    });
+
+    const nativeEvent = {
+      header: { event_id: 'evt-native-1', app_id: 'cli_app' },
+      event: {
+        task_guid: 'guid-native-1',
+        event_types: ['task_completed_update', 'task_summary_update'],
+      },
+    };
+    assert.deepEqual(ingestor.handle(nativeEvent), {
+      status: 'queued',
+      created: true,
+      eventId: 'evt-native-1',
+      taskGuid: 'guid-native-1',
+    });
+    assert.equal(ingestor.handle(nativeEvent).created, false);
+
+    const reopened = createTaskV2StatusInbox({
+      directory,
+      clock: () => 1_787_900_001_000,
+    });
+    assert.deepEqual(reopened.pending({ limit: 10 }), [{
+      event_id: 'evt-native-1',
+      task_id: 'guid-native-1',
+      app_id: 'cli_app',
+      event_types: ['task_completed_update', 'task_summary_update'],
+    }]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test('status inbox durably deduplicates events and preserves acknowledgement across reopen', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-status-inbox-'));

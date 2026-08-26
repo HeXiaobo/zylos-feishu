@@ -196,10 +196,17 @@ back to a readable generic AI-employee label.
 
 The paired Core/Feishu release requires Node.js 20.20.0 or newer. Before the
 canary, grant `task:task:read`, `task:task:write`, and task-comment read/write
-permissions, then subscribe to `task.task.updated_v1`,
+permissions, then subscribe to `task.task.update_user_access_v2`,
 `task.task.comment.updated_v1`, and `card.action.trigger`. Task v2 status sync
 requires `COMMITMENT_FEISHU_TASK_V2_ENABLED=1`; comment sync additionally
 requires `FEISHU_TASK_COMMENTS_ENABLED=1`.
+
+When Task v2 status sync is enabled in long-connection mode, startup first
+creates the Task v2 subscription relation with the configured App identity and
+fails closed if that call fails. App identity receives real-time changes only
+for Tasks for which that App is responsible; personally followed user Tasks
+are outside the managed real-time SLA. The legacy `task.task.updated_v1`
+handler remains registered only for the migration window.
 
 Do not start projection implicitly. An operator must first register one
 history policy in Commitment Core (`from_now` for a new business canary;
