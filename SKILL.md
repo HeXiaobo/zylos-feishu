@@ -228,9 +228,10 @@ npm run task-status:gate -- --input /absolute/path/completion-gate.json
 The input names `coreDbPath`, `statusInboxDbPath`, `appId`, and a non-empty
 `cases` array of `{ "taskGuid": "...", "eventId": "..." }`. A pass proves the
 same remote Task is completed, the exact durable status settlement returned
-`submitted_for_review`, its Core command receipt exists, and the linked Core
-Task has exactly one review submission and zero acceptance events. This gate
-does not accept a Task on the reviewer's behalf.
+`submitted_for_review`, the command receipt at the exact idempotency key
+returned by the production Core mapper exists, and the linked Core Task has
+exactly one review submission and zero acceptance events. This gate does not
+accept a Task on the reviewer's behalf.
 
 For the first SQLite inbox rollout, keep the Task v2 projection worker stopped
 and start exactly one Feishu process with Task v2 enabled. Let that process

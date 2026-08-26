@@ -41,7 +41,7 @@ function createFixture() {
     JSON.stringify({ event: { type: 'TaskStarted' }, task: { state: 'in_progress' } }),
   );
   core.prepare('INSERT INTO commitment_commands VALUES (?, ?, ?)').run(
-    'feishu-task-v2:status-event-1:submit',
+    'feishu-task-v2:status-event-1:task-command',
     'core-task-1',
     JSON.stringify({ event: { type: 'TaskSubmittedForReview' }, task: { state: 'review' } }),
   );
@@ -74,6 +74,7 @@ function createFixture() {
       taskId: 'core-task-1',
       taskGuid: 'task-guid-1',
       commands: ['StartTask', 'SubmitForReview'],
+      submissionIdempotencyKey: 'feishu-task-v2:status-event-1:task-command',
       state: 'review',
     }),
     Date.parse('2026-08-26T10:00:03.000Z'),
@@ -156,6 +157,10 @@ test('completion gate validates exact SQLite, Core review, and remote completion
     assert.deepEqual(report.cases[0].core.eventCounts, {
       started: 1, submitted: 1, accepted: 0,
     });
+    assert.deepEqual(report.cases[0].core.commandReceipts, [
+      'feishu-task-v2:status-event-1:start',
+      'feishu-task-v2:status-event-1:task-command',
+    ]);
   } finally {
     fixture.cleanup();
   }
@@ -223,7 +228,7 @@ test('completion fails when the exact Core submit receipt is absent', async () =
   try {
     const core = new Database(fixture.coreDbPath);
     core.prepare('DELETE FROM commitment_commands WHERE idempotency_key LIKE ?')
-      .run('%:submit');
+      .run('%:task-command');
     core.close();
     const report = await evaluateFixture(fixture);
     assert.deepEqual(report.failureCodes, ['CORE_SUBMIT_RECEIPT_MISSING']);

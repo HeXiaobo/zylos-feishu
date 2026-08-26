@@ -229,9 +229,11 @@ export function createTaskV2StatusEventHandler({
           mappedSubmission.command.taskId !== task.id
           || mappedSubmission.command.actorId !== actorId
           || mappedSubmission.expectedVersion !== expectedVersion
+          || typeof mappedSubmission.command.idempotencyKey !== 'string'
+          || mappedSubmission.command.idempotencyKey.trim() === ''
         ) {
           throw permanentMapperError(
-            'Core external Task mapper must preserve task identity, actor, and version',
+            'Core external Task mapper must preserve task identity, actor, and version, plus command identity',
           );
         }
       }
@@ -254,6 +256,9 @@ export function createTaskV2StatusEventHandler({
           taskId: task.id,
           taskGuid,
           commands: Object.freeze(commands),
+          ...(commands.includes('SubmitForReview')
+            ? { submissionIdempotencyKey: mappedSubmission.command.idempotencyKey }
+            : {}),
           state: task.state,
         }, event.event_types);
       }

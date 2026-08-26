@@ -156,6 +156,8 @@ async function evaluateCase({ coreDb, statusDb, appId, item, remoteReader }) {
     || !Array.isArray(statusResult.commands)
     || !statusResult.commands.includes('SubmitForReview')
     || statusResult.commands.includes('AcceptTask')
+    || typeof statusResult.submissionIdempotencyKey !== 'string'
+    || statusResult.submissionIdempotencyKey.trim() === ''
   ) {
     return failedCase(
       item,
@@ -165,7 +167,7 @@ async function evaluateCase({ coreDb, statusDb, appId, item, remoteReader }) {
     );
   }
 
-  const submitKey = `feishu-task-v2:${item.eventId}:submit`;
+  const submitKey = statusResult.submissionIdempotencyKey;
   const startKey = `feishu-task-v2:${item.eventId}:start`;
   const submitReceipt = coreDb.prepare(`
     SELECT result_json AS resultJson

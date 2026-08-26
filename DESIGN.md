@@ -591,8 +591,9 @@ Commitment Core database, and the live SDK Reader. It proves:
 - the exact App/event row is durably acknowledged and contains
   `task_completed_update`;
 - its immutable settlement is `submitted_for_review`, contains
-  `SubmitForReview`, and never contains `AcceptTask`;
-- the event-specific Core command receipt is `TaskSubmittedForReview`;
+  `SubmitForReview`, never contains `AcceptTask`, and records the exact
+  idempotency key returned by the production Core mapper;
+- the Core command at that mapper-returned key is `TaskSubmittedForReview`;
 - the Core Task is in `review` with exactly one submission and zero acceptance
   events; and
 - the same remote Task still has the linked Core marker, title, and a non-empty

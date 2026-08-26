@@ -317,6 +317,7 @@ test('native completion submits for review exactly once and never accepts for th
   };
   const result = await handler.handle(event);
   assert.equal(result.status, 'submitted_for_review');
+  assert.equal(result.submissionIdempotencyKey, 'core-mapped:evt-complete-1');
   assert.deepEqual(harness.commands.map(command => command.type), [
     'StartTask',
     'SubmitForReview',
