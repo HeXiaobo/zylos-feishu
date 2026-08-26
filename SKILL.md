@@ -207,6 +207,10 @@ fails closed if that call fails. App identity receives real-time changes only
 for Tasks for which that App is responsible; personally followed user Tasks
 are outside the managed real-time SLA. The legacy `task.task.updated_v1`
 handler remains registered only for the migration window.
+The installed Commitment Core must provide
+`scripts/external-task-adapter.js#mapExternalTaskEvent`; Feishu delegates
+native completion semantics to that mapper and rejects any result other than
+the expected `SubmitForReview` command for the same Task, actor, and version.
 
 Do not start projection implicitly. An operator must first register one
 history policy in Commitment Core (`from_now` for a new business canary;

@@ -116,6 +116,18 @@ function delivery(taskId = 'task-1', version = 1) {
   };
 }
 
+function mapCompletedExternalTask(externalEvent) {
+  return {
+    command: {
+      type: 'SubmitForReview',
+      taskId: externalEvent.taskId,
+      actorId: externalEvent.actorId,
+      idempotencyKey: `mapped:${externalEvent.eventId}`,
+    },
+    expectedVersion: externalEvent.expectedVersion,
+  };
+}
+
 test('maps owner/acceptor followers and Agent or human assignees without changing Core roles', () => {
   const mapper = createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' });
   assert.deepEqual(mapper.map(coreTask()), [
@@ -276,6 +288,7 @@ test('platform failure leaves Core intact for retry and a GUID conflict is perma
 
 test('native completion submits for review exactly once and never accepts for the Acceptor', async () => {
   const harness = fakeCore();
+  const mappedEvents = [];
   harness.core.externalLinks.link({
     taskId: 'task-1', actorId: 'ou_owner', backend: TASK_V2_LINK_BACKEND,
     externalId: 'guid-1', idempotencyKey: 'link-status',
@@ -284,6 +297,18 @@ test('native completion submits for review exactly once and never accepts for th
     core: harness.core,
     appId: APP_ID,
     gateway: { async getTask() { return { completedAt: '1787900000000' }; } },
+    mapExternalTaskEvent(externalEvent) {
+      mappedEvents.push(externalEvent);
+      return {
+        command: {
+          type: 'SubmitForReview',
+          taskId: externalEvent.taskId,
+          actorId: externalEvent.actorId,
+          idempotencyKey: `core-mapped:${externalEvent.eventId}`,
+        },
+        expectedVersion: externalEvent.expectedVersion,
+      };
+    },
   });
   const event = {
     header: { event_id: 'evt-complete-1', app_id: APP_ID },
@@ -295,6 +320,15 @@ test('native completion submits for review exactly once and never accepts for th
     'StartTask',
     'SubmitForReview',
   ]);
+  assert.deepEqual(mappedEvents, [{
+    backend: TASK_V2_LINK_BACKEND,
+    eventId: 'evt-complete-1',
+    eventType: 'completed',
+    taskId: 'task-1',
+    actorId: 'agent:yueran',
+    expectedVersion: 2,
+  }]);
+  assert.equal(harness.commands[1].idempotencyKey, 'core-mapped:evt-complete-1');
   assert.equal(harness.tasks.get('task-1').state, 'review');
   assert.equal(harness.commands.some(command => command.type === 'AcceptTask'), false);
   assert.equal((await handler.handle(event)).status, 'already_in_review');
@@ -304,6 +338,7 @@ test('native completion submits for review exactly once and never accepts for th
     core: harness.core,
     appId: APP_ID,
     gateway: { async getTask() { return { completedAt: '0' }; } },
+    mapExternalTaskEvent() { throw new Error('must not map an uncompleted Task'); },
   });
   assert.equal((await uncompleted.handle({
     header: { event_id: 'evt-uncomplete', app_id: APP_ID },
@@ -317,12 +352,83 @@ test('native completion submits for review exactly once and never accepts for th
   })).status, 'already_in_review');
 });
 
+test('native completion rejects an acceptance-shaped Core mapper result', async () => {
+  const harness = fakeCore();
+  harness.core.externalLinks.link({
+    taskId: 'task-1', actorId: 'ou_owner', backend: TASK_V2_LINK_BACKEND,
+    externalId: 'guid-1', idempotencyKey: 'link-invalid-mapper',
+  });
+  const handler = createTaskV2StatusEventHandler({
+    core: harness.core,
+    appId: APP_ID,
+    gateway: { async getTask() { return { completedAt: '1787900000000' }; } },
+    mapExternalTaskEvent(externalEvent) {
+      return {
+        command: {
+          type: 'AcceptTask',
+          taskId: externalEvent.taskId,
+          actorId: 'ou_acceptor',
+          idempotencyKey: 'must-not-run',
+        },
+        expectedVersion: externalEvent.expectedVersion,
+      };
+    },
+  });
+
+  await assert.rejects(
+    handler.handle({
+      header: { event_id: 'evt-invalid-mapper', app_id: APP_ID },
+      event: { task_guid: 'guid-1', event_types: ['task_completed_update'] },
+    }),
+    error => error?.retryable === false && /only SubmitForReview/.test(error.message),
+  );
+  assert.deepEqual(harness.commands, []);
+  assert.equal(harness.tasks.get('task-1').state, 'ready');
+});
+
+test('native completion rejects mapper identity or version drift before mutating Core', async () => {
+  const harness = fakeCore();
+  harness.core.externalLinks.link({
+    taskId: 'task-1', actorId: 'ou_owner', backend: TASK_V2_LINK_BACKEND,
+    externalId: 'guid-1', idempotencyKey: 'link-drifted-mapper',
+  });
+  const handler = createTaskV2StatusEventHandler({
+    core: harness.core,
+    appId: APP_ID,
+    gateway: { async getTask() { return { completedAt: '1787900000000' }; } },
+    mapExternalTaskEvent() {
+      return {
+        command: {
+          type: 'SubmitForReview',
+          taskId: 'task-other',
+          actorId: 'ou_attacker',
+          idempotencyKey: 'drifted-mapper',
+        },
+        expectedVersion: 999,
+      };
+    },
+  });
+
+  await assert.rejects(
+    handler.handle({
+      header: { event_id: 'evt-drifted-mapper', app_id: APP_ID },
+      event: { task_guid: 'guid-1', event_types: ['task_completed_update'] },
+    }),
+    error => error?.retryable === false && /preserve task identity, actor, and version/.test(
+      error.message,
+    ),
+  );
+  assert.deepEqual(harness.commands, []);
+  assert.equal(harness.tasks.get('task-1').state, 'ready');
+});
+
 test('native non-completion commits signal reconciliation without mutating Core', async () => {
   const harness = fakeCore();
   const handler = createTaskV2StatusEventHandler({
     core: harness.core,
     appId: APP_ID,
     gateway: { async getTask() { throw new Error('must not read completion state'); } },
+    mapExternalTaskEvent() { throw new Error('must not map a non-completion event'); },
   });
 
   assert.deepEqual(await handler.handle({
@@ -349,6 +455,7 @@ test('mixed native commits submit only completion and preserve a reconciliation 
     core: harness.core,
     appId: APP_ID,
     gateway: { async getTask() { return { completedAt: '1787900000000' }; } },
+    mapExternalTaskEvent: mapCompletedExternalTask,
   });
 
   const result = await handler.handle({

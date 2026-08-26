@@ -279,11 +279,15 @@ an unmapped Task assignee fails closed.
 
 Native completion means "submitted by the executor": `ready` is first started
 and then moved to `review`, while `in_progress` moves directly to `review`.
-The reverse Adapter never emits `AcceptTask`. Core `review`, `done`, and
-`cancelled` project as completed; `RequestChanges` returns Core to `ready` and
-the next projection reopens the native Task. Updates are field-difference
-patches: an already-completed native Task is not completed again when Core
-advances from `review` to `done`.
+The Feishu handler delegates the completion-to-command mapping to Core's
+`external-task-adapter.js` and accepts only an identity/version-preserving
+`SubmitForReview` result. It validates that result before an optional
+`StartTask`, so a bad mapper cannot leave a ready Task half-transitioned. The
+reverse Adapter never emits `AcceptTask`. Core `review`, `done`, and `cancelled`
+project as completed; `RequestChanges` returns Core to `ready` and the next
+projection reopens the native Task. Updates are field-difference patches: an
+already-completed native Task is not completed again when Core advances from
+`review` to `done`.
 
 Remote create uses a stable `client_token` only for Feishu's short deduplication
 window. Durable identity is the Core ExternalLink plus its receipt. If create

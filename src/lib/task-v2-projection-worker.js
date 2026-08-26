@@ -80,10 +80,16 @@ export async function loadCommitmentProjectionDependencies({
 } = {}) {
   const zylosDir = env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
   const scripts = path.join(zylosDir, '.claude/skills/commitment-core/scripts');
-  const [coreModule, workerModule, reconciliationModule] = await Promise.all([
+  const [
+    coreModule,
+    workerModule,
+    reconciliationModule,
+    externalTaskModule,
+  ] = await Promise.all([
     importModule(pathToFileURL(path.join(scripts, 'core.js')).href),
     importModule(pathToFileURL(path.join(scripts, 'projection-worker.js')).href),
     importModule(pathToFileURL(path.join(scripts, 'reconcile-projection.js')).href),
+    importModule(pathToFileURL(path.join(scripts, 'external-task-adapter.js')).href),
   ]);
   if (typeof coreModule.openCommitmentCore !== 'function') {
     throw new TypeError('installed Commitment Core has no openCommitmentCore');
@@ -94,10 +100,14 @@ export async function loadCommitmentProjectionDependencies({
   if (typeof reconciliationModule.reconcileProjection !== 'function') {
     throw new TypeError('installed Commitment Core has no reconcileProjection');
   }
+  if (typeof externalTaskModule.mapExternalTaskEvent !== 'function') {
+    throw new TypeError('installed Commitment Core has no mapExternalTaskEvent');
+  }
   return Object.freeze({
     openCore: coreModule.openCommitmentCore,
     processBatch: workerModule.processProjectionBatch,
     reconcile: reconciliationModule.reconcileProjection,
+    mapExternalTaskEvent: externalTaskModule.mapExternalTaskEvent,
   });
 }
 
@@ -150,6 +160,7 @@ export async function runTaskV2ProjectionOnce({
   statusInbox,
   openCore,
   processBatch,
+  mapExternalTaskEvent,
 } = {}) {
   requireText(workerId, 'workerId');
   requirePositiveInteger(limit, 'limit');
@@ -183,7 +194,12 @@ export async function runTaskV2ProjectionOnce({
       ? null
       : await processTaskV2StatusInboxOnce({
         inbox: statusInbox,
-        handler: createTaskV2StatusEventHandler({ core, gateway, appId }),
+        handler: createTaskV2StatusEventHandler({
+          core,
+          gateway,
+          appId,
+          mapExternalTaskEvent,
+        }),
         limit,
         retryAfterMs,
         maxAttempts,
@@ -205,6 +221,7 @@ export async function runTaskV2Reconciliation({
   tasks,
   repairStatus = false,
   appId,
+  mapExternalTaskEvent,
 } = {}) {
   if (typeof openCore !== 'function') throw new TypeError('openCore must be a function');
   if (typeof reconcile !== 'function') throw new TypeError('reconcile must be a function');
@@ -214,7 +231,12 @@ export async function runTaskV2Reconciliation({
     const snapshot = await collectTaskV2ReconciliationSnapshot({ core, gateway, tasks });
     const repairs = [];
     if (repairStatus) {
-      const handler = createTaskV2StatusEventHandler({ core, gateway, appId });
+      const handler = createTaskV2StatusEventHandler({
+        core,
+        gateway,
+        appId,
+        mapExternalTaskEvent,
+      });
       for (const candidate of snapshot.statusRepairCandidates) {
         repairs.push(await handler.handle({
           event_id: `reconcile:${candidate.taskGuid}:${candidate.completedAt}`,
@@ -323,6 +345,7 @@ async function main(args = process.argv.slice(2), env = process.env) {
       reconcile: dependencies.reconcile,
       gateway: runtime.gateway,
       appId: runtime.appId,
+      mapExternalTaskEvent: dependencies.mapExternalTaskEvent,
       repairStatus: args[1] === '--repair-status',
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);

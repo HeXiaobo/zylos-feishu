@@ -66,6 +66,12 @@ function withReconciliationSignal(result, eventTypes) {
   });
 }
 
+function permanentMapperError(message) {
+  const error = new TypeError(message);
+  error.retryable = false;
+  return error;
+}
+
 export function createTaskV2StatusEventIngestor({ inbox, appId } = {}) {
   if (!inbox || typeof inbox.enqueue !== 'function') {
     throw new TypeError('inbox.enqueue must be a function');
@@ -91,11 +97,17 @@ export function createTaskV2StatusEventIngestor({ inbox, appId } = {}) {
 /**
  * Convert an App-owned Task status event back into Core commands.
  *
- * Feishu's binary completion signal can start an untouched task and submit it
- * for review, but this Module never constructs AcceptTask. Uncompletion is a
- * projection drift repaired from Core, not a RequestChanges shortcut.
+ * Feishu's binary completion signal can start an untouched task, then the Core
+ * external Task mapper owns the review command semantics. This Module never
+ * constructs AcceptTask. Uncompletion is projection drift repaired from Core,
+ * not a RequestChanges shortcut.
  */
-export function createTaskV2StatusEventHandler({ core, gateway, appId } = {}) {
+export function createTaskV2StatusEventHandler({
+  core,
+  gateway,
+  appId,
+  mapExternalTaskEvent,
+} = {}) {
   if (
     !core || typeof core.query !== 'function' || typeof core.command !== 'function'
     || typeof core.externalLinks?.query !== 'function'
@@ -104,6 +116,9 @@ export function createTaskV2StatusEventHandler({ core, gateway, appId } = {}) {
   }
   if (!gateway || typeof gateway.getTask !== 'function') {
     throw new TypeError('gateway.getTask must be a function');
+  }
+  if (typeof mapExternalTaskEvent !== 'function') {
+    throw new TypeError('mapExternalTaskEvent must be a function');
   }
   const expectedAppId = requireText(appId, 'appId');
 
@@ -141,13 +156,43 @@ export function createTaskV2StatusEventHandler({ core, gateway, appId } = {}) {
       let task = core.query({ taskId: link.taskId });
       if (!task) throw new Error(`Core task not found for Task v2 GUID: ${taskGuid}`);
       const commands = [];
+      let mappedSubmission = null;
+      if (task.state === 'ready' || task.state === 'in_progress') {
+        const actorId = task.assigneeId ?? task.ownerId;
+        const expectedVersion = task.version + (task.state === 'ready' ? 1 : 0);
+        mappedSubmission = mapExternalTaskEvent({
+          backend: TASK_V2_LINK_BACKEND,
+          eventId,
+          eventType: 'completed',
+          taskId: task.id,
+          actorId,
+          expectedVersion,
+        });
+        if (mappedSubmission?.command?.type !== 'SubmitForReview') {
+          throw permanentMapperError(
+            'Core external Task mapper must produce only SubmitForReview',
+          );
+        }
+        if (
+          mappedSubmission.command.taskId !== task.id
+          || mappedSubmission.command.actorId !== actorId
+          || mappedSubmission.expectedVersion !== expectedVersion
+        ) {
+          throw permanentMapperError(
+            'Core external Task mapper must preserve task identity, actor, and version',
+          );
+        }
+      }
       if (task.state === 'ready') {
         const started = taskCommand(core, task, 'StartTask', eventId, 'start');
         commands.push('StartTask');
         task = started.task;
       }
       if (task.state === 'in_progress') {
-        const submitted = taskCommand(core, task, 'SubmitForReview', eventId, 'submit-for-review');
+        const submitted = core.command(
+          mappedSubmission.command,
+          mappedSubmission.expectedVersion,
+        );
         commands.push('SubmitForReview');
         task = submitted.task;
       }

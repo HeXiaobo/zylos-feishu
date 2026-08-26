@@ -6,11 +6,60 @@ import { TASK_V2_PROJECTION } from '../src/lib/task-v2-projection.js';
 import {
   createTaskV2ProjectionRuntime,
   initializeTaskV2Projection,
+  loadCommitmentProjectionDependencies,
   resolveTaskV2Url,
   runTaskV2Reconciliation,
   runTaskV2ProjectionOnce,
   superviseTaskV2Projection,
 } from '../src/lib/task-v2-projection-worker.js';
+
+test('production dependency loader requires the Core external Task mapper', async () => {
+  const imported = [];
+  const openCommitmentCore = () => {};
+  const processProjectionBatch = async () => {};
+  const reconcileProjection = () => {};
+  const mapExternalTaskEvent = event => event;
+  const modules = new Map([
+    ['core.js', { openCommitmentCore }],
+    ['projection-worker.js', { processProjectionBatch }],
+    ['reconcile-projection.js', { reconcileProjection }],
+    ['external-task-adapter.js', { mapExternalTaskEvent }],
+  ]);
+
+  const dependencies = await loadCommitmentProjectionDependencies({
+    env: { ZYLOS_DIR: '/runtime/zylos' },
+    async importModule(specifier) {
+      imported.push(specifier);
+      const name = [...modules.keys()].find(candidate => specifier.endsWith(candidate));
+      return modules.get(name);
+    },
+  });
+
+  assert.equal(dependencies.mapExternalTaskEvent, mapExternalTaskEvent);
+  assert.deepEqual(imported.map(specifier => specifier.split('/').at(-1)), [
+    'core.js',
+    'projection-worker.js',
+    'reconcile-projection.js',
+    'external-task-adapter.js',
+  ]);
+});
+
+test('production dependency loader fails closed when Core lacks the external Task mapper', async () => {
+  const modules = [
+    { openCommitmentCore() {} },
+    { processProjectionBatch() {} },
+    { reconcileProjection() {} },
+    {},
+  ];
+
+  await assert.rejects(
+    loadCommitmentProjectionDependencies({
+      env: { ZYLOS_DIR: '/runtime/zylos' },
+      async importModule() { return modules.shift(); },
+    }),
+    /installed Commitment Core has no mapExternalTaskEvent/,
+  );
+});
 
 function fakeCore() {
   const calls = [];
@@ -145,6 +194,7 @@ test('one worker cycle drains the durable reverse-status inbox after outbound se
       async getTask() { throw new Error('unlinked event must not read Feishu'); },
     },
     memberMapper: createTaskV2MemberMapper({ appId: 'cli_yueran', agentId: 'agent:yueran' }),
+    mapExternalTaskEvent() { throw new Error('unlinked event must not be mapped'); },
     openCore: () => harness.core,
     async processBatch() {
       return { projection: TASK_V2_PROJECTION, idle: true };
@@ -184,6 +234,7 @@ test('reconciliation combines the Feishu snapshot with the Core generic diff', a
 
 test('explicit reconciliation repair converts linked native completion only to Core review', async () => {
   const harness = fakeCore();
+  const mappedEvents = [];
   harness.core.externalLinks.query = query => (
     query.externalId
       ? { taskId: 'task-worker', externalId: 'guid-worker' }
@@ -201,6 +252,18 @@ test('explicit reconciliation repair converts linked native completion only to C
     gateway,
     appId: 'cli_yueran',
     repairStatus: true,
+    mapExternalTaskEvent(externalEvent) {
+      mappedEvents.push(externalEvent);
+      return {
+        command: {
+          type: 'SubmitForReview',
+          taskId: externalEvent.taskId,
+          actorId: externalEvent.actorId,
+          idempotencyKey: `mapped:${externalEvent.eventId}`,
+        },
+        expectedVersion: externalEvent.expectedVersion,
+      };
+    },
     reconcile: () => ({
       consistent: false, missing: [], unexpected: [], stateMismatches: [], duplicateKeys: [],
     }),
@@ -212,6 +275,8 @@ test('explicit reconciliation repair converts linked native completion only to C
     harness.calls.filter(([operation]) => operation === 'command').map(([, command]) => command.type),
     ['StartTask', 'SubmitForReview'],
   );
+  assert.equal(mappedEvents.length, 1);
+  assert.equal(mappedEvents[0].eventType, 'completed');
 });
 
 test('URL resolver exposes the linked native Task URL through a stable user-facing command seam', async () => {
