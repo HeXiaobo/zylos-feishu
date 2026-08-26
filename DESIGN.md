@@ -558,9 +558,13 @@ before it passes:
 - the exact comment arrived through the realtime event source within the
   configured latency SLO and reached `processed`;
 - exactly one sent outbound comment targets that inbound comment;
-- the exact canonical comment has one non-empty action-required notification
-  decision, and its complete recipient/dedupe-key set exactly matches sent
-  Feishu notification receipts with no missing or unexpected recipient;
+- the exact canonical comment has an action-required notification decision;
+  its non-empty recipient/dedupe-key set normally matches sent Feishu receipts
+  exactly, with no missing or unexpected recipient;
+- when the commenter is the only human owner/acceptor/subscriber, the empty
+  inbound decision cannot attest delivery by itself: the exact outbound ledger
+  key must identify a matching Core Agent reply event, and that reply's
+  immutable decision and sent receipt must target exactly the original human;
 - the remote Task still exists, its GUID/title/Core marker match, no same-title
   lookalike is visible, and both remote comments belong to the same Task;
 - the remote Agent comment has the exact `reply_to_comment_id`.
@@ -569,6 +573,12 @@ Failures are returned as stable codes in
 `zylos.native-task-closure-gate/v2`; one poisoned case does not stop the
 remaining cases. The CLI emits one JSON report and exits `0` for pass, `1` for
 a gate failure, or `2` for invalid input/runtime assembly:
+
+Successful case reports identify whether notification evidence came from the
+`inbound-comment` decision or, for a sole-human canary, the exact
+`agent-reply` decision. An empty inbound decision never counts as a receipt,
+cannot have an inbound delivery row, and a second human role/subscription
+disables the sole-human fallback.
 
 ```bash
 npm run task-comments:gate -- --input /absolute/path/gate-input.json

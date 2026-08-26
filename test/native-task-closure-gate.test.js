@@ -26,7 +26,13 @@ function createFixture() {
   const taskCommentsDbPath = path.join(directory, 'task-comments.db');
   const core = new Database(coreDbPath);
   core.exec(`
-    CREATE TABLE commitment_tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+    CREATE TABLE commitment_tasks (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      acceptor_id TEXT NOT NULL,
+      assignee_id TEXT
+    );
     CREATE TABLE commitment_external_links (
       id TEXT PRIMARY KEY,
       task_id TEXT NOT NULL,
@@ -51,9 +57,23 @@ function createFixture() {
       task_id TEXT NOT NULL,
       result_json TEXT NOT NULL
     );
+    CREATE TABLE commitment_task_subscriptions (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      subscriber_id TEXT NOT NULL
+    );
   `);
-  core.prepare('INSERT INTO commitment_tasks (id, title) VALUES (?, ?)')
-    .run('core-task-1', 'Unique closure canary');
+  core.prepare(`
+    INSERT INTO commitment_tasks (
+      id, title, owner_id, acceptor_id, assignee_id
+    ) VALUES (?, ?, ?, ?, ?)
+  `).run(
+    'core-task-1',
+    'Unique closure canary',
+    'ou_requester',
+    'ou_owner',
+    'agent:yueran',
+  );
   core.prepare(`
     INSERT INTO commitment_external_links (
       id, task_id, actor_id, backend, external_id, created_at
@@ -108,6 +128,7 @@ function createFixture() {
       idempotency_key TEXT NOT NULL,
       task_guid TEXT NOT NULL,
       reply_to_comment_id TEXT,
+      content TEXT,
       status TEXT NOT NULL,
       comment_id TEXT
     );
@@ -278,8 +299,17 @@ function evaluateFixture(fixture, overrides = {}) {
 
 function addSecondClosure(fixture) {
   const core = new Database(fixture.coreDbPath);
-  core.prepare('INSERT INTO commitment_tasks (id, title) VALUES (?, ?)')
-    .run('core-task-2', 'Second closure canary');
+  core.prepare(`
+    INSERT INTO commitment_tasks (
+      id, title, owner_id, acceptor_id, assignee_id
+    ) VALUES (?, ?, ?, ?, ?)
+  `).run(
+    'core-task-2',
+    'Second closure canary',
+    'ou_requester',
+    'ou_owner',
+    'agent:yueran',
+  );
   core.prepare(`
     INSERT INTO commitment_external_links (
       id, task_id, actor_id, backend, external_id, created_at
@@ -360,6 +390,78 @@ function addSecondClosure(fixture) {
   comments.close();
 }
 
+function makeSoleHumanClosure(fixture) {
+  const core = new Database(fixture.coreDbPath);
+  core.prepare(`
+    UPDATE commitment_tasks
+    SET acceptor_id = owner_id
+    WHERE id = ?
+  `).run('core-task-1');
+  core.prepare(`
+    UPDATE commitment_notification_decisions
+    SET result_json = ?
+    WHERE event_id = ?
+  `).run(JSON.stringify({
+    eventId: 'core-comment-event-1',
+    taskId: 'core-task-1',
+    kind: 'action_required',
+    deliveries: [],
+  }), 'core-comment-event-1');
+  core.prepare(`
+    INSERT INTO commitment_conversation_events (
+      id, event_type, task_id, comment_id, actor_id, body,
+      reply_to_comment_id, occurred_at, recorded_at
+    ) VALUES (?, 'CommentAdded', ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'core-agent-reply-event-1',
+    'core-task-1',
+    'agent-comment-1',
+    'agent:yueran',
+    'Closed.',
+    logicalCommentId('comment-human-1'),
+    '2026-08-26T10:00:03.000Z',
+    '2026-08-26T10:00:03.000Z',
+  );
+  core.prepare(`
+    INSERT INTO commitment_notification_decisions (event_id, task_id, result_json)
+    VALUES (?, ?, ?)
+  `).run('core-agent-reply-event-1', 'core-task-1', JSON.stringify({
+    eventId: 'core-agent-reply-event-1',
+    taskId: 'core-task-1',
+    kind: 'action_required',
+    deliveries: [{ recipientId: 'ou_requester', dedupeKey: 'agent-notification-1' }],
+  }));
+  core.close();
+
+  const comments = new Database(fixture.taskCommentsDbPath);
+  comments.prepare('DELETE FROM feishu_task_notifications WHERE event_id = ?')
+    .run('core-comment-event-1');
+  comments.prepare(`
+    UPDATE feishu_task_comment_outbound
+    SET idempotency_key = ?, content = ?
+    WHERE app_id = ? AND reply_to_comment_id = ?
+  `).run(
+    'task-comment-core-event:core-agent-reply-event-1',
+    'Closed.',
+    APP_ID,
+    'comment-human-1',
+  );
+  comments.prepare(`
+    INSERT INTO feishu_task_notifications (
+      dedupe_key, event_id, task_id, recipient_id, status, sent_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'agent-notification-1:feishu-im',
+    'core-agent-reply-event-1',
+    'core-task-1',
+    'ou_requester',
+    'sent',
+    '2026-08-26T10:00:04.000Z',
+    '2026-08-26T10:00:03.000Z',
+  );
+  comments.close();
+}
+
 test('a uniquely managed Task comment proves the complete native closure through the public gate', async () => {
   const fixture = createFixture();
   try {
@@ -380,6 +482,7 @@ test('a uniquely managed Task comment proves the complete native closure through
     assert.equal(report.cases[0].coreTaskId, 'core-task-1');
     assert.equal(report.cases[0].inbound.latencyMs, 2_000);
     assert.equal(report.cases[0].outbound.commentId, 'comment-agent-1');
+    assert.equal(report.cases[0].notifications.origin, 'inbound-comment');
     assert.deepEqual(report.cases[0].notifications.recipients, ['ou_owner']);
     assert.deepEqual(report.cases[0].notifications.receipts, [{
       dedupeKey: 'notification-1:feishu-im',
@@ -387,6 +490,218 @@ test('a uniquely managed Task comment proves the complete native closure through
       status: 'sent',
       sentAt: '2026-08-26T10:00:04.000Z',
     }]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a sole human can prove closure from the exact Agent reply notification', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+
+    const report = await evaluateFixture(fixture, { remoteReader: createLiveRemoteReader() });
+
+    assert.equal(report.evidenceMode, 'live');
+    assert.equal(report.validationPassed, true);
+    assert.equal(report.passed, true);
+    assert.deepEqual(report.failureCodes, []);
+    assert.deepEqual(report.cases[0].notifications.recipients, ['ou_requester']);
+    assert.equal(report.cases[0].notifications.eventId, 'core-agent-reply-event-1');
+    assert.equal(report.cases[0].notifications.origin, 'agent-reply');
+    assert.deepEqual(report.cases[0].notifications.receipts, [{
+      dedupeKey: 'agent-notification-1:feishu-im',
+      recipientId: 'ou_requester',
+      status: 'sent',
+      sentAt: '2026-08-26T10:00:04.000Z',
+    }]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('an empty inbound decision cannot substitute for the exact Agent reply decision', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const core = new Database(fixture.coreDbPath);
+    core.prepare('DELETE FROM commitment_notification_decisions WHERE event_id = ?')
+      .run('core-agent-reply-event-1');
+    core.close();
+
+    const report = await evaluateFixture(fixture);
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, [
+      'CORE_AGENT_REPLY_NOTIFICATION_DECISION_MISSING',
+    ]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('an empty inbound decision cannot hide another human subscriber', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const core = new Database(fixture.coreDbPath);
+    core.prepare(`
+      INSERT INTO commitment_task_subscriptions (id, task_id, subscriber_id)
+      VALUES (?, ?, ?)
+    `).run('subscription-other', 'core-task-1', 'ou_other');
+    core.close();
+
+    const report = await evaluateFixture(fixture);
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, ['SOLE_HUMAN_AUDIENCE_INVALID']);
+    assert.deepEqual(report.cases[0].failures[0].details.humanAudience, [
+      'ou_requester',
+      'ou_other',
+    ]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a sole-human Agent reply decision cannot target a different recipient', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const core = new Database(fixture.coreDbPath);
+    core.prepare(`
+      UPDATE commitment_notification_decisions
+      SET result_json = ?
+      WHERE event_id = ?
+    `).run(JSON.stringify({
+      eventId: 'core-agent-reply-event-1',
+      taskId: 'core-task-1',
+      kind: 'action_required',
+      deliveries: [{ recipientId: 'ou_other', dedupeKey: 'agent-notification-other' }],
+    }), 'core-agent-reply-event-1');
+    core.close();
+
+    const report = await evaluateFixture(fixture);
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, [
+      'CORE_AGENT_REPLY_NOTIFICATION_RECIPIENT_MISMATCH',
+    ]);
+    assert.equal(
+      report.cases[0].failures[0].details.expectedRecipientId,
+      'ou_requester',
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a sole-human reply must carry the production Core event correlation key', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare(`
+      UPDATE feishu_task_comment_outbound
+      SET idempotency_key = ?
+      WHERE reply_to_comment_id = ?
+    `).run('caller-spoofed-reply', 'comment-human-1');
+    comments.close();
+
+    const report = await evaluateFixture(fixture);
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, ['CORE_AGENT_REPLY_EVENT_ID_MISSING']);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a sole-human reply cannot correlate a Core Agent event for another parent', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const core = new Database(fixture.coreDbPath);
+    core.prepare(`
+      UPDATE commitment_conversation_events
+      SET reply_to_comment_id = ?
+      WHERE id = ?
+    `).run(logicalCommentId('comment-human-other'), 'core-agent-reply-event-1');
+    core.close();
+
+    const report = await evaluateFixture(fixture);
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, ['CORE_AGENT_REPLY_EVENT_INVALID']);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('an inbound receipt cannot substitute for the sole-human Agent reply receipt', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare('DELETE FROM feishu_task_notifications WHERE event_id = ?')
+      .run('core-agent-reply-event-1');
+    comments.close();
+
+    const report = await evaluateFixture(fixture);
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, ['NOTIFICATION_RECEIPT_MISSING']);
+    assert.equal(
+      report.cases[0].failures[0].details.eventId,
+      'core-agent-reply-event-1',
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('an empty inbound decision rejects an unexpected inbound delivery receipt', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare(`
+      INSERT INTO feishu_task_notifications (
+        dedupe_key, event_id, task_id, recipient_id, status, sent_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'unexpected-inbound-notification',
+      'core-comment-event-1',
+      'core-task-1',
+      'ou_requester',
+      'sent',
+      '2026-08-26T10:00:04.000Z',
+      '2026-08-26T10:00:03.000Z',
+    );
+    comments.close();
+
+    const report = await evaluateFixture(fixture);
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, ['INBOUND_NOTIFICATION_RECEIPT_UNEXPECTED']);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('sole-human fallback requires the commenter to own both human Task roles', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const core = new Database(fixture.coreDbPath);
+    core.prepare('UPDATE commitment_tasks SET acceptor_id = ? WHERE id = ?')
+      .run('agent:reviewer', 'core-task-1');
+    core.close();
+
+    const report = await evaluateFixture(fixture);
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, ['SOLE_HUMAN_AUDIENCE_INVALID']);
   } finally {
     fixture.cleanup();
   }
@@ -438,8 +753,17 @@ test('duplicate Core ownership of one Task GUID is rejected instead of choosing 
   const fixture = createFixture();
   try {
     const core = new Database(fixture.coreDbPath);
-    core.prepare('INSERT INTO commitment_tasks (id, title) VALUES (?, ?)')
-      .run('core-task-2', 'Unique closure canary');
+    core.prepare(`
+      INSERT INTO commitment_tasks (
+        id, title, owner_id, acceptor_id, assignee_id
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(
+      'core-task-2',
+      'Unique closure canary',
+      'ou_requester',
+      'ou_owner',
+      'agent:yueran',
+    );
     core.prepare(`
       INSERT INTO commitment_external_links (
         id, task_id, actor_id, backend, external_id, created_at

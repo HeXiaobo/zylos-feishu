@@ -7,6 +7,8 @@ import { feishuNotificationDedupeKey } from './task-notification-adapter.js';
 
 const REPORT_SCHEMA = 'zylos.native-task-closure-gate/v2';
 const LINK_BACKEND = 'feishu-task-v2';
+const CORE_EVENT_OUTBOUND_PREFIX = 'task-comment-core-event:';
+const HUMAN_OPEN_ID = /^ou_[A-Za-z0-9_-]+$/;
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -65,7 +67,7 @@ function logicalCommentId(appId, commentId) {
   return `external-comment:${digest}`;
 }
 
-function parseNotificationDecision(row, { eventId, taskId }) {
+function parseNotificationDecision(row, { eventId, taskId, allowEmpty = false }) {
   if (!row) return null;
   const decision = requireRecord(JSON.parse(row.resultJson), 'Core notification decision');
   if (
@@ -89,10 +91,35 @@ function parseNotificationDecision(row, { eventId, taskId }) {
       ),
     });
   });
-  if (deliveries.length === 0) {
+  if (!allowEmpty && deliveries.length === 0) {
     throw new TypeError('Core notification decision has no human recipients');
   }
   return Object.freeze({ eventId, taskId, deliveries: Object.freeze(deliveries) });
+}
+
+function soleHumanAudience(coreDb, link, inboundActorId) {
+  const subscribers = coreDb.prepare(`
+    SELECT subscriber_id AS subscriberId
+    FROM commitment_task_subscriptions
+    WHERE task_id = ?
+    ORDER BY subscriber_id
+  `).all(link.taskId);
+  const humanAudience = [...new Set([
+    link.ownerId,
+    link.acceptorId,
+    link.assigneeId,
+    ...subscribers.map(({ subscriberId }) => subscriberId),
+  ].filter(identity => HUMAN_OPEN_ID.test(identity ?? '')))];
+  return {
+    valid: HUMAN_OPEN_ID.test(inboundActorId)
+      && link.ownerId === inboundActorId
+      && link.acceptorId === inboundActorId
+      && typeof link.assigneeId === 'string'
+      && link.assigneeId.startsWith('agent:')
+      && humanAudience.length === 1
+      && humanAudience[0] === inboundActorId,
+    humanAudience,
+  };
 }
 
 function openReadonly(dbPath, field) {
@@ -121,7 +148,9 @@ function failedCase(item, code, message, details = {}) {
 
 async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, maxInboundLatencyMs }) {
   const links = coreDb.prepare(`
-    SELECT links.task_id AS taskId, tasks.title AS title
+    SELECT links.task_id AS taskId, tasks.title AS title,
+           tasks.owner_id AS ownerId, tasks.acceptor_id AS acceptorId,
+           tasks.assignee_id AS assigneeId
     FROM commitment_external_links AS links
     JOIN commitment_tasks AS tasks ON tasks.id = links.task_id
     WHERE links.backend = ? AND links.external_id = ?
@@ -230,7 +259,7 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
 
   const outboundRows = commentsDb.prepare(`
     SELECT idempotency_key AS idempotencyKey, reply_to_comment_id AS replyToCommentId,
-           status, comment_id AS commentId
+           content, status, comment_id AS commentId
     FROM feishu_task_comment_outbound
     WHERE app_id = ? AND task_guid = ? AND reply_to_comment_id = ?
   `).all(appId, item.taskGuid, item.commentId);
@@ -263,7 +292,7 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
 
   const coreCommentId = logicalCommentId(appId, item.commentId);
   const commentEvents = coreDb.prepare(`
-    SELECT id AS eventId
+    SELECT id AS eventId, actor_id AS actorId
     FROM commitment_conversation_events
     WHERE task_id = ? AND comment_id = ? AND event_type = 'CommentAdded'
     ORDER BY occurred_at, recorded_at, id
@@ -284,7 +313,7 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
       { coreTaskId: link.taskId, coreCommentId, matches: commentEvents.length },
     );
   }
-  const notificationEventId = commentEvents[0].eventId;
+  let notificationEventId = commentEvents[0].eventId;
   const decisionRow = coreDb.prepare(`
     SELECT result_json AS resultJson
     FROM commitment_notification_decisions
@@ -303,6 +332,7 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
     notificationDecision = parseNotificationDecision(decisionRow, {
       eventId: notificationEventId,
       taskId: link.taskId,
+      allowEmpty: true,
     });
   } catch (error) {
     return failedCase(
@@ -311,6 +341,125 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
       'The persisted Core notification decision is malformed, empty, or mismatched',
       { eventId: notificationEventId, error: String(error?.message ?? error).slice(0, 4_000) },
     );
+  }
+  let notificationOrigin = 'inbound-comment';
+  if (notificationDecision.deliveries.length === 0) {
+    const unexpectedInboundReceipts = commentsDb.prepare(`
+      SELECT dedupe_key AS dedupeKey, recipient_id AS recipientId, status
+      FROM feishu_task_notifications
+      WHERE event_id = ? AND task_id = ?
+      ORDER BY recipient_id, dedupe_key
+    `).all(notificationEventId, link.taskId);
+    if (unexpectedInboundReceipts.length > 0) {
+      return failedCase(
+        item,
+        'INBOUND_NOTIFICATION_RECEIPT_UNEXPECTED',
+        'An empty inbound notification decision cannot have Feishu delivery receipts',
+        { eventId: notificationEventId, unexpectedDeliveries: unexpectedInboundReceipts },
+      );
+    }
+    const audience = soleHumanAudience(coreDb, link, commentEvents[0].actorId);
+    if (!audience.valid) {
+      return failedCase(
+        item,
+        'SOLE_HUMAN_AUDIENCE_INVALID',
+        'An empty inbound notification decision is valid only for the sole acting human',
+        {
+          inboundActorId: commentEvents[0].actorId,
+          assigneeId: link.assigneeId,
+          humanAudience: audience.humanAudience,
+        },
+      );
+    }
+    if (!outbound.idempotencyKey.startsWith(CORE_EVENT_OUTBOUND_PREFIX)) {
+      return failedCase(
+        item,
+        'CORE_AGENT_REPLY_EVENT_ID_MISSING',
+        'The exact outbound reply is not correlated to a canonical Core Agent event',
+        { idempotencyKey: outbound.idempotencyKey },
+      );
+    }
+    const agentReplyEventId = outbound.idempotencyKey.slice(CORE_EVENT_OUTBOUND_PREFIX.length);
+    if (!agentReplyEventId) {
+      return failedCase(
+        item,
+        'CORE_AGENT_REPLY_EVENT_ID_MISSING',
+        'The exact outbound reply has an empty canonical Core Agent event identity',
+        { idempotencyKey: outbound.idempotencyKey },
+      );
+    }
+    const agentReplyEvent = coreDb.prepare(`
+      SELECT id AS eventId, task_id AS taskId, actor_id AS actorId, body,
+             reply_to_comment_id AS replyToCommentId
+      FROM commitment_conversation_events
+      WHERE id = ? AND event_type = 'CommentAdded'
+    `).get(agentReplyEventId);
+    if (
+      !agentReplyEvent
+      || agentReplyEvent.taskId !== link.taskId
+      || agentReplyEvent.actorId !== link.assigneeId
+      || agentReplyEvent.replyToCommentId !== coreCommentId
+      || agentReplyEvent.body !== outbound.content
+    ) {
+      return failedCase(
+        item,
+        'CORE_AGENT_REPLY_EVENT_INVALID',
+        'The exact outbound reply does not match one canonical Core Agent reply event',
+        {
+          expectedEventId: agentReplyEventId,
+          expectedActorId: link.assigneeId,
+          observedEvent: agentReplyEvent ? {
+            eventId: agentReplyEvent.eventId,
+            taskId: agentReplyEvent.taskId,
+            actorId: agentReplyEvent.actorId,
+            replyToCommentId: agentReplyEvent.replyToCommentId,
+            bodyMatchesOutbound: agentReplyEvent.body === outbound.content,
+          } : null,
+        },
+      );
+    }
+    const agentDecisionRow = coreDb.prepare(`
+      SELECT result_json AS resultJson
+      FROM commitment_notification_decisions
+      WHERE event_id = ? AND task_id = ?
+    `).get(agentReplyEventId, link.taskId);
+    if (!agentDecisionRow) {
+      return failedCase(
+        item,
+        'CORE_AGENT_REPLY_NOTIFICATION_DECISION_MISSING',
+        'The canonical Agent reply has no persisted Core notification decision',
+        { eventId: agentReplyEventId, coreTaskId: link.taskId },
+      );
+    }
+    try {
+      notificationDecision = parseNotificationDecision(agentDecisionRow, {
+        eventId: agentReplyEventId,
+        taskId: link.taskId,
+      });
+    } catch (error) {
+      return failedCase(
+        item,
+        'CORE_AGENT_REPLY_NOTIFICATION_DECISION_INVALID',
+        'The canonical Agent reply notification decision is malformed, empty, or mismatched',
+        { eventId: agentReplyEventId, error: String(error?.message ?? error).slice(0, 4_000) },
+      );
+    }
+    if (
+      notificationDecision.deliveries.length !== 1
+      || notificationDecision.deliveries[0].recipientId !== commentEvents[0].actorId
+    ) {
+      return failedCase(
+        item,
+        'CORE_AGENT_REPLY_NOTIFICATION_RECIPIENT_MISMATCH',
+        'The canonical Agent reply must notify exactly the sole human commenter',
+        {
+          expectedRecipientId: commentEvents[0].actorId,
+          observedRecipients: notificationDecision.deliveries.map(({ recipientId }) => recipientId),
+        },
+      );
+    }
+    notificationEventId = agentReplyEventId;
+    notificationOrigin = 'agent-reply';
   }
   const notificationRows = commentsDb.prepare(`
     SELECT dedupe_key AS dedupeKey, recipient_id AS recipientId,
@@ -550,6 +699,7 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
     }),
     notifications: Object.freeze({
       eventId: notificationEventId,
+      origin: notificationOrigin,
       recipients: Object.freeze(notificationDecision.deliveries.map(({ recipientId }) => recipientId)),
       receipts: Object.freeze(notificationRows
         .filter(row => row.status === 'sent' && row.sentAt)
