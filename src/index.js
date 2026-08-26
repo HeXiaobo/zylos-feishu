@@ -77,6 +77,7 @@ import {
 } from './lib/inbound-event-inbox.js';
 import { normalizeInboundMessageEvent } from './lib/inbound-message-event.js';
 import { decideGroupActivation } from './lib/group-activation-policy.js';
+import { decideGroupAccess } from './lib/group-access-policy.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -713,6 +714,13 @@ function updateCursor(chatId, messageId) {
 function resolveGroupConfig(chatId) {
   const groups = config.groups || {};
   return groups[chatId];
+}
+
+function hasExplicitGroupConfig(chatId) {
+  const normalizedChatId = chatId === undefined || chatId === null ? '' : String(chatId);
+  if (resolveGroupConfig(normalizedChatId)) return true;
+  return [...(config.allowed_groups || []), ...(config.smart_groups || [])]
+    .some(group => String(group.chat_id) === normalizedChatId);
 }
 
 /**
@@ -1872,25 +1880,34 @@ async function handleMessage(data) {
   if (chatType === 'group') {
     senderIsOwnerAtIngress = isOwner(senderUserId, senderOpenId);
     const groupPolicy = config.groupPolicy || 'allowlist';
-    if (groupPolicy === 'disabled') {
-      replyToMessage(messageId, "Sorry, group chat is currently disabled.").catch(() => {});
-      console.log(`[feishu] Group policy disabled, ignoring group message from ${senderUserId}`);
-      return;
-    }
-    if (!isGroupAllowed(chatId) && !senderIsOwnerAtIngress) {
-      console.log(`[feishu] Group ${chatId} not allowed by policy, rejecting`);
-      replyToMessage(messageId, "Sorry, I'm not available in this group.").catch(() => {});
-      return;
-    }
-    const memberAccess = await authorizeConfiguredMemberAccess(senderUserId, senderOpenId, sender);
-    if (memberAccess === false) {
-      console.log(`[feishu] Sender ${senderUserId} rejected by configured member access policy in group ${chatId}`);
-      replyToMessage(messageId, "Sorry, you don't have permission to interact with me in this group.").catch(() => {});
-      return;
-    }
-    if (!isSenderAllowedInGroup(chatId, senderUserId, senderOpenId) && !senderIsOwnerAtIngress) {
-      console.log(`[feishu] Sender ${senderUserId} not in group ${chatId} allowFrom, rejecting`);
-      replyToMessage(messageId, "Sorry, you don't have permission to interact with me in this group.").catch(() => {});
+    const groupConfigured = hasExplicitGroupConfig(chatId);
+    const groupAllowed = isGroupAllowed(chatId);
+    const senderAllowedByGroup = isSenderAllowedInGroup(chatId, senderUserId, senderOpenId);
+    const memberAccess = groupPolicy !== 'disabled'
+      && groupAllowed
+      && !groupConfigured
+      && !senderIsOwnerAtIngress
+      ? await authorizeConfiguredMemberAccess(senderUserId, senderOpenId, sender)
+      : null;
+    const access = decideGroupAccess({
+      groupPolicy,
+      groupAllowed,
+      groupConfigured,
+      senderIsOwner: senderIsOwnerAtIngress,
+      senderAllowedByGroup,
+      memberAccessAllowed: memberAccess,
+      explicitActivation: mentionedAtIngress,
+    });
+    if (!access.allowed) {
+      console.log(`[feishu] Group access denied reason=${access.reasonCode} sender=${senderUserId} chat=${chatId}`);
+      if (access.notifySender) {
+        const rejection = access.reasonCode === 'ACCESS_GROUP_DISABLED'
+          ? 'Sorry, group chat is currently disabled.'
+          : access.reasonCode === 'ACCESS_GROUP_NOT_ALLOWED'
+            ? "Sorry, I'm not available in this group."
+            : "Sorry, you don't have permission to interact with me in this group.";
+        replyToMessage(messageId, rejection).catch(() => {});
+      }
       return;
     }
   }
@@ -2108,24 +2125,26 @@ async function handleMessage(data) {
       logText = text;
     }
 
-    // Group access is the intersection of groupPolicy, per-group allowFrom,
-    // and the configured audited member policy when present.
+    // Group access was already composed at ingress. Explicit groups own their
+    // sender policy; passive Smart traffic remains task-intake gated here.
 
-    const taskInput = await handleAuthorizedTaskInput({
-      message,
-      text: explicitTaskText,
-      actorId: senderOpenId || senderUserId,
-      chatType,
-      chatId,
-      senderUserId,
-      senderOpenId,
-      messageId,
-      timestamp: data._timestamp || null,
-      mentions,
-      threadId,
-      rootId,
-      parentId,
-    });
+    const taskInput = groupActivation.allowTaskIntake
+      ? await handleAuthorizedTaskInput({
+        message,
+        text: explicitTaskText,
+        actorId: senderOpenId || senderUserId,
+        chatType,
+        chatId,
+        senderUserId,
+        senderOpenId,
+        messageId,
+        timestamp: data._timestamp || null,
+        mentions,
+        threadId,
+        rootId,
+        parentId,
+      })
+      : { handled: false, route: null };
     if (taskInput.handled) return;
     const taskRoute = taskInput.route;
 
@@ -2142,7 +2161,7 @@ async function handleMessage(data) {
     const contextMessages = await getGroupContext(chatId, messageId);
     updateCursor(chatId, messageId);
 
-    if (!assistantRequest) {
+    if (!assistantRequest && groupActivation.showImmediateResponse) {
       addTypingIndicator(messageId);
     }
 
@@ -2164,6 +2183,7 @@ async function handleMessage(data) {
     const threadRootId = threadId ? rootId : null;
     const groupRejectReply = () => {
       removeTypingIndicator(messageId);
+      if (!groupActivation.showImmediateResponse) return;
       if (assistantRequest) {
         failConversationResponse(assistantRequest).then(handled => {
           if (!handled) {
@@ -2179,7 +2199,9 @@ async function handleMessage(data) {
 
     // Handle images (lazy download: only for messages being sent to C4)
     if (imageKeys.length > 0) {
-      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+      assistantRequest = groupActivation.showImmediateResponse
+        ? await openConversationResponse({ chatId, chatType, messageId, rootId, parentId })
+        : null;
       if (assistantRequest) removeTypingIndicator(messageId);
       const mediaPaths = [];
       for (const imgKey of imageKeys) {
@@ -2201,7 +2223,9 @@ async function handleMessage(data) {
     }
 
     if (fileKey) {
-      assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
+      assistantRequest = groupActivation.showImmediateResponse
+        ? await openConversationResponse({ chatId, chatType, messageId, rootId, parentId })
+        : null;
       if (assistantRequest) removeTypingIndicator(messageId);
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       let localPath = null;
@@ -2227,7 +2251,7 @@ async function handleMessage(data) {
       groupName: getGroupName(chatId),
       smartHint: groupActivation.smartMode,
     });
-    const workIntakeEnvelope = taskRoute?.kind === 'task-intent'
+    const workIntakeEnvelope = taskRoute?.kind === 'task-intent' || !groupActivation.allowTaskIntake
       ? null
       : buildNaturalWorkIntakeEnvelope({
         message,
@@ -2238,7 +2262,7 @@ async function handleMessage(data) {
       });
     if (workIntakeEnvelope) {
       assistantRequest = buildAssistantRequest(messageId);
-    } else if (taskRoute?.kind !== 'task-intent') {
+    } else if (taskRoute?.kind !== 'task-intent' && groupActivation.showImmediateResponse) {
       assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
       if (assistantRequest) removeTypingIndicator(messageId);
     }

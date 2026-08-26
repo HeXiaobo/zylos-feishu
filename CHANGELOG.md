@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gate install and upgrade on Core's native Task mapper protocol, and establish
   the Task v2 server-side subscription once through the shared WebSocket/webhook
   startup gate before either transport can receive events.
+- Restore zero-visible Smart-group evaluation: passive authorization failures no longer emit permission replies or typing/card placeholders, and terminal runtime `[SKIP]` decisions are suppressed even when preceded by explanatory text.
+- Treat an explicitly configured group's `allowFrom` policy as authoritative across tenant boundaries, while retaining the global member policy for direct messages and unconfigured open groups.
+- Keep passive Smart-group messages out of both explicit task handling and natural-language WorkIntake unless the bot is exactly @mentioned.
 - Persist response-card delivery intent before sending, retry ambiguous Feishu outcomes with the same UUID, and use a single idempotent plain fallback only after explicit card rejection.
 - Derive proactive card identity from Core's stable `C4_DELIVERY_ID`; sends without a durable identity degrade safely instead of inventing a new UUID on every process invocation.
 - Compact terminal response-stream state to a hash-only tombstone so full answers and public work summaries are not retained indefinitely.
