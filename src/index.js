@@ -1146,14 +1146,18 @@ const taskCardEventHandlers = createTaskCardEventHandlers({
 });
 
 let taskV2StatusEventIngestor = null;
+function openTaskV2StatusInbox() {
+  return createTaskV2StatusInbox({
+    directory: path.join(DATA_DIR, 'task-v2-status-inbox'),
+  });
+}
+
 function handleTaskV2StatusEvent(event) {
   if (!taskV2Enabled) throw new Error('Task v2 capability is disabled');
   if (!taskV2StatusEventIngestor) {
     taskV2StatusEventIngestor = createTaskV2StatusEventIngestor({
       appId: process.env.FEISHU_APP_ID,
-      inbox: createTaskV2StatusInbox({
-        directory: path.join(DATA_DIR, 'task-v2-status-inbox'),
-      }),
+      inbox: openTaskV2StatusInbox(),
     });
   }
   return taskV2StatusEventIngestor.handle(event);
@@ -2654,6 +2658,7 @@ if (!creds.app_id || !creds.app_secret) {
       : undefined;
     await startTaskV2Transport({
       enabled: taskV2Enabled,
+      openStatusInbox: taskV2Enabled ? openTaskV2StatusInbox : undefined,
       subscription,
       start: connectionMode === 'webhook'
         ? () => startWebhook(creds)

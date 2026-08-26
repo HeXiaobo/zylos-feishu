@@ -48,12 +48,27 @@ export function createTaskV2SubscriptionAdapter({ client } = {}) {
 }
 
 /** Fail-closed startup gate shared by every Task v2 event transport. */
-export async function startTaskV2Transport({ enabled, subscription, start } = {}) {
+export async function startTaskV2Transport({
+  enabled,
+  openStatusInbox,
+  subscription,
+  start,
+} = {}) {
   if (typeof enabled !== 'boolean') throw new TypeError('enabled must be a boolean');
+  if (enabled && typeof openStatusInbox !== 'function') {
+    throw new TypeError('openStatusInbox must be a function');
+  }
   if (enabled && typeof subscription?.subscribe !== 'function') {
     throw new TypeError('subscription.subscribe must be a function');
   }
   if (typeof start !== 'function') throw new TypeError('start must be a function');
-  if (enabled) await subscription.subscribe();
+  if (enabled) {
+    const inbox = openStatusInbox();
+    if (!inbox || typeof inbox.close !== 'function') {
+      throw new TypeError('openStatusInbox must return an inbox with close');
+    }
+    inbox.close();
+    await subscription.subscribe();
+  }
   return start();
 }

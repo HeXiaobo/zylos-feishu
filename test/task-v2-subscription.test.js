@@ -65,17 +65,23 @@ test('Task v2 subscription Adapter coalesces concurrent startup attempts', async
 });
 
 test('Task v2 transport subscribes before starting a webhook or WebSocket transport', async () => {
-  const order = [];
+  for (const mode of ['webhook', 'websocket']) {
+    const order = [];
 
-  await startTaskV2Transport({
-    enabled: true,
-    subscription: {
-      async subscribe() { order.push('subscribe'); },
-    },
-    async start() { order.push('start'); },
-  });
+    await startTaskV2Transport({
+      enabled: true,
+      openStatusInbox() {
+        order.push('open');
+        return { close() { order.push('close'); } };
+      },
+      subscription: {
+        async subscribe() { order.push('subscribe'); },
+      },
+      async start() { order.push(`start:${mode}`); },
+    });
 
-  assert.deepEqual(order, ['subscribe', 'start']);
+    assert.deepEqual(order, ['open', 'close', 'subscribe', `start:${mode}`]);
+  }
 });
 
 test('Task v2 transport stays stopped when subscription fails', async () => {
@@ -84,6 +90,7 @@ test('Task v2 transport stays stopped when subscription fails', async () => {
 
   await assert.rejects(startTaskV2Transport({
     enabled: true,
+    openStatusInbox() { return { close() {} }; },
     subscription: {
       async subscribe() { throw outage; },
     },
@@ -91,4 +98,27 @@ test('Task v2 transport stays stopped when subscription fails', async () => {
   }), outage);
 
   assert.equal(starts, 0);
+});
+
+test('Task v2 transport does not subscribe or start when status inbox preflight fails', async () => {
+  for (const failureStage of ['open', 'close']) {
+    const outage = new Error(`status inbox ${failureStage} failed`);
+    let subscriptions = 0;
+    let starts = 0;
+
+    await assert.rejects(startTaskV2Transport({
+      enabled: true,
+      openStatusInbox() {
+        if (failureStage === 'open') throw outage;
+        return { close() { throw outage; } };
+      },
+      subscription: {
+        async subscribe() { subscriptions += 1; },
+      },
+      async start() { starts += 1; },
+    }), outage);
+
+    assert.equal(subscriptions, 0);
+    assert.equal(starts, 0);
+  }
 });

@@ -203,13 +203,16 @@ requires `COMMITMENT_FEISHU_TASK_V2_ENABLED=1`; comment sync additionally
 requires `FEISHU_TASK_COMMENTS_ENABLED=1`.
 
 When Task v2 status sync is enabled, the common WebSocket/Webhook startup gate
-first creates the Task v2 subscription relation with the configured App
-identity and fails closed before starting either transport if that call fails.
-One successful relation is reused within the process instead of issuing
-duplicate subscription calls. App identity receives real-time changes only for
-Tasks for which that App is responsible; personally followed user Tasks are
-outside the managed real-time SLA. The legacy `task.task.updated_v1` handler
-remains registered only for the migration window.
+first opens and closes `task-v2-status-inbox/status-inbox.db`. This preflight
+loads the native SQLite binding and runs schema, legacy migration,
+dual-writer-evidence, and filesystem permission checks before any server-side
+subscription or event transport can start. It then creates the Task v2
+subscription relation with the configured App identity and fails closed if
+either phase fails. One successful relation is reused within the process
+instead of issuing duplicate subscription calls. App identity receives
+real-time changes only for Tasks for which that App is responsible; personally
+followed user Tasks are outside the managed real-time SLA. The legacy
+`task.task.updated_v1` handler remains registered only for the migration window.
 The installed Commitment Core must provide
 `scripts/external-task-adapter.js#mapExternalTaskEvent`; Feishu delegates
 native completion semantics to that mapper and rejects any result other than
@@ -228,6 +231,14 @@ same remote Task is completed, the exact durable status settlement returned
 `submitted_for_review`, its Core command receipt exists, and the linked Core
 Task has exactly one review submission and zero acceptance events. This gate
 does not accept a Task on the reviewer's behalf.
+
+For the first SQLite inbox rollout, keep the Task v2 projection worker stopped
+and start exactly one Feishu process with Task v2 enabled. Let that process
+finish the preflight migration before starting the projection worker. To roll
+back to an older artifact, first disable
+`COMMITMENT_FEISHU_TASK_V2_ENABLED` and stop the reverse-status/projection
+worker. That rollback suspends the managed native-status SLA; never leave
+reverse-status enabled while an older artifact can write the legacy inbox.
 
 Do not start projection implicitly. An operator must first register one
 history policy in Commitment Core (`from_now` for a new business canary;

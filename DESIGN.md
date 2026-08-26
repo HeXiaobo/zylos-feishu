@@ -340,9 +340,12 @@ mutate Core or depend on Core availability.
 
 The Feishu App needs `task:task:read` and `task:task:write`, plus the
 `task.task.update_user_access_v2` event subscription. Before starting either
-the WebSocket or webhook event transport, their common startup gate calls the
-Task v2 subscription API with the same bot identity and fails closed if that
-relation cannot be established. Successful subscription is memoized within
+the WebSocket or webhook event transport, their common startup gate opens and
+closes the production `status-inbox.db`. That preflight loads the native SQLite
+binding and executes schema creation, legacy migration, dual-writer evidence,
+and permission checks. Only after it succeeds does the gate call the Task v2
+subscription API with the same bot identity; either failure prevents both the
+subscription and transport startup. Successful subscription is memoized within
 the process so concurrent or repeated startup attempts do not duplicate it.
 Bot identity covers only Tasks for which the current App is responsible; a
 user's personally followed Tasks are not part of this managed real-time SLA.
@@ -356,6 +359,14 @@ status event. The legacy
 `task.task.updated_v1` handler remains registered during migration. F3 does
 not call comment APIs;
 `task:comment:read` and `task:comment:write` belong to the later comment slice.
+
+The first SQLite-inbox deployment is deliberately single-writer during
+migration: keep the Task v2 projection worker stopped, start one Feishu process
+with the feature enabled, wait for startup preflight to complete, and only then
+start the projection worker. Rollback to an older artifact requires disabling
+`COMMITMENT_FEISHU_TASK_V2_ENABLED` and stopping reverse-status/projection
+processing first. This explicitly drops the managed status SLA during rollback;
+an older artifact must never remain active as a legacy inbox writer.
 
 ---
 
