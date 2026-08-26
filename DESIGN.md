@@ -509,6 +509,41 @@ one durable C4 receipt. The reply endpoint is opaque and platform-owned;
 exact Task v2 `reply_to_comment_id`. Agent notification identities are routed
 to C4 and are never passed to Feishu as fake `open_id` values.
 
+### 4.6 Native Task closure acceptance gate
+
+`evaluateNativeTaskClosure(...)` is the read-only acceptance Interface for a
+managed Task comment closure. It opens the Core and Task comment SQLite files
+in read-only mode and accepts an injected remote Reader Adapter. The live CLI
+uses the SDK Reader; tests use an offline fixture Reader and never call Feishu.
+
+Every case must provide the exact Task GUID, inbound comment ID, Core
+notification event ID, and expected recipient IDs. The gate proves all of the
+following before it passes:
+
+- the GUID and linked Core Task have a one-to-one `feishu-task-v2`
+  `ExternalLink`;
+- the exact comment arrived through the realtime event source within the
+  configured latency SLO and reached `processed`;
+- exactly one sent outbound comment targets that inbound comment;
+- every expected recipient has a sent notification receipt for the exact Core
+  event and Task;
+- the remote Task still exists, its GUID/title/Core marker match, no same-title
+  lookalike is visible, and both remote comments belong to the same Task;
+- the remote Agent comment has the exact `reply_to_comment_id`.
+
+Failures are returned as stable codes in
+`zylos.native-task-closure-gate/v1`; one poisoned case does not stop the
+remaining cases. The CLI emits one JSON report and exits `0` for pass, `1` for
+a gate failure, or `2` for invalid input/runtime assembly:
+
+```bash
+npm run task-comments:gate -- --input /absolute/path/gate-input.json
+```
+
+For deterministic offline verification only, supply
+`--remote-fixture /absolute/path/remote.json`. The gate never writes either
+SQLite database and its SDK Adapter exposes only Task/comment read operations.
+
 ---
 
 ## 5. Configuration
