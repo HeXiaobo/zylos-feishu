@@ -666,6 +666,20 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
       },
     );
   }
+  if (
+    remoteOutbound.comment?.creator?.type !== 'app'
+    || remoteOutbound.comment?.creator?.id !== appId
+  ) {
+    return failedCase(
+      item,
+      'REMOTE_REPLY_CREATOR_MISMATCH',
+      'Agent Feishu reply was not authored by the configured App identity',
+      {
+        expectedCreator: { id: appId, type: 'app' },
+        observedCreator: remoteOutbound.comment?.creator ?? null,
+      },
+    );
+  }
   if (remoteOutbound.comment?.replyToCommentId !== item.commentId) {
     return failedCase(
       item,
@@ -675,6 +689,14 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
         expectedReplyToCommentId: item.commentId,
         observedReplyToCommentId: remoteOutbound.comment?.replyToCommentId ?? null,
       },
+    );
+  }
+  if (remoteOutbound.comment?.content !== outbound.content) {
+    return failedCase(
+      item,
+      'REMOTE_REPLY_CONTENT_MISMATCH',
+      'Agent Feishu reply content does not match the durable outbound receipt',
+      { contentMatchesOutbound: false },
     );
   }
 

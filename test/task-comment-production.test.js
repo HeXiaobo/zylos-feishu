@@ -246,32 +246,46 @@ test('outbound Task reply records an Agent comment in Core before projecting by 
   const order = [];
   const commands = [];
   const replies = [];
+  const receipts = new Map();
   const currentComments = new Map();
+  const instants = [
+    '2026-08-25T10:05:00.000Z',
+    '2026-08-25T10:05:01.000Z',
+  ];
   const outbound = createCoreFirstTaskCommentReply({
     appId: 'cli_app',
-    clock: () => '2026-08-25T10:05:00.000Z',
+    clock: () => instants.shift(),
     taskMapping: {
       async resolve() {
         return { taskId: 'core-task-1', wakeTarget: { agentId: 'agent:yueran' } };
       },
     },
-    conversation: {
+    commentQuery: {
       query({ taskId, commentId }) {
         return currentComments.get(`${taskId}:${commentId}`) ?? null;
       },
+    },
+    conversation: {
       record(command) {
         order.push('core');
         commands.push(command);
+        const existing = receipts.get(command.idempotencyKey);
+        if (existing) {
+          assert.deepEqual(command, existing.command);
+          return existing.result;
+        }
         const comment = {
           actorId: command.actorId,
           body: command.body,
           replyToCommentId: command.replyToCommentId,
           lastEventId: 'core-agent-comment-event-1',
+          occurredAt: command.occurredAt,
         };
         const result = {
           event: { id: 'core-agent-comment-event-1' },
           comment,
         };
+        receipts.set(command.idempotencyKey, { command, result });
         currentComments.set(`${command.taskId}:${command.commentId}`, comment);
         return result;
       },
@@ -293,8 +307,8 @@ test('outbound Task reply records an Agent comment in Core before projecting by 
   const first = await outbound.reply(request);
   const replay = await outbound.reply(request);
 
-  assert.deepEqual(order, ['core', 'feishu', 'feishu']);
-  assert.equal(commands.length, 1);
+  assert.deepEqual(order, ['core', 'feishu', 'core', 'feishu']);
+  assert.equal(commands.length, 2);
   assert.equal(commands[0].type, 'AddComment');
   assert.equal(commands[0].taskId, 'core-task-1');
   assert.equal(commands[0].actorId, 'agent:yueran');
@@ -308,6 +322,83 @@ test('outbound Task reply records an Agent comment in Core before projecting by 
   ]);
   assert.equal(first.coreEventId, 'core-agent-comment-event-1');
   assert.equal(replay.coreEventId, 'core-agent-comment-event-1');
+});
+
+test('a stale concurrent first-read recovers the winning Core timestamp through the coordinator', async () => {
+  const receipts = new Map();
+  let persistedComment = null;
+  let queryCalls = 0;
+  let recordCalls = 0;
+  let projections = 0;
+  const instants = [
+    '2026-08-25T10:05:00.000Z',
+    '2026-08-25T10:05:01.000Z',
+  ];
+  const outbound = createCoreFirstTaskCommentReply({
+    appId: 'cli_app',
+    clock: () => instants.shift(),
+    taskMapping: {
+      async resolve() {
+        return { taskId: 'core-task-1', wakeTarget: { agentId: 'agent:yueran' } };
+      },
+    },
+    commentQuery: {
+      query() {
+        queryCalls += 1;
+        // Simulate two processes reading before the first transaction commits.
+        if (queryCalls <= 2) return null;
+        return persistedComment;
+      },
+    },
+    conversation: {
+      record(command) {
+        recordCalls += 1;
+        const existing = receipts.get(command.idempotencyKey);
+        if (existing) {
+          if (existing.command.occurredAt !== command.occurredAt) {
+            const error = new Error('same key with a raced timestamp');
+            error.code = 'IDEMPOTENCY_CONFLICT';
+            throw error;
+          }
+          return existing.result;
+        }
+        persistedComment = {
+          actorId: command.actorId,
+          body: command.body,
+          replyToCommentId: command.replyToCommentId,
+          lastEventId: 'core-agent-comment-event-race',
+          occurredAt: command.occurredAt,
+        };
+        const result = {
+          event: { id: 'core-agent-comment-event-race' },
+          comment: persistedComment,
+        };
+        receipts.set(command.idempotencyKey, { command, result });
+        return result;
+      },
+    },
+    replyAdapter: {
+      async reply() {
+        projections += 1;
+        return { created: projections === 1, commentId: 'comment-agent-race' };
+      },
+    },
+  });
+  const request = {
+    taskGuid: 'task-guid-1',
+    replyToCommentId: 'comment-human-1',
+    content: '并发回复只应形成一个 Core 事件。',
+  };
+
+  const first = await outbound.reply(request);
+  const raced = await outbound.reply(request);
+
+  assert.equal(first.coreEventId, 'core-agent-comment-event-race');
+  assert.equal(raced.coreEventId, first.coreEventId);
+  assert.equal(receipts.size, 1);
+  assert.equal(recordCalls, 3);
+  assert.equal(queryCalls, 3);
+  assert.equal(projections, 2);
 });
 
 test('Agent notifications enter C4 as idempotent no-reply system messages', async () => {

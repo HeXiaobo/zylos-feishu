@@ -357,7 +357,7 @@ test('outbound reply ledger prevents duplicate replies and suppresses the exact 
           return foundComment({
             id: 'comment-agent',
             content: request.content,
-            creator: { id: 'app-bot' },
+            creator: { id: APP_ID, type: 'app' },
             replyToCommentId: 'comment-human',
           });
         },
@@ -390,7 +390,13 @@ test('outbound reply ledger prevents duplicate replies and suppresses the exact 
       store: harness.store,
       commentApi: {
         async getComment() {
-          return { kind: 'found', comment: foundComment({ id: 'comment-agent' }) };
+          return {
+            kind: 'found',
+            comment: foundComment({
+              id: 'comment-agent',
+              creator: { id: APP_ID, type: 'app' },
+            }),
+          };
         },
       },
       taskMapping: {
@@ -437,6 +443,7 @@ test('worker adopts a matching echo while outbound delivery is still pending', a
             comment: foundComment({
               id: 'comment-agent-racing',
               content: 'Answer racing with the event stream.',
+              creator: { id: APP_ID, type: 'app' },
               replyToCommentId: 'comment-human',
             }),
           };
@@ -468,6 +475,66 @@ test('worker adopts a matching echo while outbound delivery is still pending', a
       idempotencyKey: 'agent-reply-racing-1',
       commentId: 'comment-agent-racing',
     }).status, 'sent');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('worker never adopts a human same-content comment as an outbound Agent echo', async () => {
+  const harness = createHarness();
+  try {
+    harness.store.beginOutbound({
+      appId: APP_ID,
+      taskGuid: 'task-guid-1',
+      replyToCommentId: 'comment-human',
+      content: 'A shared answer.',
+      idempotencyKey: 'agent-reply-human-spoof-1',
+    });
+    await enqueueHandler(harness.store)(event({
+      event_id: 'evt-human-same-content',
+      comment_id: 'comment-human-same-content',
+    }));
+    let coreCalls = 0;
+    let wakes = 0;
+    const worker = createTaskCommentWorker({
+      appId: APP_ID,
+      store: harness.store,
+      commentApi: {
+        async getComment() {
+          return {
+            kind: 'found',
+            comment: foundComment({
+              id: 'comment-human-same-content',
+              content: 'A shared answer.',
+              creator: { id: 'ou_attacker', type: 'user' },
+              replyToCommentId: 'comment-human',
+            }),
+          };
+        },
+      },
+      taskMapping: {
+        async resolve() {
+          return { taskId: 'core-task-1', wakeTarget: { agentId: 'agent:yueran' } };
+        },
+      },
+      conversation: {
+        async record() {
+          coreCalls += 1;
+          return { event: { id: 'core-human-same-content-event' } };
+        },
+      },
+      async wakeAgent() { wakes += 1; },
+      workerId: 'worker-human-same-content',
+    });
+
+    const result = await worker.processOnce();
+    assert.equal(result.results[0].outcome, 'recorded');
+    assert.equal(coreCalls, 1);
+    assert.equal(wakes, 1);
+    assert.equal(harness.store.queryOutbound({
+      appId: APP_ID,
+      idempotencyKey: 'agent-reply-human-spoof-1',
+    }).status, 'pending');
   } finally {
     harness.cleanup();
   }

@@ -12,15 +12,19 @@ export async function loadTaskCommentReplyCoreDependencies({
   importModule = specifier => import(specifier),
 } = {}) {
   const zylosDir = env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-  const specifier = pathToFileURL(path.join(
-    zylosDir,
-    '.claude/skills/commitment-core/scripts/core.js',
-  )).href;
-  const coreModule = await importModule(specifier);
+  const coreScripts = path.join(zylosDir, '.claude/skills/commitment-core/scripts');
+  const [coreModule, coordinatorModule] = await Promise.all([
+    importModule(pathToFileURL(path.join(coreScripts, 'core.js')).href),
+    importModule(pathToFileURL(path.join(coreScripts, 'task-comment-coordinator.js')).href),
+  ]);
   return Object.freeze({
     openCore: requireFunction(
       coreModule?.openCommitmentCore,
       'installed Commitment Core.openCommitmentCore',
+    ),
+    createCoordinator: requireFunction(
+      coordinatorModule?.createTaskCommentCoordinator,
+      'installed Commitment Core.createTaskCommentCoordinator',
     ),
   });
 }

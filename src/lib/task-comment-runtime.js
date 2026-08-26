@@ -53,6 +53,10 @@ function errorDetail(error) {
   return String(error?.message ?? error ?? 'unknown task comment worker error').slice(0, 4_000);
 }
 
+function isCommentFromApp(comment, appId) {
+  return comment?.creator?.type === 'app' && comment.creator.id === appId;
+}
+
 export function createTaskCommentWorker({
   appId,
   store,
@@ -100,16 +104,24 @@ export function createTaskCommentWorker({
         error.retryable = false;
         throw error;
       }
-      const outbound = store.isOutboundComment({
-        appId: normalizedAppId,
-        commentId: comment.id,
-      }) || store.adoptOutboundComment({
-        appId: normalizedAppId,
-        taskGuid: entry.taskGuid,
-        replyToCommentId: comment.replyToCommentId,
-        content: comment.content,
-        commentId: comment.id,
-      });
+      if (comment.resourceType && comment.resourceType !== 'task') {
+        const error = new Error('Task v2 comment belongs to a non-Task resource');
+        error.retryable = false;
+        throw error;
+      }
+      const appAuthored = isCommentFromApp(comment, normalizedAppId);
+      const outbound = appAuthored && (
+        store.isOutboundComment({
+          appId: normalizedAppId,
+          commentId: comment.id,
+        }) || store.adoptOutboundComment({
+          appId: normalizedAppId,
+          taskGuid: entry.taskGuid,
+          replyToCommentId: comment.replyToCommentId,
+          content: comment.content,
+          commentId: comment.id,
+        })
+      );
       if (outbound) {
         store.recordObserved({
           appId: normalizedAppId,
@@ -118,11 +130,6 @@ export function createTaskCommentWorker({
           updatedAt: comment.updatedAt,
         });
         return { outcome: 'echo_suppressed', commentId: comment.id };
-      }
-      if (comment.resourceType && comment.resourceType !== 'task') {
-        const error = new Error('Task v2 comment belongs to a non-Task resource');
-        error.retryable = false;
-        throw error;
       }
       const commandType = comment.updatedAt === comment.createdAt
         ? 'AddComment'

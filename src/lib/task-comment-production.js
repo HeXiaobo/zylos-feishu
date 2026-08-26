@@ -98,27 +98,25 @@ export function taskCommentReplyIdempotencyKey({ appId, taskGuid, replyToComment
 export function createCoreFirstTaskCommentReply({
   appId,
   taskMapping,
+  commentQuery,
   conversation,
   replyAdapter,
   clock = () => new Date(),
 }) {
   const normalizedAppId = requireText(appId, 'Core-first Task comment appId');
   requireFunction(taskMapping?.resolve, 'Task comment mapping.resolve');
-  requireFunction(conversation?.query, 'Core conversation.query');
+  requireFunction(commentQuery?.query, 'Core comment query.query');
   requireFunction(conversation?.record, 'Core conversation.record');
   requireFunction(replyAdapter?.reply, 'Task comment reply adapter.reply');
   requireFunction(clock, 'Core-first Task comment clock');
 
-  function verifyExisting(existing, expected) {
-    const comment = requireRecord(existing, 'existing Core Agent comment');
-    for (const field of ['actorId', 'body', 'replyToCommentId']) {
-      if (comment[field] !== expected[field]) {
-        const error = new Error(`existing Core Agent comment has conflicting ${field}`);
-        error.code = 'IDEMPOTENCY_CONFLICT';
-        throw error;
-      }
-    }
-    return requireText(comment.lastEventId, 'existing Core Agent comment lastEventId');
+  function persistedOccurredAt(taskId, commentId) {
+    const existing = commentQuery.query({ taskId, commentId });
+    if (!existing) return null;
+    return canonicalInstant(
+      requireRecord(existing, 'existing Core Agent comment').occurredAt,
+      'existing Core Agent comment occurredAt',
+    );
   }
 
   return Object.freeze({
@@ -163,28 +161,33 @@ export function createCoreFirstTaskCommentReply({
         body: normalized.content,
         replyToCommentId,
       };
-      let existing = conversation.query({ taskId, commentId });
-      let coreEventId;
-      if (existing) {
-        coreEventId = verifyExisting(existing, expected);
-      } else {
-        try {
-          const result = await conversation.record({
-            type: 'AddComment',
-            taskId,
-            commentId,
-            ...expected,
-            occurredAt: canonicalInstant(clock(), 'Core-first Task comment clock result'),
-            idempotencyKey: `${coreKey}:core`,
-          });
-          coreEventId = requireText(result?.event?.id, 'Core Agent comment event ID');
-        } catch (error) {
-          if (error?.code !== 'IDEMPOTENCY_CONFLICT') throw error;
-          existing = conversation.query({ taskId, commentId });
-          if (!existing) throw error;
-          coreEventId = verifyExisting(existing, expected);
-        }
+      const occurredAt = persistedOccurredAt(taskId, commentId)
+        ?? canonicalInstant(clock(), 'Core-first Task comment clock result');
+      // Always enter the coordinator, including on retry. Commitment Core's
+      // receipt returns the same event for this stable command, while the
+      // coordinator can replay a persisted notification decision whose first
+      // ledger publication failed.
+      const command = {
+        type: 'AddComment',
+        taskId,
+        commentId,
+        ...expected,
+        occurredAt,
+        idempotencyKey: `${coreKey}:core`,
+      };
+      let result;
+      try {
+        result = await conversation.record(command);
+      } catch (error) {
+        if (error?.code !== 'IDEMPOTENCY_CONFLICT') throw error;
+        const winningOccurredAt = persistedOccurredAt(taskId, commentId);
+        if (!winningOccurredAt || winningOccurredAt === occurredAt) throw error;
+        // A concurrent first delivery may have won after this process read an
+        // empty snapshot. Retry the coordinator with that persisted timestamp;
+        // any other fingerprint conflict still fails closed in Core.
+        result = await conversation.record({ ...command, occurredAt: winningOccurredAt });
       }
+      const coreEventId = requireText(result?.event?.id, 'Core Agent comment event ID');
       const projection = await replyAdapter.reply({
         ...normalized,
         idempotencyKey: `task-comment-core-event:${coreEventId}`,

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Route short-lived Agent replies through the canonical Task comment
+  coordinator before projecting them to Feishu, so exact-parent human
+  notification decisions are persisted and delivered idempotently instead of
+  being bypassed by the C4 send path; retries also reuse the first Core comment
+  timestamp (including concurrent first-delivery races) so notification and
+  transport recovery remain valid after restart.
+- Require exact configured-App authorship before adopting an ambiguous Task
+  comment echo, and independently verify App author, parent, and content in the
+  native closure gate so a human same-content comment cannot produce a false
+  Agent-reply receipt.
 - Add a live, read-only native completion gate that proves one exact Task v2
   completion event settled durably, produced the expected Core command receipt,
   left the linked Core Task in review, and did not auto-accept it.

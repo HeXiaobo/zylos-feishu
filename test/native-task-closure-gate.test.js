@@ -158,13 +158,14 @@ function createFixture() {
   );
   comments.prepare(`
     INSERT INTO feishu_task_comment_outbound (
-      app_id, idempotency_key, task_guid, reply_to_comment_id, status, comment_id
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      app_id, idempotency_key, task_guid, reply_to_comment_id, content, status, comment_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     APP_ID,
     'agent-reply-1',
     'task-guid-1',
     'comment-human-1',
+    'Closed.',
     'sent',
     'comment-agent-1',
   );
@@ -192,7 +193,9 @@ function createFixture() {
   };
 }
 
-function createRemoteReader() {
+function createRemoteReader({
+  agentReplyCreator = { id: APP_ID, type: 'app' },
+} = {}) {
   return {
     async getTask() {
       return {
@@ -211,12 +214,16 @@ function createRemoteReader() {
       const comment = commentId === 'comment-human-1'
         ? {
             id: 'comment-human-1',
+            content: 'Please close this canary.',
+            creator: { id: 'ou_requester', type: 'user' },
             resourceType: 'task',
             resourceId: 'task-guid-1',
             replyToCommentId: null,
           }
         : {
             id: 'comment-agent-1',
+            content: 'Closed.',
+            creator: agentReplyCreator,
             resourceType: 'task',
             resourceId: 'task-guid-1',
             replyToCommentId: 'comment-human-1',
@@ -226,7 +233,9 @@ function createRemoteReader() {
   };
 }
 
-function createLiveRemoteReader() {
+function createLiveRemoteReader({
+  agentReplyCreator = { id: APP_ID, type: 'app' },
+} = {}) {
   return createSdkNativeTaskGateReader({
     client: {
       task: {
@@ -263,7 +272,9 @@ function createLiveRemoteReader() {
                 data: { comment: {
                   id: commentId,
                   content: agentReply ? 'Closed.' : 'Please close this canary.',
-                  creator: { id: agentReply ? 'ou_bot' : 'ou_requester', type: 'user' },
+                  creator: agentReply
+                    ? agentReplyCreator
+                    : { id: 'ou_requester', type: 'user' },
                   created_at: '2026-08-26T10:00:00.000Z',
                   updated_at: '2026-08-26T10:00:00.000Z',
                   resource_type: 'task',
@@ -364,13 +375,14 @@ function addSecondClosure(fixture) {
   );
   comments.prepare(`
     INSERT INTO feishu_task_comment_outbound (
-      app_id, idempotency_key, task_guid, reply_to_comment_id, status, comment_id
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      app_id, idempotency_key, task_guid, reply_to_comment_id, content, status, comment_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     APP_ID,
     'agent-reply-2',
     'task-guid-2',
     'comment-human-2',
+    'Closed second.',
     'sent',
     'comment-agent-2',
   );
@@ -968,6 +980,22 @@ test('an exact reply without a sent receipt reports its outbound ledger status',
   }
 });
 
+test('a human same-content reply cannot impersonate the App Agent in the live gate', async () => {
+  const fixture = createFixture();
+  try {
+    const report = await evaluateFixture(fixture, {
+      remoteReader: createRemoteReader({
+        agentReplyCreator: { id: 'ou_attacker', type: 'user' },
+      }),
+    });
+
+    assert.equal(report.passed, false);
+    assert.deepEqual(report.failureCodes, ['REMOTE_REPLY_CREATOR_MISMATCH']);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test('multiple sent replies to one inbound comment fail as a duplicate closure', async () => {
   const fixture = createFixture();
   try {
@@ -1282,6 +1310,29 @@ test('the remote Agent reply must point to the exact inbound comment', async () 
   }
 });
 
+test('the remote App reply content must match the durable outbound receipt', async () => {
+  const fixture = createFixture();
+  try {
+    const remoteReader = createRemoteReader();
+    const originalGetComment = remoteReader.getComment;
+    remoteReader.getComment = async (request) => {
+      const result = await originalGetComment(request);
+      if (request.commentId !== 'comment-agent-1') return result;
+      return {
+        kind: 'found',
+        comment: { ...result.comment, content: 'Different remote content.' },
+      };
+    };
+
+    const report = await evaluateFixture(fixture, { remoteReader });
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, ['REMOTE_REPLY_CONTENT_MISMATCH']);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test('one remote Adapter failure does not prevent a second closure case from being evaluated', async () => {
   const fixture = createFixture();
   try {
@@ -1297,18 +1348,22 @@ test('one remote Adapter failure does not prevent a second closure case from bei
     const comments = {
       'comment-human-1': {
         id: 'comment-human-1', resourceType: 'task', resourceId: 'task-guid-1',
+        content: 'Please close this canary.', creator: { id: 'ou_requester', type: 'user' },
         replyToCommentId: null,
       },
       'comment-agent-1': {
         id: 'comment-agent-1', resourceType: 'task', resourceId: 'task-guid-1',
+        content: 'Closed.', creator: { id: APP_ID, type: 'app' },
         replyToCommentId: 'comment-human-1',
       },
       'comment-human-2': {
         id: 'comment-human-2', resourceType: 'task', resourceId: 'task-guid-2',
-        replyToCommentId: null,
+        content: 'Please close the second canary.',
+        creator: { id: 'ou_requester', type: 'user' }, replyToCommentId: null,
       },
       'comment-agent-2': {
         id: 'comment-agent-2', resourceType: 'task', resourceId: 'task-guid-2',
+        content: 'Closed second.', creator: { id: APP_ID, type: 'app' },
         replyToCommentId: 'comment-human-2',
       },
     };

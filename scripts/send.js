@@ -29,10 +29,9 @@ import {
   requestIdForC4Delivery,
 } from '../src/lib/c4-delivery-policy.js';
 import {
-  createCoreFirstTaskCommentReply,
-  createCoreTaskV2CommentMapping,
   parseTaskCommentReplyEndpoint,
 } from '../src/lib/task-comment-production.js';
+import { createTaskCommentReplyProduction } from '../src/lib/task-comment-reply-production.js';
 import { isTaskCommentsEnabled } from '../src/lib/task-comment-runtime-policy.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
@@ -410,42 +409,39 @@ async function send() {
       const [
         { getClient },
         { openTaskCommentStore },
-        { createTaskCommentReplyAdapter },
-        { createSdkTaskV2CommentApi },
         { loadTaskCommentReplyCoreDependencies },
       ] = await Promise.all([
         import('../src/lib/client.js'),
         import('../src/lib/task-comment-store.js'),
-        import('../src/lib/task-comment-runtime.js'),
-        import('../src/lib/task-v2-comment-api.js'),
         import('../src/lib/task-comment-core-dependencies.js'),
       ]);
       const appId = getCredentials().app_id;
       if (!appId) throw new Error('FEISHU_APP_ID is required for Task comment replies');
       const scopedTaskCommentReplyEndpoint = parseTaskCommentReplyEndpoint(rawEndpoint, { appId });
-      const { openCore } = await loadTaskCommentReplyCoreDependencies({ env: process.env });
+      const { openCore, createCoordinator } = await loadTaskCommentReplyCoreDependencies({
+        env: process.env,
+      });
       const core = openCore();
       let store;
       try {
         store = openTaskCommentStore({ dbPath: path.join(DATA_DIR, 'task-comments.db') });
-        const adapter = createTaskCommentReplyAdapter({
+        const outbound = createTaskCommentReplyProduction({
           appId,
+          core,
           store,
-          commentApi: createSdkTaskV2CommentApi({ client: getClient() }),
-        });
-        const outbound = createCoreFirstTaskCommentReply({
-          appId,
-          taskMapping: createCoreTaskV2CommentMapping({ core }),
-          conversation: core.conversation,
-          replyAdapter: adapter,
+          client: getClient(),
+          createCoordinator,
         });
         await outbound.reply({
           ...scopedTaskCommentReplyEndpoint,
           content: message,
         });
       } finally {
-        store?.close();
-        core.close();
+        try {
+          store?.close();
+        } finally {
+          core.close();
+        }
       }
     } else {
       const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
