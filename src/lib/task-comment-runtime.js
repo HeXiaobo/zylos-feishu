@@ -131,6 +131,7 @@ export function createTaskCommentWorker({
         });
         return { outcome: 'echo_suppressed', commentId: comment.id };
       }
+      const suppressSelfWake = appAuthored && !comment.replyToCommentId;
       const commandType = comment.updatedAt === comment.createdAt
         ? 'AddComment'
         : 'ReviseComment';
@@ -154,7 +155,7 @@ export function createTaskCommentWorker({
         ]),
       };
       const result = await conversation.record(command);
-      if (mapping.wakeTarget) {
+      if (mapping.wakeTarget && !suppressSelfWake) {
         await wakeAgent({
           taskId: mapping.taskId,
           target: mapping.wakeTarget,
@@ -178,7 +179,12 @@ export function createTaskCommentWorker({
         commentId: comment.id,
         updatedAt: comment.updatedAt,
       });
-      return { outcome: 'recorded', command, result };
+      return {
+        outcome: 'recorded',
+        command,
+        result,
+        ...(suppressSelfWake ? { wakeSuppressed: 'self_app_top_level' } : {}),
+      };
     }
     const command = {
       type: 'DeleteComment',

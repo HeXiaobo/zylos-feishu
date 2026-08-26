@@ -327,6 +327,14 @@ and link-mismatch records without changing either system. Explicit
 through the same Core status handler; it can start and submit for review but
 never accepts a Task. Its report is the detection snapshot plus applied repair
 receipts, so run reconciliation again to verify the resulting clean state.
+The continuous supervisor runs that status repair once at startup and every
+60 seconds, so a completely missed completion callback still converges Core to
+`review`. Override the cadence with
+`COMMITMENT_FEISHU_TASK_V2_RECONCILIATION_INTERVAL_MS`. Each scan lists managed
+native Tasks once and indexes them by Core task ID before walking Core tasks;
+it explicitly pages both open and completed partitions and does not repeat the
+full Feishu pagination for every Core task. Shutdown aborts are checked before
+starting a scheduled scan and between bounded list/repair steps.
 
 Native status callbacks acknowledge only after a `synchronous=FULL` transaction
 to the Feishu-owned SQLite/WAL Task v2 inbox. Its indexed current-state rows
@@ -511,6 +519,12 @@ The caller records the Agent response in Core `TaskConversation` first, then
 uses that immutable Core event identity as the reply Adapter idempotency key.
 The Adapter is a platform projection; suppressing its returned Feishu comment
 echo therefore does not remove the Agent response from Core history.
+An unregistered top-level comment whose creator is this exact App is still
+recorded in Core for audit and human follower notification, but it is not an
+Agent wake input. This prevents an operator-authored App comment from waking
+the same Agent, replying to itself, and creating an undeliverable notification
+addressed to the App ID. Exact registered/adopted outbound echo handling and
+human same-content handling remain unchanged.
 
 `createTaskCommentReconciler(...)` lists comments every 5–10 minutes for active
 Task mappings, including mappings whose Task was not created by this App. Done

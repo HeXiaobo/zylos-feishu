@@ -22,6 +22,13 @@ function optionalText(value, field) {
   return requireText(value, field);
 }
 
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error('Task v2 managed Task scan aborted', { cause: signal.reason });
+  error.name = 'AbortError';
+  throw error;
+}
+
 function taskMarker(task) {
   return JSON.stringify({
     schema: MARKER_SCHEMA,
@@ -224,6 +231,77 @@ export function createSdkTaskV2Gateway({ client } = {}) {
     }
   }
 
+  async function scanManagedTasks(expectedCoreTaskId = null, signal) {
+    const tasks = [];
+    const seenTaskGuids = new Set();
+    for (const completed of [false, true]) {
+      const seenPageTokens = new Set();
+      let pageToken;
+      let exhausted = false;
+      for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
+        throwIfAborted(signal);
+        const response = await taskApi.list({
+          params: {
+            user_id_type: USER_ID_TYPE,
+            type: 'my_tasks',
+            completed,
+            page_size: 50,
+            ...(pageToken ? { page_token: pageToken } : {}),
+          },
+        });
+        if (response?.code !== 0) {
+          throw new FeishuTaskV2Error(response?.msg || 'Feishu Task v2 list failed', {
+            code: response?.code,
+            retryable: !PERMANENT_FEISHU_CODES.has(response?.code),
+          });
+        }
+        const candidates = response?.data?.items ?? [];
+        for (const candidate of candidates) {
+          const taskGuid = requireText(candidate.guid, 'Task v2 list item guid');
+          if (seenTaskGuids.has(taskGuid)) continue;
+          seenTaskGuids.add(taskGuid);
+          // list(my_tasks) includes extra in production. Filter on that marker
+          // before the authoritative get, avoiding reads of unrelated tasks.
+          const listedMarker = parseTaskMarker(candidate.extra);
+          if (candidate.extra !== undefined) {
+            if (listedMarker === null) continue;
+            if (
+              expectedCoreTaskId !== null
+              && listedMarker.coreTaskId !== expectedCoreTaskId
+            ) continue;
+          }
+          throwIfAborted(signal);
+          const snapshot = await getTask(taskGuid);
+          if (
+            snapshot.coreTaskId !== null
+            && (
+              expectedCoreTaskId === null
+              || snapshot.coreTaskId === expectedCoreTaskId
+            )
+          ) tasks.push(snapshot);
+        }
+        if (!response?.data?.has_more) {
+          exhausted = true;
+          break;
+        }
+        const nextPageToken = requireText(response?.data?.page_token, 'Task v2 list page_token');
+        if (seenPageTokens.has(nextPageToken)) {
+          throw new FeishuTaskV2Error('Feishu Task v2 list repeated a page token', {
+            retryable: false,
+          });
+        }
+        seenPageTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+      if (!exhausted) {
+        throw new FeishuTaskV2Error('Feishu Task v2 list exceeded the page safety limit', {
+          retryable: false,
+        });
+      }
+    }
+    return tasks;
+  }
+
   return Object.freeze({
     async createTask({ task, members, clientToken } = {}) {
       try {
@@ -259,54 +337,18 @@ export function createSdkTaskV2Gateway({ client } = {}) {
 
     getTask,
 
-    async findTasksByCoreTaskId(coreTaskId) {
+    async listManagedTasks({ signal } = {}) {
+      try {
+        return await scanManagedTasks(null, signal);
+      } catch (error) {
+        return wrapSdkFailure('list', error);
+      }
+    },
+
+    async findTasksByCoreTaskId(coreTaskId, { signal } = {}) {
       const expectedId = requireText(coreTaskId, 'coreTaskId');
       try {
-        const tasks = [];
-        const seenTaskGuids = new Set();
-        const seenPageTokens = new Set();
-        let pageToken;
-        for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
-          const response = await taskApi.list({
-            params: {
-              user_id_type: USER_ID_TYPE,
-              type: 'my_tasks',
-              page_size: 50,
-              ...(pageToken ? { page_token: pageToken } : {}),
-            },
-          });
-          if (response?.code !== 0) {
-            throw new FeishuTaskV2Error(response?.msg || 'Feishu Task v2 list failed', {
-              code: response?.code,
-              retryable: !PERMANENT_FEISHU_CODES.has(response?.code),
-            });
-          }
-          const candidates = response?.data?.items ?? [];
-          for (const candidate of candidates) {
-            const taskGuid = requireText(candidate.guid, 'Task v2 list item guid');
-            if (seenTaskGuids.has(taskGuid)) continue;
-            seenTaskGuids.add(taskGuid);
-            // list(my_tasks) includes extra in production. Filter on that
-            // marker before the authoritative get, avoiding one API request
-            // for every unrelated task visible to the App.
-            const listedMarker = parseTaskMarker(candidate.extra);
-            if (candidate.extra !== undefined && listedMarker?.coreTaskId !== expectedId) continue;
-            const snapshot = await getTask(taskGuid);
-            if (snapshot.coreTaskId === expectedId) tasks.push(snapshot);
-          }
-          if (!response?.data?.has_more) return tasks;
-          const nextPageToken = requireText(response?.data?.page_token, 'Task v2 list page_token');
-          if (seenPageTokens.has(nextPageToken)) {
-            throw new FeishuTaskV2Error('Feishu Task v2 list repeated a page token', {
-              retryable: false,
-            });
-          }
-          seenPageTokens.add(nextPageToken);
-          pageToken = nextPageToken;
-        }
-        throw new FeishuTaskV2Error('Feishu Task v2 list exceeded the page safety limit', {
-          retryable: false,
-        });
+        return await scanManagedTasks(expectedId, signal);
       } catch (error) {
         return wrapSdkFailure('list', error);
       }

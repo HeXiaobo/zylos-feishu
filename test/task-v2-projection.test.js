@@ -577,6 +577,43 @@ test('reconciliation walks every bounded Core page instead of silently truncatin
   assert.equal(snapshot.expected.at(-1).key, 'task-101');
 });
 
+test('reconciliation indexes one managed Task listing instead of rescanning Feishu per Core task', async () => {
+  const harness = fakeCore([
+    coreTask({ id: 'task-1' }),
+    coreTask({ id: 'task-2' }),
+  ]);
+  let listings = 0;
+  let legacyFinds = 0;
+
+  const snapshot = await collectTaskV2ReconciliationSnapshot({
+    core: harness.core,
+    gateway: {
+      async listManagedTasks() {
+        listings += 1;
+        return [{
+          guid: 'guid-task-2',
+          url: 'https://task/guid-task-2',
+          completedAt: '0',
+          coreTaskId: 'task-2',
+        }];
+      },
+      async findTasksByCoreTaskId() {
+        legacyFinds += 1;
+        throw new Error('managed listing must replace per-task scans');
+      },
+    },
+  });
+
+  assert.equal(listings, 1);
+  assert.equal(legacyFinds, 0);
+  assert.deepEqual(snapshot.actual, [{
+    key: 'task-2',
+    state: 'open',
+    externalId: 'guid-task-2',
+    url: 'https://task/guid-task-2',
+  }]);
+});
+
 function sdkTask(overrides = {}) {
   return {
     guid: 'guid-sdk',
@@ -654,6 +691,9 @@ test('SDK Adapter uses tenant Task v2 create/patch/member calls with client_toke
   );
   assert.equal(calls.find(([name]) => name === 'addMembers')[1].data.client_token, 'zt2_update:add');
 
+  const managed = await gateway.listManagedTasks();
+  assert.equal(managed.length, 1);
+  assert.equal(managed[0].coreTaskId, 'task-1');
   const found = await gateway.findTasksByCoreTaskId('task-1');
   assert.equal(found.length, 1);
   assert.equal(found[0].guid, 'guid-sdk');
@@ -721,6 +761,9 @@ test('SDK Adapter lists every bot-visible Task page before deciding create-after
       async removeMembers() { throw new Error('unexpected removeMembers'); },
       async list(payload) {
         lists.push(payload);
+        if (payload.params.completed) {
+          return { code: 0, data: { items: [], has_more: false } };
+        }
         if (!payload.params.page_token) {
           return {
             code: 0,
@@ -760,7 +803,50 @@ test('SDK Adapter lists every bot-visible Task page before deciding create-after
   const found = await createSdkTaskV2Gateway({ client }).findTasksByCoreTaskId('task-1');
 
   assert.deepEqual(found.map(task => task.guid), ['guid-target']);
-  assert.deepEqual(lists.map(call => call.params.page_token ?? null), [null, 'page-2']);
+  assert.deepEqual(lists.map(call => call.params.page_token ?? null), [null, 'page-2', null]);
+  assert.deepEqual(lists.map(call => call.params.completed), [false, false, true]);
   assert.equal(lists.every(call => call.params.type === 'my_tasks'), true);
-  assert.equal(lists.length, 2);
+  assert.equal(lists.length, 3);
+});
+
+test('SDK Adapter lists both open and completed managed Task partitions', async () => {
+  const lists = [];
+  const response = task => ({ code: 0, data: { task } });
+  const managedTask = (guid, coreTaskId, completedAt) => sdkTask({
+    guid,
+    completed_at: completedAt,
+    extra: JSON.stringify({
+      schema: 'zylos.task-v2-projection/v1',
+      coreTaskId,
+      coreTaskVersion: 1,
+    }),
+  });
+  const snapshots = new Map([
+    ['guid-open', managedTask('guid-open', 'task-open', '0')],
+    ['guid-completed', managedTask('guid-completed', 'task-completed', '1787900000000')],
+  ]);
+  const client = {
+    task: { v2: { task: {
+      async create() { throw new Error('unexpected create'); },
+      async patch() { throw new Error('unexpected patch'); },
+      async addMembers() { throw new Error('unexpected addMembers'); },
+      async removeMembers() { throw new Error('unexpected removeMembers'); },
+      async list(payload) {
+        lists.push(payload);
+        const task = payload.params.completed
+          ? snapshots.get('guid-completed')
+          : snapshots.get('guid-open');
+        return { code: 0, data: { items: [task], has_more: false } };
+      },
+      async get({ path }) { return response(snapshots.get(path.task_guid)); },
+    } } },
+  };
+
+  const tasks = await createSdkTaskV2Gateway({ client }).listManagedTasks();
+
+  assert.deepEqual(lists.map(call => call.params.completed), [false, true]);
+  assert.deepEqual(tasks.map(task => [task.guid, task.completedAt]), [
+    ['guid-open', '0'],
+    ['guid-completed', '1787900000000'],
+  ]);
 });

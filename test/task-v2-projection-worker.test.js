@@ -351,6 +351,83 @@ test('explicit reconciliation repair converts linked native completion only to C
   assert.equal(mappedEvents[0].eventType, 'completed');
 });
 
+test('supervisor repairs a linked native completion when the realtime status event was missed', async () => {
+  const harness = fakeCore();
+  const controller = new AbortController();
+  const logs = [];
+  let cycles = 0;
+  let now = 0;
+  harness.core.externalLinks.query = query => (
+    query.externalId
+      ? { taskId: 'task-worker', externalId: 'guid-worker' }
+      : [{ taskId: 'task-worker', externalId: 'guid-worker' }]
+  );
+  let listings = 0;
+  const gateway = {
+    async listManagedTasks() {
+      listings += 1;
+      return [{
+        guid: 'guid-worker',
+        url: 'https://task/guid-worker',
+        completedAt: '1787900000000',
+        coreTaskId: 'task-worker',
+      }];
+    },
+    async findTasksByCoreTaskId() {
+      throw new Error('watchdog must use one managed Task listing');
+    },
+    async getTask() { return { completedAt: '1787900000000' }; },
+  };
+
+  await superviseTaskV2Projection({
+    intervalMs: 250,
+    reconciliationIntervalMs: 60_000,
+    signal: controller.signal,
+    clock: () => now,
+    async runOnce() {
+      cycles += 1;
+      if (cycles === 3) controller.abort();
+      return { projection: TASK_V2_PROJECTION, idle: true };
+    },
+    async runReconciliation() {
+      return runTaskV2Reconciliation({
+        openCore: () => harness.core,
+        gateway,
+        appId: 'cli_yueran',
+        repairStatus: true,
+        mapExternalTaskEvent(externalEvent) {
+          return {
+            command: {
+              type: 'SubmitForReview',
+              taskId: externalEvent.taskId,
+              actorId: externalEvent.actorId,
+              idempotencyKey: `mapped:${externalEvent.eventId}`,
+            },
+            expectedVersion: externalEvent.expectedVersion,
+          };
+        },
+        reconcile: () => ({
+          consistent: false,
+          missing: [],
+          unexpected: [],
+          stateMismatches: [],
+          duplicateKeys: [],
+        }),
+      });
+    },
+    async sleepUntilNext() { now += 60_000; },
+    log(event) { logs.push(event); },
+  });
+
+  assert.equal(harness.core.query({ taskId: 'task-worker' }).state, 'review');
+  assert.equal(listings, 2);
+  assert.equal(logs[0].statusReconciliation.repairs[0].status, 'submitted_for_review');
+  assert.deepEqual(
+    harness.calls.filter(([operation]) => operation === 'command').map(([, command]) => command.type),
+    ['StartTask', 'SubmitForReview'],
+  );
+});
+
 test('URL resolver exposes the linked native Task URL through a stable user-facing command seam', async () => {
   const harness = fakeCore();
   harness.core.externalLinks.query = () => [{ externalId: 'guid-worker' }];
@@ -395,4 +472,35 @@ test('supervisor logs failures, continues, and stops cleanly', async () => {
   assert.deepEqual(result, { cycles: 2, stopReason: 'aborted' });
   assert.equal(logs[0].event, 'commitment_feishu_task_v2_projection_failed');
   assert.equal(logs[1].event, 'commitment_feishu_task_v2_projection');
+});
+
+test('supervisor enforces reconciliation cadence and does not start a scan after abort', async () => {
+  const controller = new AbortController();
+  let cycles = 0;
+  let now = 0;
+  let reconciliations = 0;
+
+  await superviseTaskV2Projection({
+    intervalMs: 250,
+    reconciliationIntervalMs: 60_000,
+    signal: controller.signal,
+    clock: () => now,
+    async runOnce() {
+      cycles += 1;
+      if (cycles === 4) controller.abort();
+      return { projection: TASK_V2_PROJECTION, idle: true };
+    },
+    async runReconciliation() {
+      reconciliations += 1;
+      return { repairs: [] };
+    },
+    async sleepUntilNext() {
+      if (cycles === 1) now = 59_999;
+      else if (cycles === 2) now = 60_000;
+      else if (cycles === 3) now = 120_000;
+    },
+    log() {},
+  });
+
+  assert.equal(reconciliations, 2);
 });

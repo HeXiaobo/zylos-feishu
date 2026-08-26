@@ -33,6 +33,7 @@ const DEFAULTS = Object.freeze({
   retryAfterMs: 5_000,
   maxAttempts: 5,
   intervalMs: 2_000,
+  reconciliationIntervalMs: 60_000,
 });
 
 function requireText(value, field) {
@@ -47,6 +48,13 @@ function requirePositiveInteger(value, field) {
     throw new TypeError(`${field} must be a positive integer`);
   }
   return value;
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error('Task v2 reconciliation aborted', { cause: signal.reason });
+  error.name = 'AbortError';
+  throw error;
 }
 
 function envInteger(value, fallback, field) {
@@ -228,13 +236,20 @@ export async function runTaskV2Reconciliation({
   repairStatus = false,
   appId,
   mapExternalTaskEvent,
+  signal,
 } = {}) {
   if (typeof openCore !== 'function') throw new TypeError('openCore must be a function');
   if (typeof reconcile !== 'function') throw new TypeError('reconcile must be a function');
   if (typeof repairStatus !== 'boolean') throw new TypeError('repairStatus must be a boolean');
+  throwIfAborted(signal);
   const core = openCore();
   try {
-    const snapshot = await collectTaskV2ReconciliationSnapshot({ core, gateway, tasks });
+    const snapshot = await collectTaskV2ReconciliationSnapshot({
+      core,
+      gateway,
+      tasks,
+      signal,
+    });
     const repairs = [];
     if (repairStatus) {
       const handler = createTaskV2StatusEventHandler({
@@ -244,6 +259,7 @@ export async function runTaskV2Reconciliation({
         mapExternalTaskEvent,
       });
       for (const candidate of snapshot.statusRepairCandidates) {
+        throwIfAborted(signal);
         repairs.push(await handler.handle({
           event_id: `reconcile:${candidate.taskGuid}:${candidate.completedAt}`,
           task_id: candidate.taskGuid,
@@ -299,29 +315,55 @@ export async function resolveTaskV2Url({ taskId, openCore, gateway } = {}) {
 
 export async function superviseTaskV2Projection({
   intervalMs = DEFAULTS.intervalMs,
+  reconciliationIntervalMs = DEFAULTS.reconciliationIntervalMs,
   signal,
   runOnce,
+  runReconciliation,
   sleepUntilNext = sleep,
+  clock = Date.now,
   log = event => console.log(JSON.stringify(event)),
   ...cycleOptions
 } = {}) {
   requirePositiveInteger(intervalMs, 'intervalMs');
   if (typeof runOnce !== 'function') throw new TypeError('runOnce must be a function');
+  if (runReconciliation !== undefined) {
+    requirePositiveInteger(reconciliationIntervalMs, 'reconciliationIntervalMs');
+    if (typeof runReconciliation !== 'function') {
+      throw new TypeError('runReconciliation must be a function');
+    }
+  }
+  if (typeof clock !== 'function') throw new TypeError('clock must be a function');
   let cycles = 0;
+  let nextReconciliationAt = 0;
   while (!signal?.aborted) {
     cycles += 1;
+    let cycleEvent;
     try {
-      log({ event: 'commitment_feishu_task_v2_projection', cycle: cycles, ...await runOnce({
+      cycleEvent = { event: 'commitment_feishu_task_v2_projection', cycle: cycles, ...await runOnce({
         ...cycleOptions,
         operationId: randomUUID(),
-      }) });
+      }) };
     } catch (error) {
-      log({
+      cycleEvent = {
         event: 'commitment_feishu_task_v2_projection_failed',
         cycle: cycles,
         error: error?.stack || error?.message || String(error),
-      });
+      };
     }
+    const now = Number(clock());
+    if (!Number.isFinite(now)) throw new TypeError('clock must return a finite timestamp');
+    if (!signal?.aborted && runReconciliation && now >= nextReconciliationAt) {
+      nextReconciliationAt = now + reconciliationIntervalMs;
+      try {
+        cycleEvent.statusReconciliation = await runReconciliation({ signal });
+      } catch (error) {
+        cycleEvent.statusReconciliation = {
+          failed: true,
+          error: error?.stack || error?.message || String(error),
+        };
+      }
+    }
+    log(cycleEvent);
     if (!signal?.aborted) await sleepUntilNext(intervalMs, signal);
   }
   return { cycles, stopReason: 'aborted' };
@@ -393,8 +435,22 @@ async function main(args = process.argv.slice(2), env = process.env) {
   await superviseTaskV2Projection({
     ...cycleOptions,
     intervalMs: envInteger(env.COMMITMENT_FEISHU_TASK_V2_INTERVAL_MS, DEFAULTS.intervalMs, 'interval ms'),
+    reconciliationIntervalMs: envInteger(
+      env.COMMITMENT_FEISHU_TASK_V2_RECONCILIATION_INTERVAL_MS,
+      DEFAULTS.reconciliationIntervalMs,
+      'reconciliation interval ms',
+    ),
     signal: controller.signal,
     runOnce: runTaskV2ProjectionOnce,
+    runReconciliation: ({ signal: reconciliationSignal } = {}) => runTaskV2Reconciliation({
+      openCore: dependencies.openCore,
+      reconcile: dependencies.reconcile,
+      gateway: runtime.gateway,
+      repairStatus: true,
+      appId: runtime.appId,
+      mapExternalTaskEvent: dependencies.mapExternalTaskEvent,
+      signal: reconciliationSignal,
+    }),
   });
 }
 

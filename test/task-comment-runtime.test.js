@@ -404,7 +404,12 @@ test('outbound reply ledger prevents duplicate replies and suppresses the exact 
           return { taskId: 'core-task-1', wakeTarget: { sessionId: 'session-1' } };
         },
       },
-      conversation: { async record() { coreCalls += 1; } },
+      conversation: {
+        async record() {
+          coreCalls += 1;
+          return { event: { id: 'core-app-top-level-event' } };
+        },
+      },
       async wakeAgent() { wakes += 1; },
       workerId: 'worker-echo',
     });
@@ -412,6 +417,55 @@ test('outbound reply ledger prevents duplicate replies and suppresses the exact 
     assert.equal(result.results[0].outcome, 'echo_suppressed');
     assert.equal(coreCalls, 0);
     assert.equal(wakes, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('an unregistered top-level comment authored by this App is observed without self-wake', async () => {
+  const harness = createHarness();
+  try {
+    await enqueueHandler(harness.store)(event({
+      event_id: 'evt-app-top-level',
+      comment_id: 'comment-app-top-level',
+    }));
+    let coreCalls = 0;
+    let wakes = 0;
+    const worker = createTaskCommentWorker({
+      appId: APP_ID,
+      store: harness.store,
+      commentApi: {
+        async getComment() {
+          return {
+            kind: 'found',
+            comment: foundComment({
+              id: 'comment-app-top-level',
+              content: 'Operator-authored diagnostic comment.',
+              creator: { id: APP_ID, type: 'app' },
+              replyToCommentId: null,
+            }),
+          };
+        },
+      },
+      taskMapping: {
+        async resolve() {
+          return { taskId: 'core-task-1', wakeTarget: { agentId: 'agent:yueran' } };
+        },
+      },
+      conversation: { async record() { coreCalls += 1; } },
+      async wakeAgent() { wakes += 1; },
+      workerId: 'worker-app-top-level',
+    });
+
+    const result = await worker.processOnce();
+    assert.equal(result.results[0].outcome, 'recorded');
+    assert.equal(result.results[0].wakeSuppressed, 'self_app_top_level');
+    assert.equal(coreCalls, 1);
+    assert.equal(wakes, 0);
+    assert.deepEqual(harness.store.listObserved({
+      appId: APP_ID,
+      taskGuid: 'task-guid-1',
+    }).map(({ commentId }) => commentId), ['comment-app-top-level']);
   } finally {
     harness.cleanup();
   }

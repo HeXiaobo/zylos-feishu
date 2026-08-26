@@ -7,6 +7,13 @@ function requireRecord(value, field) {
   return value;
 }
 
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error('Task v2 reconciliation snapshot aborted', { cause: signal.reason });
+  error.name = 'AbortError';
+  throw error;
+}
+
 function projectionStateFromCore(task) {
   return ['review', 'done', 'cancelled'].includes(task.state) ? 'completed' : 'open';
 }
@@ -15,10 +22,11 @@ function projectionStateFromRemote(task) {
   return task.completedAt === null || task.completedAt === '0' ? 'open' : 'completed';
 }
 
-function queryAllCoreTasks(core) {
+function queryAllCoreTasks(core, signal) {
   const tasks = [];
   let cursor;
   while (true) {
+    throwIfAborted(signal);
     const page = core.query({ limit: 100, ...(cursor ? { cursor } : {}) });
     if (!Array.isArray(page)) throw new TypeError('Core task query must return an array');
     tasks.push(...page);
@@ -33,15 +41,46 @@ function queryAllCoreTasks(core) {
 }
 
 /** Collect platform-shaped inputs for Core's generic reconcileProjection Module. */
-export async function collectTaskV2ReconciliationSnapshot({ core, gateway, tasks } = {}) {
+export async function collectTaskV2ReconciliationSnapshot({
+  core,
+  gateway,
+  tasks,
+  signal,
+} = {}) {
   if (!core || typeof core.query !== 'function' || typeof core.externalLinks?.query !== 'function') {
     throw new TypeError('core must provide query and externalLinks Interfaces');
   }
-  if (!gateway || typeof gateway.findTasksByCoreTaskId !== 'function') {
-    throw new TypeError('gateway.findTasksByCoreTaskId must be a function');
+  if (
+    !gateway
+    || (
+      typeof gateway.listManagedTasks !== 'function'
+      && typeof gateway.findTasksByCoreTaskId !== 'function'
+    )
+  ) {
+    throw new TypeError('gateway must provide listManagedTasks or findTasksByCoreTaskId');
   }
-  const coreTasks = tasks ?? queryAllCoreTasks(core);
+  throwIfAborted(signal);
+  const coreTasks = tasks ?? queryAllCoreTasks(core, signal);
   if (!Array.isArray(coreTasks)) throw new TypeError('tasks must be an array');
+
+  let managedTasksByCoreId = null;
+  if (typeof gateway.listManagedTasks === 'function') {
+    const managedTasks = await gateway.listManagedTasks({ signal });
+    if (!Array.isArray(managedTasks)) {
+      throw new TypeError('gateway.listManagedTasks must return an array');
+    }
+    managedTasksByCoreId = new Map();
+    for (const [index, remoteValue] of managedTasks.entries()) {
+      const remote = requireRecord(remoteValue, `managedTasks[${index}]`);
+      if (typeof remote.coreTaskId !== 'string' || remote.coreTaskId.trim() === '') {
+        throw new TypeError(`managedTasks[${index}].coreTaskId must be a non-empty string`);
+      }
+      const coreTaskId = remote.coreTaskId.trim();
+      const matches = managedTasksByCoreId.get(coreTaskId) ?? [];
+      matches.push(remote);
+      managedTasksByCoreId.set(coreTaskId, matches);
+    }
+  }
 
   const expected = [];
   const actual = [];
@@ -49,11 +88,14 @@ export async function collectTaskV2ReconciliationSnapshot({ core, gateway, tasks
   const linkMismatches = [];
   const statusRepairCandidates = [];
   for (const [index, taskValue] of coreTasks.entries()) {
+    throwIfAborted(signal);
     const task = requireRecord(taskValue, `tasks[${index}]`);
     expected.push({ key: task.id, state: projectionStateFromCore(task) });
     const links = core.externalLinks.query({ taskId: task.id, backend: TASK_V2_LINK_BACKEND });
     if (links.length === 0) missingLinks.push({ taskId: task.id });
-    const discovered = await gateway.findTasksByCoreTaskId(task.id);
+    const discovered = managedTasksByCoreId === null
+      ? await gateway.findTasksByCoreTaskId(task.id, { signal })
+      : (managedTasksByCoreId.get(task.id) ?? []);
     if (!Array.isArray(discovered)) {
       throw new TypeError('gateway.findTasksByCoreTaskId must return an array');
     }
