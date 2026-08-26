@@ -1,6 +1,11 @@
+import { createHash } from 'node:crypto';
+
 import Database from 'better-sqlite3';
 
-const REPORT_SCHEMA = 'zylos.native-task-closure-gate/v1';
+import { isLiveNativeTaskGateReader } from './native-task-closure-gate-remote.js';
+import { feishuNotificationDedupeKey } from './task-notification-adapter.js';
+
+const REPORT_SCHEMA = 'zylos.native-task-closure-gate/v2';
 const LINK_BACKEND = 'feishu-task-v2';
 
 function requireRecord(value, field) {
@@ -42,30 +47,52 @@ function normalizeCases(value) {
   }
   return value.map((rawCase, index) => {
     const item = requireRecord(rawCase, `native Task closure cases[${index}]`);
-    const notification = requireRecord(
-      item.notification,
-      `native Task closure cases[${index}].notification`,
-    );
-    if (!Array.isArray(notification.recipientIds) || notification.recipientIds.length === 0) {
-      throw new TypeError(`native Task closure cases[${index}].notification.recipientIds must be non-empty`);
+    const unknown = Object.keys(item).find(key => !['taskGuid', 'commentId'].includes(key));
+    if (unknown) {
+      throw new TypeError(`native Task closure cases[${index}] contains unsupported field: ${unknown}`);
     }
     return Object.freeze({
       taskGuid: requireText(item.taskGuid, `native Task closure cases[${index}].taskGuid`),
       commentId: requireText(item.commentId, `native Task closure cases[${index}].commentId`),
-      notification: Object.freeze({
-        eventId: requireText(
-          notification.eventId,
-          `native Task closure cases[${index}].notification.eventId`,
-        ),
-        recipientIds: Object.freeze(notification.recipientIds.map((recipientId, recipientIndex) => (
-          requireText(
-            recipientId,
-            `native Task closure cases[${index}].notification.recipientIds[${recipientIndex}]`,
-          )
-        ))),
-      }),
     });
   });
+}
+
+function logicalCommentId(appId, commentId) {
+  const digest = createHash('sha256')
+    .update(JSON.stringify([appId, commentId]))
+    .digest('base64url');
+  return `external-comment:${digest}`;
+}
+
+function parseNotificationDecision(row, { eventId, taskId }) {
+  if (!row) return null;
+  const decision = requireRecord(JSON.parse(row.resultJson), 'Core notification decision');
+  if (
+    decision.eventId !== eventId
+    || decision.taskId !== taskId
+    || decision.kind !== 'action_required'
+    || !Array.isArray(decision.deliveries)
+  ) {
+    throw new TypeError('Core notification decision does not match the canonical comment event');
+  }
+  const deliveries = decision.deliveries.map((rawDelivery, index) => {
+    const delivery = requireRecord(rawDelivery, `Core notification decision.deliveries[${index}]`);
+    return Object.freeze({
+      dedupeKey: feishuNotificationDedupeKey(requireText(
+        delivery.dedupeKey,
+        `Core notification decision.deliveries[${index}].dedupeKey`,
+      )),
+      recipientId: requireText(
+        delivery.recipientId,
+        `Core notification decision.deliveries[${index}].recipientId`,
+      ),
+    });
+  });
+  if (deliveries.length === 0) {
+    throw new TypeError('Core notification decision has no human recipients');
+  }
+  return Object.freeze({ eventId, taskId, deliveries: Object.freeze(deliveries) });
 }
 
 function openReadonly(dbPath, field) {
@@ -234,25 +261,101 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
   }
   const outbound = sentOutboundRows[0];
 
+  const coreCommentId = logicalCommentId(appId, item.commentId);
+  const commentEvents = coreDb.prepare(`
+    SELECT id AS eventId
+    FROM commitment_conversation_events
+    WHERE task_id = ? AND comment_id = ? AND event_type = 'CommentAdded'
+    ORDER BY occurred_at, recorded_at, id
+  `).all(link.taskId, coreCommentId);
+  if (commentEvents.length === 0) {
+    return failedCase(
+      item,
+      'CORE_COMMENT_EVENT_MISSING',
+      'The exact inbound comment has no canonical Core CommentAdded event',
+      { coreTaskId: link.taskId, coreCommentId },
+    );
+  }
+  if (commentEvents.length > 1) {
+    return failedCase(
+      item,
+      'CORE_COMMENT_EVENT_NOT_UNIQUE',
+      'The exact inbound comment has more than one canonical Core CommentAdded event',
+      { coreTaskId: link.taskId, coreCommentId, matches: commentEvents.length },
+    );
+  }
+  const notificationEventId = commentEvents[0].eventId;
+  const decisionRow = coreDb.prepare(`
+    SELECT result_json AS resultJson
+    FROM commitment_notification_decisions
+    WHERE event_id = ? AND task_id = ?
+  `).get(notificationEventId, link.taskId);
+  if (!decisionRow) {
+    return failedCase(
+      item,
+      'CORE_NOTIFICATION_DECISION_MISSING',
+      'The canonical comment event has no persisted Core notification decision',
+      { eventId: notificationEventId, coreTaskId: link.taskId },
+    );
+  }
+  let notificationDecision;
+  try {
+    notificationDecision = parseNotificationDecision(decisionRow, {
+      eventId: notificationEventId,
+      taskId: link.taskId,
+    });
+  } catch (error) {
+    return failedCase(
+      item,
+      'CORE_NOTIFICATION_DECISION_INVALID',
+      'The persisted Core notification decision is malformed, empty, or mismatched',
+      { eventId: notificationEventId, error: String(error?.message ?? error).slice(0, 4_000) },
+    );
+  }
   const notificationRows = commentsDb.prepare(`
     SELECT dedupe_key AS dedupeKey, recipient_id AS recipientId,
            status, sent_at AS sentAt
     FROM feishu_task_notifications
     WHERE event_id = ? AND task_id = ?
-      AND recipient_id IN (${item.notification.recipientIds.map(() => '?').join(', ')})
-  `).all(item.notification.eventId, link.taskId, ...item.notification.recipientIds);
-  const sentRecipients = new Set(
-    notificationRows.filter(row => row.status === 'sent' && row.sentAt).map(row => row.recipientId),
-  );
-  const missingRecipientIds = item.notification.recipientIds.filter(
-    recipientId => !sentRecipients.has(recipientId),
-  );
-  if (missingRecipientIds.length > 0) {
+    ORDER BY recipient_id, dedupe_key
+  `).all(notificationEventId, link.taskId);
+  const expectedDeliveries = new Map(notificationDecision.deliveries.map(delivery => (
+    [`${delivery.recipientId}\u0000${delivery.dedupeKey}`, delivery]
+  )));
+  const observedDeliveries = new Map(notificationRows.map(row => (
+    [`${row.recipientId}\u0000${row.dedupeKey}`, row]
+  )));
+  const missingDeliveries = [...expectedDeliveries]
+    .filter(([key]) => !observedDeliveries.has(key))
+    .map(([, delivery]) => delivery);
+  if (missingDeliveries.length > 0) {
     return failedCase(
       item,
       'NOTIFICATION_RECEIPT_MISSING',
-      'Expected notification recipients do not all have sent delivery receipts',
-      { eventId: item.notification.eventId, missingRecipientIds },
+      'Core-derived notification deliveries are missing from the Feishu ledger',
+      { eventId: notificationEventId, missingDeliveries },
+    );
+  }
+  const unexpectedDeliveries = [...observedDeliveries]
+    .filter(([key]) => !expectedDeliveries.has(key))
+    .map(([, row]) => ({ dedupeKey: row.dedupeKey, recipientId: row.recipientId }));
+  if (unexpectedDeliveries.length > 0) {
+    return failedCase(
+      item,
+      'NOTIFICATION_RECEIPT_UNEXPECTED',
+      'The Feishu ledger contains recipients outside the immutable Core decision',
+      { eventId: notificationEventId, unexpectedDeliveries },
+    );
+  }
+  const unsentDeliveries = notificationRows
+    .filter(row => row.status !== 'sent' || !row.sentAt)
+    .map(row => ({ dedupeKey: row.dedupeKey, recipientId: row.recipientId, status: row.status }));
+  if (unsentDeliveries.length > 0) {
+    return failedCase(
+      item,
+      'NOTIFICATION_RECEIPT_NOT_SENT',
+      'Core-derived notification deliveries do not all have sent receipts',
+      { eventId: notificationEventId, unsentDeliveries },
     );
   }
 
@@ -446,8 +549,8 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
       commentId: outbound.commentId,
     }),
     notifications: Object.freeze({
-      eventId: item.notification.eventId,
-      recipients: Object.freeze([...item.notification.recipientIds]),
+      eventId: notificationEventId,
+      recipients: Object.freeze(notificationDecision.deliveries.map(({ recipientId }) => recipientId)),
       receipts: Object.freeze(notificationRows
         .filter(row => row.status === 'sent' && row.sentAt)
         .map(row => Object.freeze({
@@ -480,6 +583,8 @@ export async function evaluateNativeTaskClosure({
   const normalizedAppId = requireText(appId, 'native Task closure appId');
   const normalizedCases = normalizeCases(cases);
   const remote = requireRecord(remoteReader, 'native Task closure remoteReader');
+  const attestable = isLiveNativeTaskGateReader(remote);
+  const evidenceMode = attestable ? 'live' : 'injected';
   for (const operation of ['getTask', 'findTasksBySummary', 'getComment']) {
     requireFunction(remote[operation], `native Task closure remoteReader.${operation}`);
   }
@@ -511,21 +616,33 @@ export async function evaluateNativeTaskClosure({
         ));
       }
     }
-    const passed = caseReports.filter(item => item.passed).length;
+    const validated = caseReports.filter(item => item.passed).length;
     const failureCodes = [...new Set(caseReports.flatMap(item => (
       item.failures.map(({ code }) => code)
     )))].sort();
+    const attestationFailureCodes = attestable ? [] : ['NON_LIVE_EVIDENCE'];
+    const reports = caseReports.map(report => Object.freeze({
+      ...report,
+      validationPassed: report.passed,
+      passed: attestable && report.passed,
+    }));
     return Object.freeze({
       schema: REPORT_SCHEMA,
       checkedAt,
-      passed: passed === caseReports.length,
+      evidenceMode,
+      attestable,
+      validationPassed: validated === caseReports.length,
+      passed: attestable && validated === caseReports.length,
       failureCodes: Object.freeze(failureCodes),
+      attestationFailureCodes: Object.freeze(attestationFailureCodes),
       totals: Object.freeze({
         cases: caseReports.length,
-        passed,
-        failed: caseReports.length - passed,
+        validated,
+        validationFailed: caseReports.length - validated,
+        passed: attestable ? validated : 0,
+        failed: attestable ? caseReports.length - validated : caseReports.length,
       }),
-      cases: Object.freeze(caseReports),
+      cases: Object.freeze(reports),
     });
   } finally {
     commentsDb.close();

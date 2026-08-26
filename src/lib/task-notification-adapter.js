@@ -35,6 +35,10 @@ function stableUuid(value) {
   return `ztn_${createHash('sha256').update(value).digest('hex').slice(0, 40)}`;
 }
 
+export function feishuNotificationDedupeKey(coreDedupeKey) {
+  return `${requireText(coreDedupeKey, 'Core notification dedupeKey')}:feishu-im`;
+}
+
 function notificationText(deliveries) {
   const summaries = [...new Set(deliveries.map(({ summary }) => summary))];
   const lines = ['【Zylos 任务提醒】'];
@@ -146,7 +150,7 @@ export function createFeishuNotificationAdapter({
       return normalizedDecision.deliveries.map((rawDelivery) => {
         const delivery = requireRecord(rawDelivery, 'Core notification delivery');
         return notifications.enqueue({
-          dedupeKey: `${requireText(delivery.dedupeKey, 'delivery.dedupeKey')}:feishu-im`,
+          dedupeKey: feishuNotificationDedupeKey(delivery.dedupeKey),
           eventId: requireText(normalizedDecision.eventId, 'decision.eventId'),
           taskId: requireText(normalizedDecision.taskId, 'decision.taskId'),
           recipientId: requireText(delivery.recipientId, 'delivery.recipientId'),

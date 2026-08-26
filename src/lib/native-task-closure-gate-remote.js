@@ -1,6 +1,7 @@
 import { createSdkTaskV2CommentApi } from './task-v2-comment-api.js';
 
 const MAX_LIST_PAGES = 1_000;
+const liveReaders = new WeakSet();
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -68,7 +69,7 @@ export function createSdkNativeTaskGateReader({ client } = {}) {
   }
   const comments = createSdkTaskV2CommentApi({ client: sdk });
 
-  return Object.freeze({
+  const reader = Object.freeze({
     async getTask({ taskGuid }) {
       const guid = requireText(taskGuid, 'native Task gate taskGuid');
       let response;
@@ -123,55 +124,10 @@ export function createSdkNativeTaskGateReader({ client } = {}) {
       return comments.getComment(request);
     },
   });
+  liveReaders.add(reader);
+  return reader;
 }
 
-/** Offline Adapter for deterministic CLI fixtures; no network access occurs. */
-export function createFixtureNativeTaskGateReader(rawFixture) {
-  const fixture = requireRecord(rawFixture, 'native Task gate remote fixture');
-  if (!Array.isArray(fixture.tasks) || !Array.isArray(fixture.comments)) {
-    throw new TypeError('native Task gate remote fixture tasks/comments must be arrays');
-  }
-  const tasks = fixture.tasks.map((rawTask, index) => {
-    const field = `native Task gate remote fixture.tasks[${index}]`;
-    const task = requireRecord(rawTask, field);
-    return Object.freeze({
-      guid: requireText(task.guid, `${field}.guid`),
-      summary: optionalText(task.summary, `${field}.summary`),
-      coreTaskId: optionalText(task.coreTaskId, `${field}.coreTaskId`),
-    });
-  });
-  const comments = fixture.comments.map((rawComment, index) => {
-    const comment = requireRecord(
-      rawComment,
-      `native Task gate remote fixture.comments[${index}]`,
-    );
-    return Object.freeze({
-      id: requireText(comment.id, `native Task gate remote fixture.comments[${index}].id`),
-      resourceType: requireText(
-        comment.resourceType,
-        `native Task gate remote fixture.comments[${index}].resourceType`,
-      ),
-      resourceId: requireText(
-        comment.resourceId,
-        `native Task gate remote fixture.comments[${index}].resourceId`,
-      ),
-      replyToCommentId: optionalText(
-        comment.replyToCommentId,
-        `native Task gate remote fixture.comments[${index}].replyToCommentId`,
-      ),
-    });
-  });
-  return Object.freeze({
-    async getTask({ taskGuid }) {
-      const task = tasks.find(candidate => candidate.guid === taskGuid);
-      return task ? { kind: 'found', task } : { kind: 'missing' };
-    },
-    async findTasksBySummary({ summary }) {
-      return tasks.filter(task => task.summary === summary);
-    },
-    async getComment({ commentId }) {
-      const comment = comments.find(candidate => candidate.id === commentId);
-      return comment ? { kind: 'found', comment } : { kind: 'missing', commentId };
-    },
-  });
+export function isLiveNativeTaskGateReader(reader) {
+  return Boolean(reader && typeof reader === 'object' && liveReaders.has(reader));
 }

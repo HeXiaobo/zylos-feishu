@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createSdkNativeTaskGateReader } from '../src/lib/native-task-closure-gate-remote.js';
+import {
+  createSdkNativeTaskGateReader,
+  isLiveNativeTaskGateReader,
+} from '../src/lib/native-task-closure-gate-remote.js';
 
 test('SDK gate reader performs only paginated Task and comment reads through its public Adapter', async () => {
   const calls = [];
@@ -72,6 +75,9 @@ test('SDK gate reader performs only paginated Task and comment reads through its
       },
     },
   });
+
+  assert.equal(isLiveNativeTaskGateReader(reader), true);
+  assert.equal(isLiveNativeTaskGateReader({ evidenceMode: 'live' }), false);
 
   assert.deepEqual(await reader.getTask({ taskGuid: 'task-guid-1' }), {
     kind: 'found',

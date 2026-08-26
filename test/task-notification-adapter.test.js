@@ -8,6 +8,7 @@ import {
   createFeishuNotificationAdapter,
   createRoutedNotificationSender,
   createSdkFeishuNotificationSender,
+  feishuNotificationDedupeKey,
 } from '../src/lib/task-notification-adapter.js';
 import { openTaskCommentStore } from '../src/lib/task-comment-store.js';
 
@@ -45,6 +46,13 @@ function decision(eventId, summaryKey) {
     }],
   };
 }
+
+test('Feishu notification ledger keys are a stable projection of Core dedupe keys', () => {
+  assert.equal(
+    feishuNotificationDedupeKey('core-comment-event-1:ou_owner'),
+    'core-comment-event-1:ou_owner:feishu-im',
+  );
+});
 
 function immediateDecision(eventId) {
   return {
