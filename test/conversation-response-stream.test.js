@@ -6,16 +6,20 @@ import test from 'node:test';
 
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
 
-function event(sequence, type, payload = {}) {
+function eventFor(requestId, sequence, type, payload = {}) {
   return {
     schemaVersion: 1,
-    eventId: `assistant.feishu.om_1:${sequence}`,
-    requestId: 'assistant.feishu.om_1',
+    eventId: `${requestId}:${sequence}`,
+    requestId,
     sequence,
     type,
     occurredAt: 1_700_000_000 + sequence,
     payload,
   };
+}
+
+function event(sequence, type, payload = {}) {
+  return eventFor('assistant.feishu.om_1', sequence, type, payload);
 }
 
 function createClient({ conversion = true, interactiveFailure = false } = {}) {
@@ -140,6 +144,71 @@ test('opens once, coalesces real deltas, keeps sequence monotonic, and closes th
   assert.equal(finalCard.body.elements[0].element_id.length <= 20, true);
   assert.equal(finalCard.body.elements[1].element_id.length <= 20, true);
 }));
+
+for (const conversion of [true, false]) {
+  const mode = conversion ? 'CardKit' : 'ordinary-card fallback';
+  test(`keeps interleaved requests and a background completion on separate cards in ${mode}`, () => withState(async stateDirectory => {
+    const { client, calls } = createClient({ conversion });
+    const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+    const requestA = 'assistant.feishu.om_A';
+    const requestB = 'assistant.feishu.om_B';
+
+    await stream.open({ requestId: requestA, target: target() });
+    await stream.apply({
+      requestId: requestA,
+      events: [
+        eventFor(requestA, 1, 'AssistantRequestAccepted', { sourceId: 'om_A' }),
+        eventFor(requestA, 2, 'RunStarted'),
+      ],
+    });
+    await stream.open({ requestId: requestB, target: target() });
+    await stream.apply({
+      requestId: requestB,
+      events: [
+        eventFor(requestB, 1, 'AssistantRequestAccepted', { sourceId: 'om_B' }),
+        eventFor(requestB, 2, 'RunStarted'),
+      ],
+    });
+    await stream.apply({
+      requestId: requestA,
+      events: [eventFor(requestA, 3, 'RunCompleted', { output: 'A 的答案' })],
+    });
+    await stream.sendCompleted({
+      requestId: 'assistant.feishu.background_notice',
+      target: target(),
+      output: '独立后台通知',
+    });
+    await stream.apply({
+      requestId: requestB,
+      events: [eventFor(requestB, 3, 'RunCompleted', { output: 'B 的答案' })],
+    });
+
+    const terminalWrites = calls.flatMap(([operation, payload]) => {
+      if (operation === 'update') {
+        const card = JSON.parse(payload.data.card.data);
+        return card.config.streaming_mode === false
+          ? [{ target: payload.path.card_id, answer: cardElement(card, 'zylos_answer').content }]
+          : [];
+      }
+      if (operation === 'patch') {
+        const card = JSON.parse(payload.data.content);
+        return card.config.streaming_mode === false
+          ? [{ target: payload.path.message_id, answer: cardElement(card, 'zylos_answer').content }]
+          : [];
+      }
+      return [];
+    });
+
+    assert.ok(terminalWrites.some(write => write.target.includes('om_response_1') && write.answer === 'A 的答案'));
+    assert.ok(terminalWrites.some(write => write.target.includes('om_response_2') && write.answer === 'B 的答案'));
+    const completedSends = calls.filter(([operation, payload]) => {
+      if (operation !== 'send') return false;
+      const card = JSON.parse(payload.data.content);
+      return cardElement(card, 'zylos_answer')?.content === '独立后台通知';
+    });
+    assert.equal(completedSends.length, 1);
+  }));
+}
 
 test('phase events stay visible while running and disappear when completion supplies the answer', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
@@ -911,4 +980,47 @@ test('legacy compatibility completion cannot overwrite an existing terminal resu
     }),
     error => error?.code === 'ASSISTANT_TERMINAL_CONFLICT',
   );
+}));
+
+test('ignores and diagnoses a higher-sequence event that arrives after canonical terminal state', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const warnings = [];
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    logger: { warn(message, details) { warnings.push([message, details]); } },
+  });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'AssistantRequestAccepted', { sourceId: 'om_1' }),
+      event(2, 'RunStarted'),
+      event(3, 'RunCompleted', { output: '不可变终态' }),
+    ],
+  });
+  const callsAtTerminal = calls.length;
+
+  const late = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(4, 'OutputDelta', { delta: '迟到且不得覆盖' })],
+  });
+
+  assert.deepEqual(late, {
+    handled: true,
+    ignored: true,
+    reason: 'terminal_state',
+    status: 'completed',
+  });
+  assert.equal(calls.length, callsAtTerminal);
+  assert.deepEqual(warnings, [[
+    'Ignored response event after terminal state',
+    {
+      requestId: 'assistant.feishu.om_1',
+      status: 'completed',
+      lastEventSequence: 3,
+      receivedSequences: [4],
+    },
+  ]]);
 }));

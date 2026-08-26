@@ -29,7 +29,7 @@ test('accepts a Core that satisfies every required protocol', (t) => {
     protocols: {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
-      'c4.assistant-response-stream': 2,
+      'c4.assistant-response-stream': 3,
       'c4.outbound-delivery-id': 1,
       'work-intake': 1,
       'commitment-core': 1,
@@ -46,6 +46,34 @@ test('accepts a Core that satisfies every required protocol', (t) => {
   assert.equal(result.ok, true);
   assert.deepEqual(result.errors, []);
   assert.equal(result.core.release, '0.7.2-rc.3');
+});
+
+test('rejects stream-v2 Core because it can inject a second message into the active runtime turn', (t) => {
+  const cli = fakeZylos(t, {
+    schemaVersion: 1,
+    product: 'zylos-core',
+    release: '0.7.2-rc.6',
+    protocols: {
+      'c4.reply': 2,
+      'c4.reply.argv-compat': 1,
+      'c4.assistant-response-stream': 2,
+      'c4.outbound-delivery-id': 1,
+      'work-intake': 1,
+      'commitment-core': 1,
+      'projection-outbox': 1,
+      'external-task-adapter': 1,
+      'task-reminder': 1,
+    },
+  });
+
+  const result = checkCoreCompatibility({
+    env: { ...process.env, ZYLOS_CLI_PATH: cli },
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.errors, [
+    'Protocol c4.assistant-response-stream requires >= 3, found 2',
+  ]);
 });
 
 test('reports every missing or outdated protocol before upgrade', (t) => {
@@ -67,7 +95,7 @@ test('reports every missing or outdated protocol before upgrade', (t) => {
   assert.deepEqual(result.errors, [
     'Protocol c4.reply requires >= 2, found 1',
     'Protocol c4.reply.argv-compat requires >= 1, found missing',
-    'Protocol c4.assistant-response-stream requires >= 2, found 1',
+    'Protocol c4.assistant-response-stream requires >= 3, found 1',
     'Protocol c4.outbound-delivery-id requires >= 1, found missing',
     'Protocol work-intake requires >= 1, found missing',
     'Protocol commitment-core requires >= 1, found missing',
@@ -77,7 +105,7 @@ test('reports every missing or outdated protocol before upgrade', (t) => {
   ]);
 });
 
-test('rejects a stream-v2 Core that lacks stable outbound delivery identity', (t) => {
+test('rejects a stream-v3 Core that lacks stable outbound delivery identity', (t) => {
   const cli = fakeZylos(t, {
     schemaVersion: 1,
     product: 'zylos-core',
@@ -85,7 +113,7 @@ test('rejects a stream-v2 Core that lacks stable outbound delivery identity', (t
     protocols: {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
-      'c4.assistant-response-stream': 2,
+      'c4.assistant-response-stream': 3,
       'work-intake': 1,
       'commitment-core': 1,
       'projection-outbox': 1,
@@ -112,7 +140,7 @@ test('rejects an otherwise compatible Core that lacks the external Task mapper p
     protocols: {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
-      'c4.assistant-response-stream': 2,
+      'c4.assistant-response-stream': 3,
       'c4.outbound-delivery-id': 1,
       'work-intake': 1,
       'commitment-core': 1,
@@ -139,7 +167,7 @@ test('rejects an otherwise compatible Core that cannot persist canonical task re
     protocols: {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
-      'c4.assistant-response-stream': 2,
+      'c4.assistant-response-stream': 3,
       'c4.outbound-delivery-id': 1,
       'work-intake': 1,
       'commitment-core': 1,
@@ -172,7 +200,7 @@ test('pre-upgrade aborts before backup when Core lacks the external Task mapper'
     protocols: {
       'c4.reply': 2,
       'c4.reply.argv-compat': 1,
-      'c4.assistant-response-stream': 2,
+      'c4.assistant-response-stream': 3,
       'c4.outbound-delivery-id': 1,
       'work-intake': 1,
       'commitment-core': 1,

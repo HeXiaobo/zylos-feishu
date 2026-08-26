@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.7] - 2026-08-27
+
+### Changed
+- Require Core's `c4.assistant-response-stream >= 3` runtime-turn admission so
+  later messages and background runs cannot enter an active runtime turn and
+  shift replies onto the wrong Feishu card.
+
+### Fixed
+- Keep interleaved requests and background completions isolated in both CardKit
+  and ordinary-card modes, and ignore diagnosed late events after a canonical
+  terminal state without mutating the completed card.
+
 ## [0.3.7-rc.6] - 2026-08-27
 
 ### Changed

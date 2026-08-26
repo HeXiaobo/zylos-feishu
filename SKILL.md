@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.7-rc.6
+version: 0.3.7-rc.7
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),
@@ -172,13 +172,14 @@ narrow publisher Interface. Cards use Card JSON 2.0, stable create UUIDs, Core
 task versions as CardKit update sequences, and signed callback contexts.
 
 The paired release's pre-install/pre-upgrade gate also requires Core's
-`c4.reply.argv-compat`, `c4.assistant-response-stream >= 2`, and
+`c4.reply.argv-compat`, `c4.assistant-response-stream >= 3`, and
 `c4.outbound-delivery-id >= 1` capabilities, plus
 `external-task-adapter >= 1` for native completion and `task-reminder >= 1`
-for canonical reminder persistence. Response-stream v2 binds
-output to the exact runtime turn; the outbound-delivery capability separately
-guarantees the stable identity used by proactive cards. An older Core must fail
-the compatibility gate instead of starting this component.
+for canonical reminder persistence. Response-stream v3 serializes admission to
+each runtime turn until its terminal stop, preventing a later message or
+background run from entering the active turn; the outbound-delivery capability
+separately guarantees the stable identity used by proactive cards. An older Core
+must fail the compatibility gate instead of starting this component.
 
 Configure deployment identity explicitly in `~/zylos/.env`; the universal
 component has no built-in Agent name or logical Agent-to-App mapping:

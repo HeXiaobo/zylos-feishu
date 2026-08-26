@@ -1050,9 +1050,21 @@ export function createConversationResponseStream({
           if (events.every(event => event.sequence <= state.lastEventSequence)) {
             return { handled: true, replayed: true, status: state.status };
           }
-          const error = new Error('conversation response stream is already terminal');
-          error.code = 'ASSISTANT_TERMINAL_CONFLICT';
-          throw error;
+          const receivedSequences = events
+            .filter(event => event.sequence > state.lastEventSequence)
+            .map(event => event.sequence);
+          logger.warn?.('Ignored response event after terminal state', {
+            requestId,
+            status: state.status,
+            lastEventSequence: state.lastEventSequence,
+            receivedSequences,
+          });
+          return {
+            handled: true,
+            ignored: true,
+            reason: 'terminal_state',
+            status: state.status,
+          };
         }
         const compatibility = state.compatibilityTerminal
           ? { status: state.status, outputHash: state.outputHash, phase: state.phase }
