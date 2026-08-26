@@ -233,6 +233,27 @@ test('keeps the collapsed process panel when CardKit falls back to ordinary card
   assert.match(cardElement(card, 'zylos_answer').content, /等待回答/);
 }));
 
+test('uses a user-facing chat-list summary in both running card modes', async () => {
+  for (const conversion of [true, false]) {
+    await withState(async stateDirectory => {
+      const { client, calls } = createClient({ conversion });
+      const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+      await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+      await stream.apply({
+        requestId: 'assistant.feishu.om_1',
+        events: [event(1, 'RunStarted')],
+      });
+
+      const [kind, payload] = calls
+        .filter(([name]) => name === (conversion ? 'update' : 'patch'))
+        .at(-1);
+      const card = JSON.parse(kind === 'update' ? payload.data.card.data : payload.data.content);
+      assert.equal(card.config.summary.content, '正在回复…');
+      assert.equal(card.config.summary.content.includes('Zylos'), false);
+    });
+  }
+});
+
 test('can hide transient process UI while continuing to stream the answer', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({

@@ -38,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - New deployments default ordinary assistant replies to the same completed-card format used by streaming replies.
+- Use “正在回复…” for running response-card summaries in Feishu chat lists
+  instead of exposing the internal platform name to end users.
 - Require `c4.assistant-response-stream >= 2`, `c4.outbound-delivery-id >= 1`,
   and `external-task-adapter >= 1`, so install and upgrade reject a Core that
   cannot provide turn-safe streaming, stable proactive card identity, and the

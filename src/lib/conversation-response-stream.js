@@ -291,7 +291,7 @@ function renderCard({
       update_multi: true,
       width_mode: 'fill',
       streaming_mode: streaming,
-      summary: { content: running ? 'Zylos 正在处理…' : phase },
+      summary: { content: running ? '正在回复…' : phase },
       ...(streaming
         ? {
             streaming_config: {
