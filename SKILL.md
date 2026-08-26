@@ -215,6 +215,20 @@ The installed Commitment Core must provide
 native completion semantics to that mapper and rejects any result other than
 the expected `SubmitForReview` command for the same Task, actor, and version.
 
+For a completion canary, record its exact Task GUID and Task v2 event ID, then
+run the live read-only gate after the status worker acknowledges the event:
+
+```sh
+npm run task-status:gate -- --input /absolute/path/completion-gate.json
+```
+
+The input names `coreDbPath`, `statusInboxDbPath`, `appId`, and a non-empty
+`cases` array of `{ "taskGuid": "...", "eventId": "..." }`. A pass proves the
+same remote Task is completed, the exact durable status settlement returned
+`submitted_for_review`, its Core command receipt exists, and the linked Core
+Task has exactly one review submission and zero acceptance events. This gate
+does not accept a Task on the reviewer's behalf.
+
 Do not start projection implicitly. An operator must first register one
 history policy in Commitment Core (`from_now` for a new business canary;
 `from_beginning` only after reviewing all existing tasks), then run one bounded

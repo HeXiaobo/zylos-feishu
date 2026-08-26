@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Add a live, read-only native completion gate that proves one exact Task v2
+  completion event settled durably, produced the expected Core command receipt,
+  left the linked Core Task in review, and did not auto-accept it.
 - Gate install and upgrade on Core's native Task mapper protocol, and establish
   the Task v2 server-side subscription once through the shared WebSocket/webhook
   startup gate before either transport can receive events.

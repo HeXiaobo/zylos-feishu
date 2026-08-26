@@ -563,6 +563,36 @@ inject Readers directly into the library Interface; those reports are marked
 non-live unless the SDK Reader is used. The gate never writes either SQLite
 database and its SDK Adapter exposes only Task/comment read operations.
 
+### 4.7 Native Task completion acceptance gate
+
+`evaluateNativeTaskCompletionClosure(...)` separately attests the status side
+of a native Task canary. Comment/reply evidence cannot substitute for this
+gate. Each case contains only the exact Task GUID and Task v2 event ID. The
+read-only gate derives every other assertion from the Feishu status inbox,
+Commitment Core database, and the live SDK Reader. It proves:
+
+- the GUID has one and only one `feishu-task-v2` link to the Core Task;
+- the exact App/event row is durably acknowledged and contains
+  `task_completed_update`;
+- its immutable settlement is `submitted_for_review`, contains
+  `SubmitForReview`, and never contains `AcceptTask`;
+- the event-specific Core command receipt is `TaskSubmittedForReview`;
+- the Core Task is in `review` with exactly one submission and zero acceptance
+  events; and
+- the same remote Task still has the linked Core marker, title, and a non-empty
+  completion timestamp.
+
+The production command is:
+
+```bash
+npm run task-status:gate -- --input /absolute/path/completion-gate.json
+```
+
+Only the SDK-assembled Reader can produce an attestable pass. Injected Readers
+may validate deterministic tests but report `evidenceMode: injected` and fail
+attestation. The gate writes neither database and never transitions Core from
+review to accepted.
+
 ---
 
 ## 5. Configuration

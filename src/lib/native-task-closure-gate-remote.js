@@ -53,10 +53,12 @@ function responseError(response, operation) {
 
 function taskSnapshot(rawTask, field = 'Feishu Task v2 task') {
   const task = requireRecord(rawTask, field);
+  const completedAt = optionalText(task.completed_at, `${field}.completed_at`);
   return Object.freeze({
     guid: requireText(task.guid, `${field}.guid`),
     summary: optionalText(task.summary, `${field}.summary`),
     coreTaskId: parseCoreTaskId(task.extra),
+    ...(completedAt === null ? {} : { completedAt }),
   });
 }
 

@@ -9,6 +9,7 @@
     "cli": "node src/cli.js",
     "task-comments:once": "node src/lib/task-comment-worker.js run --once",
     "task-comments:gate": "node scripts/native-task-closure-gate.js",
+    "task-status:gate": "node scripts/native-task-completion-gate.js",
     "test": "node --test"
   },
   "larkCli": {
