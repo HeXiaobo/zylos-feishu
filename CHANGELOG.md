@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.6] - 2026-08-27
+
+### Changed
+- Consolidate the tested `0.3.7-rc.5` native-task reminder release with the
+  Issue 8 collapsed streaming-process presentation in one release line.
+
 ## [0.3.7-rc.5] - 2026-08-26
 
 ### Added
@@ -52,10 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - New deployments default ordinary assistant replies to the same completed-card format used by streaming replies.
+- Use “正在回复…” for running response-card summaries in Feishu chat lists
+  instead of exposing the internal platform name to end users.
 - Require `c4.assistant-response-stream >= 2`, `c4.outbound-delivery-id >= 1`,
   `external-task-adapter >= 1`, and `task-reminder >= 1`, so install and upgrade reject a Core that
   cannot provide turn-safe streaming, stable proactive card identity, and the
   native completion mapper used at runtime.
+
+## [0.3.7-rc.4.issue8.2] - 2026-08-27
+
+### Changed
+- Replace the repeated numbered streaming-process list with one collapsed
+  current-status row whose public execution details can be expanded in place.
+- Add `message.streamProcessDisplay: "answer_only"` as a safe fallback that
+  streams only the answer body while keeping the completed-card behavior.
+- Preserve the collapsed process row when CardKit conversion is unavailable
+  and the same message must be updated through ordinary card patches.
 
 ## [0.3.7-rc.4] - 2026-08-26
 

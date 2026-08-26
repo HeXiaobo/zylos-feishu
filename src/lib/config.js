@@ -62,7 +62,8 @@ export const DEFAULT_CONFIG = {
   // Message settings
   message: {
     context_messages: 10,
-    useMarkdownCard: true
+    useMarkdownCard: true,
+    streamProcessDisplay: 'collapsible'
   }
 };
 
@@ -131,6 +132,13 @@ export function getConfig() {
     loadConfig();
   }
   return config;
+}
+
+export function getStreamProcessDisplay(value = getConfig()) {
+  const configured = value?.message?.streamProcessDisplay;
+  return ['collapsible', 'answer_only'].includes(configured)
+    ? configured
+    : DEFAULT_CONFIG.message.streamProcessDisplay;
 }
 
 /**

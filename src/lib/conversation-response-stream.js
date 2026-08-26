@@ -17,6 +17,7 @@ const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 120_000;
 const MAX_SEQUENCE = 2_147_483_647;
+const PROCESS_DISPLAYS = new Set(['collapsible', 'answer_only']);
 const EVENT_TYPES = new Set([
   'AssistantRequestAccepted',
   'RunQueued',
@@ -190,9 +191,9 @@ function phaseForEvent(event) {
   switch (event.type) {
     case 'AssistantRequestAccepted': return '✅ 已接收';
     case 'RunQueued': return '⏳ 排队中';
-    case 'RunStarted': return '▶️ 已开始处理';
+    case 'RunStarted': return '思考中';
     case 'ProgressUpdated': return publicProgressText(event.payload);
-    case 'OutputDelta': return '✍️ 正在生成回答';
+    case 'OutputDelta': return '正在生成回答';
     case 'RunCompleted': return '✅ 已完成';
     case 'RunFailed': return event.payload?.retryable
       ? '⚠️ 本次处理未完成，可重试'
@@ -237,14 +238,28 @@ function appendPublicReasoning(state, delta) {
 }
 
 function renderProcessTrace(progress, publicReasoning) {
-  const stages = progress.map((step, index) => `${index + 1}. ${step}`).join('\n');
+  const stages = progress.map(step => `- ${step}`).join('\n');
   const reasoning = publicReasoning.trim();
   return [
-    '**处理过程（实时）**',
-    '_仅展示可公开的阶段与工作摘要，不含模型隐藏思维；完成后自动收起_',
     stages,
-    reasoning ? `\n**公开工作摘要**\n${reasoning}` : '',
+    reasoning ? `\n**工作摘要**\n${reasoning}` : '',
+    '_仅展示可公开信息，不含模型隐藏思维_',
   ].filter(Boolean).join('\n');
+}
+
+function renderProcessPanel(phase, progress, publicReasoning) {
+  return {
+    tag: 'collapsible_panel',
+    element_id: PROGRESS_ELEMENT_ID,
+    expanded: false,
+    header: {
+      title: { tag: 'plain_text', content: phase },
+    },
+    elements: [{
+      tag: 'markdown',
+      content: renderProcessTrace(progress, publicReasoning),
+    }],
+  };
 }
 
 function clearTransientProcess(state) {
@@ -258,19 +273,25 @@ function renderCard({
   progress = [],
   publicReasoning = '',
   streaming,
+  running = streaming,
   part,
   totalParts,
+  processDisplay = 'collapsible',
 }) {
   const continuation = part > 0
     ? `\n\n_续 ${part + 1}${totalParts > 1 ? ` / ${totalParts}` : ''}_`
     : '';
+  const showProcess = processDisplay === 'collapsible'
+    && running
+    && (publicReasoning || progress.length > 0);
+  const showPhase = !running || (processDisplay === 'collapsible' && !showProcess);
   const card = {
     schema: '2.0',
     config: {
       update_multi: true,
       width_mode: 'fill',
       streaming_mode: streaming,
-      summary: { content: streaming ? 'Zylos 正在处理…' : phase },
+      summary: { content: running ? '正在回复…' : phase },
       ...(streaming
         ? {
             streaming_config: {
@@ -283,19 +304,14 @@ function renderCard({
     },
     body: {
       elements: [
-        { tag: 'markdown', element_id: PHASE_ELEMENT_ID, content: phase },
+        ...(showProcess
+          ? [renderProcessPanel(phase, progress, publicReasoning)]
+          : (showPhase ? [{ tag: 'markdown', element_id: PHASE_ELEMENT_ID, content: phase }] : [])),
         {
           tag: 'markdown',
           element_id: ANSWER_ELEMENT_ID,
-          content: `${answer || (streaming ? '_等待回答…_' : '_没有可显示的回答_')}${continuation}`,
+          content: `${answer || (running ? '_等待回答…_' : '_没有可显示的回答_')}${continuation}`,
         },
-        ...(streaming && (publicReasoning || progress.length > 0)
-          ? [{
-              tag: 'markdown',
-              element_id: PROGRESS_ELEMENT_ID,
-              content: renderProcessTrace(progress, publicReasoning),
-            }]
-          : []),
       ],
     },
   };
@@ -410,6 +426,7 @@ export function createConversationResponseStream({
   pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
   throttleMs = DEFAULT_THROTTLE_MS,
   answerBytesPerCard = DEFAULT_ANSWER_BYTES_PER_CARD,
+  processDisplay = 'collapsible',
   logger = console,
 } = {}) {
   requireRecord(client, 'client');
@@ -420,6 +437,7 @@ export function createConversationResponseStream({
   if (!Number.isSafeInteger(answerBytesPerCard) || answerBytesPerCard < 256) {
     throw new TypeError('answerBytesPerCard is invalid');
   }
+  if (!PROCESS_DISPLAYS.has(processDisplay)) throw new TypeError('processDisplay is invalid');
 
   function load(requestId) {
     return readState(statePath(stateDirectory, requestId));
@@ -517,8 +535,10 @@ export function createConversationResponseStream({
       progress: state.progress,
       publicReasoning: state.publicReasoning,
       streaming: false,
+      running: true,
       part: 0,
       totalParts: 1,
+      processDisplay,
     });
     await patchOrdinary(initial.messageId, ordinary);
     initial.rendered = ordinary;
@@ -572,8 +592,10 @@ export function createConversationResponseStream({
       progress: state.progress,
       publicReasoning: state.publicReasoning,
       streaming: !terminal,
+      running: !terminal && part === totalParts - 1,
       part,
       totalParts,
+      processDisplay,
     });
     const messageId = await sendInteractive(
       client,
@@ -641,8 +663,10 @@ export function createConversationResponseStream({
         progress: state.progress,
         publicReasoning: state.publicReasoning,
         streaming: state.mode === 'cardkit' && !terminal && part === segments.length - 1,
+        running: !terminal && part === segments.length - 1,
         part,
         totalParts: segments.length,
+        processDisplay,
       });
       if (JSON.stringify(cardState.rendered) !== JSON.stringify(card)) {
         await updateCard(state, cardState, card, purpose);
@@ -725,6 +749,7 @@ export function createConversationResponseStream({
       streaming: true,
       part: 0,
       totalParts: 1,
+      processDisplay,
     });
     if (state.delivery.kind === 'interactive_placeholder') {
       let messageId;
@@ -908,6 +933,7 @@ export function createConversationResponseStream({
               streaming: false,
               part,
               totalParts: segments.length,
+              processDisplay,
             });
             state.delivery.part = part;
             state.delivery.uuid = stableToken(requestId, `completed:${part}`);

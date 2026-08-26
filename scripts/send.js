@@ -17,7 +17,12 @@ import fs from 'fs';
 import path from 'path';
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
-import { getConfig, DATA_DIR, getCredentials } from '../src/lib/config.js';
+import {
+  getConfig,
+  getStreamProcessDisplay,
+  DATA_DIR,
+  getCredentials,
+} from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage } from '../src/lib/message.js';
@@ -194,7 +199,10 @@ async function sendText(endpoint, text) {
       const replyToMessageId = chooseReplyTarget(parsedEndpoint, { isFirstChunk: true }) || null;
       const cardText = convertAtMentionsForCard(buildMentionMarkdown(text));
       try {
-        const responseStream = createConversationResponseStream({ client: getClient() });
+        const responseStream = createConversationResponseStream({
+          client: getClient(),
+          processDisplay: getStreamProcessDisplay(config),
+        });
         await responseStream.sendCompleted({
           requestId,
           target: {
@@ -449,7 +457,10 @@ async function send() {
       let streamed = false;
       if (assistantRequestId && !mediaMatch) {
         try {
-          const responseStream = createConversationResponseStream({ client: getClient() });
+          const responseStream = createConversationResponseStream({
+            client: getClient(),
+            processDisplay: getStreamProcessDisplay(config),
+          });
           const result = await responseStream.completeWithFullAnswer({
             requestId: assistantRequestId,
             output: message,
