@@ -69,8 +69,8 @@ zylos uninstall feishu
 |----------|--------------|
 | Private chat (owner/whitelisted) | Responds via Claude |
 | @mention in allowed group | Responds with recent context |
-| Message in an explicitly configured smart group | Responds without @mention; structured task intake remains disabled |
-| Owner @mention in any group | Always responds |
+| Message in an explicitly configured smart group | Evaluated without @mention; irrelevant or unauthorized passive traffic stays silent, and structured task intake remains disabled |
+| Owner @mention in any group | Responds unless group chat is globally disabled |
 | Unknown user | Ignored |
 
 ## Natural-language WorkIntake
@@ -99,7 +99,11 @@ WorkIntake is opt-in. Set `workIntake.enabled` in
 Non-owner policies require an exact tenant match and every decision is appended
 to `logs/member-access-audit.jsonl`. Group task and WorkIntake entry always
 require an exact bot @mention. Smart mode affects ordinary conversation only;
-no-mention messages are not mapped into the structured task protocol.
+no-mention messages are not mapped into the structured task protocol. An
+explicitly configured group uses its own `allowFrom` sender policy, including
+for external members; the global member policy still protects direct messages
+and unconfigured groups admitted by `groupPolicy: "open"`. WorkIntake remains
+exact-mention gated and requires its dedicated capability configuration.
 Stable confirmation data is persisted to a local `0600` outbox before delivery.
 Each attempt signs a fresh card, and transient failures or process restarts retry
 with the same Feishu UUID.

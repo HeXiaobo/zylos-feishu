@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.7-rc.2
+version: 0.3.7-rc.3
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),
@@ -495,11 +495,13 @@ DM and group access are controlled by **independent** top-level policies:
 6. Not smart? → only exact bot @mentions are processed; other messages are ignored before content parsing
 
 **Key points:**
-- Owner always bypasses all access checks
+- Owner bypasses group allowlists and sender filters, but not `groupPolicy: "disabled"`
 - `dmPolicy` and `groupPolicy` are fully independent — changing one never affects the other
 - Group access is controlled by `groupPolicy` + `groups` config + per-group `allowFrom`
 - No user-level whitelist for groups; use per-group `allowFrom` if you need to restrict specific senders
 - Smart mode is opt-in compatibility behavior. A no-mention smart message is not mapped into the structured Commitment Core task protocol.
+- An explicitly configured group owns its `allowFrom` sender policy, including for external members. The global `memberAccessPolicy` still protects direct messages and unconfigured groups admitted by `groupPolicy: "open"`; WorkIntake remains exact-mention gated and requires its dedicated capability configuration.
+- Passive Smart-group authorization failures and terminal runtime `[SKIP]` decisions produce no typing indicator, card, or permission reply. A visible denial is reserved for an explicit bot @mention.
 
 ### Groups Config Format
 
@@ -534,6 +536,11 @@ Groups are stored in a map keyed by `chat_id`:
 
 Assistant text is rendered consistently as an interactive response card,
 including plain text, Markdown, streamed replies, and proactive C4 delivery:
+
+Passive Smart-group evaluation does not open a placeholder card. A card is sent
+only when the runtime returns substantive user-facing content; a terminal
+standalone `[SKIP]` marker (with or without a preceding runtime explanation) is
+treated as a compatibility control response and is not delivered.
 
 ```json
 {
