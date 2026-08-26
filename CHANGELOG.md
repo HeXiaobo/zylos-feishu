@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot provide turn-safe streaming, stable proactive card identity, and the
   native completion mapper used at runtime.
 
-## [0.3.7-rc.3] - 2026-08-26
+## [0.3.7-rc.4] - 2026-08-26
 
 ### Fixed
 - Run a bounded status watchdog at startup and every 60 seconds so a completely
