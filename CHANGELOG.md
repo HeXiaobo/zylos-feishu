@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Gate install and upgrade on Core's native Task mapper protocol, and establish
+  the Task v2 server-side subscription once through the shared WebSocket/webhook
+  startup gate before either transport can receive events.
 - Persist response-card delivery intent before sending, retry ambiguous Feishu outcomes with the same UUID, and use a single idempotent plain fallback only after explicit card rejection.
 - Derive proactive card identity from Core's stable `C4_DELIVERY_ID`; sends without a durable identity degrade safely instead of inventing a new UUID on every process invocation.
 - Compact terminal response-stream state to a hash-only tombstone so full answers and public work summaries are not retained indefinitely.
@@ -15,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - New deployments default ordinary assistant replies to the same completed-card format used by streaming replies.
-- Require `c4.assistant-response-stream >= 2` and `c4.outbound-delivery-id >= 1`, so install and upgrade reject a Core that cannot provide turn-safe streaming plus stable proactive card identity.
+- Require `c4.assistant-response-stream >= 2`, `c4.outbound-delivery-id >= 1`,
+  and `external-task-adapter >= 1`, so install and upgrade reject a Core that
+  cannot provide turn-safe streaming, stable proactive card identity, and the
+  native completion mapper used at runtime.
 
 ## [0.3.7-3ai.5] - 2026-08-26
 

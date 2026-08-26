@@ -20,6 +20,10 @@ describe('release metadata', () => {
       capabilities.requires['zylos-core'].protocols['c4.outbound-delivery-id'],
       1,
     );
+    assert.equal(
+      capabilities.requires['zylos-core'].protocols['external-task-adapter'],
+      1,
+    );
     assert.equal(pkg.repository.url, 'git+https://github.com/HeXiaobo/zylos-feishu.git');
     assert.equal(pkg.engines.node, '>=20.20.0');
     assert.match(skill, /^version: 0\.3\.7-rc\.1$/m);

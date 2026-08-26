@@ -173,10 +173,11 @@ task versions as CardKit update sequences, and signed callback contexts.
 
 The paired release's pre-install/pre-upgrade gate also requires Core's
 `c4.reply.argv-compat`, `c4.assistant-response-stream >= 2`, and
-`c4.outbound-delivery-id >= 1` capabilities. Response-stream v2 binds output to
-the exact runtime turn; the outbound-delivery capability separately guarantees
-the stable identity used by proactive cards. An older Core must fail the
-compatibility gate instead of starting this component.
+`c4.outbound-delivery-id >= 1` capabilities, plus
+`external-task-adapter >= 1` for native completion. Response-stream v2 binds
+output to the exact runtime turn; the outbound-delivery capability separately
+guarantees the stable identity used by proactive cards. An older Core must fail
+the compatibility gate instead of starting this component.
 
 Configure deployment identity explicitly in `~/zylos/.env`; the universal
 component has no built-in Agent name or logical Agent-to-App mapping:
@@ -201,12 +202,14 @@ permissions, then subscribe to `task.task.update_user_access_v2`,
 requires `COMMITMENT_FEISHU_TASK_V2_ENABLED=1`; comment sync additionally
 requires `FEISHU_TASK_COMMENTS_ENABLED=1`.
 
-When Task v2 status sync is enabled in long-connection mode, startup first
-creates the Task v2 subscription relation with the configured App identity and
-fails closed if that call fails. App identity receives real-time changes only
-for Tasks for which that App is responsible; personally followed user Tasks
-are outside the managed real-time SLA. The legacy `task.task.updated_v1`
-handler remains registered only for the migration window.
+When Task v2 status sync is enabled, the common WebSocket/Webhook startup gate
+first creates the Task v2 subscription relation with the configured App
+identity and fails closed before starting either transport if that call fails.
+One successful relation is reused within the process instead of issuing
+duplicate subscription calls. App identity receives real-time changes only for
+Tasks for which that App is responsible; personally followed user Tasks are
+outside the managed real-time SLA. The legacy `task.task.updated_v1` handler
+remains registered only for the migration window.
 The installed Commitment Core must provide
 `scripts/external-task-adapter.js#mapExternalTaskEvent`; Feishu delegates
 native completion semantics to that mapper and rejects any result other than

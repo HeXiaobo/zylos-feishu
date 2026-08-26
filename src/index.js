@@ -67,7 +67,7 @@ import {
 } from './lib/task-v2-runtime-policy.js';
 import {
   createTaskV2SubscriptionAdapter,
-  startTaskV2LongConnection,
+  startTaskV2Transport,
 } from './lib/task-v2-subscription.js';
 import { initializeTaskCommentIntake } from './lib/task-comment-intake.js';
 import { isTaskCommentsEnabled } from './lib/task-comment-runtime-policy.js';
@@ -2301,42 +2301,29 @@ function drainInboundMessages() {
 // Transport: WebSocket mode (Feishu SDK WSClient)
 // ============================================================
 
-async function startWebSocket(creds) {
-  const subscriptionClient = new Lark.Client({
+function startWebSocket(creds) {
+  wsClient = new Lark.WSClient({
     appId: creds.app_id,
     appSecret: creds.app_secret,
-    appType: Lark.AppType.SelfBuild,
     domain: Lark.Domain.Feishu,
+    loggerLevel: Lark.LoggerLevel.info,
+    autoReconnect: true
   });
 
-  await startTaskV2LongConnection({
-    enabled: taskV2Enabled,
-    subscription: createTaskV2SubscriptionAdapter({ client: subscriptionClient }),
-    start() {
-      wsClient = new Lark.WSClient({
-        appId: creds.app_id,
-        appSecret: creds.app_secret,
-        domain: Lark.Domain.Feishu,
-        loggerLevel: Lark.LoggerLevel.info,
-        autoReconnect: true
-      });
+  console.log('[feishu] Connecting to Feishu via WebSocket...');
 
-      console.log('[feishu] Connecting to Feishu via WebSocket...');
-
-      wsClient.start({
-        eventDispatcher: new Lark.EventDispatcher({}).register({
-          'im.message.receive_v1': async (data) => {
-            persistInboundMessage(data, data.event_id || data.header?.event_id || null);
-            void drainInboundMessages().catch((err) => {
-              console.error(`[feishu] Inbound inbox drain failed: ${err.message}`);
-            });
-          },
-          ...taskV2EventHandlers,
-          ...taskCardEventHandlers,
-          ...taskCommentEventHandlers,
-        })
-      });
-    },
+  wsClient.start({
+    eventDispatcher: new Lark.EventDispatcher({}).register({
+      'im.message.receive_v1': async (data) => {
+        persistInboundMessage(data, data.event_id || data.header?.event_id || null);
+        void drainInboundMessages().catch((err) => {
+          console.error(`[feishu] Inbound inbox drain failed: ${err.message}`);
+        });
+      },
+      ...taskV2EventHandlers,
+      ...taskCardEventHandlers,
+      ...taskCommentEventHandlers,
+    })
   });
 }
 
@@ -2653,15 +2640,27 @@ if (!creds.app_id || !creds.app_secret) {
     return;
   }
 
-  // Start selected transport
-  if (connectionMode === 'webhook') {
-    startWebhook(creds);
-  } else {
-    try {
-      await startWebSocket(creds);
-    } catch (error) {
-      console.error(`[feishu] WebSocket startup failed closed: ${error.message}`);
-      process.exit(1);
-    }
+  // Establish the App-scoped Task v2 relation before either event transport.
+  try {
+    const subscription = taskV2Enabled
+      ? createTaskV2SubscriptionAdapter({
+        client: new Lark.Client({
+          appId: creds.app_id,
+          appSecret: creds.app_secret,
+          appType: Lark.AppType.SelfBuild,
+          domain: Lark.Domain.Feishu,
+        }),
+      })
+      : undefined;
+    await startTaskV2Transport({
+      enabled: taskV2Enabled,
+      subscription,
+      start: connectionMode === 'webhook'
+        ? () => startWebhook(creds)
+        : () => startWebSocket(creds),
+    });
+  } catch (error) {
+    console.error(`[feishu] ${connectionMode} startup failed closed: ${error.message}`);
+    process.exit(1);
   }
 })();

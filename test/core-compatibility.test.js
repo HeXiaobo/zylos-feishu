@@ -34,6 +34,7 @@ test('accepts a Core that satisfies every required protocol', (t) => {
       'work-intake': 1,
       'commitment-core': 1,
       'projection-outbox': 1,
+      'external-task-adapter': 1,
     },
   });
 
@@ -70,6 +71,7 @@ test('reports every missing or outdated protocol before upgrade', (t) => {
     'Protocol work-intake requires >= 1, found missing',
     'Protocol commitment-core requires >= 1, found missing',
     'Protocol projection-outbox requires >= 1, found missing',
+    'Protocol external-task-adapter requires >= 1, found missing',
   ]);
 });
 
@@ -85,6 +87,7 @@ test('rejects a stream-v2 Core that lacks stable outbound delivery identity', (t
       'work-intake': 1,
       'commitment-core': 1,
       'projection-outbox': 1,
+      'external-task-adapter': 1,
     },
   });
 
@@ -98,7 +101,33 @@ test('rejects a stream-v2 Core that lacks stable outbound delivery identity', (t
   ]);
 });
 
-test('pre-upgrade aborts before backing up config when Core is incompatible', (t) => {
+test('rejects an otherwise compatible Core that lacks the external Task mapper protocol', (t) => {
+  const cli = fakeZylos(t, {
+    schemaVersion: 1,
+    product: 'zylos-core',
+    release: '0.7.2-rc.3',
+    protocols: {
+      'c4.reply': 2,
+      'c4.reply.argv-compat': 1,
+      'c4.assistant-response-stream': 2,
+      'c4.outbound-delivery-id': 1,
+      'work-intake': 1,
+      'commitment-core': 1,
+      'projection-outbox': 1,
+    },
+  });
+
+  const result = checkCoreCompatibility({
+    env: { ...process.env, ZYLOS_CLI_PATH: cli },
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.errors, [
+    'Protocol external-task-adapter requires >= 1, found missing',
+  ]);
+});
+
+test('pre-upgrade aborts before backup when Core lacks the external Task mapper', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-pre-upgrade-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const configDir = path.join(home, 'zylos', 'components', 'feishu');
@@ -108,8 +137,16 @@ test('pre-upgrade aborts before backing up config when Core is incompatible', (t
   const cli = fakeZylos(t, {
     schemaVersion: 1,
     product: 'zylos-core',
-    release: '0.7.1',
-    protocols: {},
+    release: '0.7.2-rc.3',
+    protocols: {
+      'c4.reply': 2,
+      'c4.reply.argv-compat': 1,
+      'c4.assistant-response-stream': 2,
+      'c4.outbound-delivery-id': 1,
+      'work-intake': 1,
+      'commitment-core': 1,
+      'projection-outbox': 1,
+    },
   });
   const result = spawnSync(process.execPath, [path.join(ROOT, 'hooks', 'pre-upgrade.js')], {
     cwd: ROOT,
@@ -119,5 +156,6 @@ test('pre-upgrade aborts before backing up config when Core is incompatible', (t
 
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Incompatible zylos-core/);
+  assert.match(result.stderr, /external-task-adapter requires >= 1, found missing/);
   assert.equal(fs.existsSync(path.join(configDir, 'config.json.backup')), false);
 });

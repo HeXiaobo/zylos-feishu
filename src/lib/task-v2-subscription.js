@@ -18,26 +18,37 @@ export function createTaskV2SubscriptionAdapter({ client } = {}) {
   if (typeof sdk.request !== 'function') {
     throw new TypeError('client.request must be a function');
   }
+  let subscribed = null;
+  let pending = null;
   return Object.freeze({
     async subscribe() {
-      const response = await sdk.request({
-        method: 'POST',
-        url: TASK_V2_SUBSCRIPTION_URL,
-      });
-      if (response?.code !== 0) {
-        const code = response?.code ?? 'unknown';
-        const message = typeof response?.msg === 'string' && response.msg.trim() !== ''
-          ? response.msg.trim()
-          : 'unknown Feishu response';
-        throw new Error(`Task v2 subscription failed (${code}): ${message}`);
+      if (subscribed) return subscribed;
+      if (!pending) {
+        pending = (async () => {
+          const response = await sdk.request({
+            method: 'POST',
+            url: TASK_V2_SUBSCRIPTION_URL,
+          });
+          if (response?.code !== 0) {
+            const code = response?.code ?? 'unknown';
+            const message = typeof response?.msg === 'string' && response.msg.trim() !== ''
+              ? response.msg.trim()
+              : 'unknown Feishu response';
+            throw new Error(`Task v2 subscription failed (${code}): ${message}`);
+          }
+          subscribed = Object.freeze({ status: 'subscribed' });
+          return subscribed;
+        })().finally(() => {
+          pending = null;
+        });
       }
-      return Object.freeze({ status: 'subscribed' });
+      return pending;
     },
   });
 }
 
-/** Fail-closed startup gate for the long-connection Task event transport. */
-export async function startTaskV2LongConnection({ enabled, subscription, start } = {}) {
+/** Fail-closed startup gate shared by every Task v2 event transport. */
+export async function startTaskV2Transport({ enabled, subscription, start } = {}) {
   if (typeof enabled !== 'boolean') throw new TypeError('enabled must be a boolean');
   if (enabled && typeof subscription?.subscribe !== 'function') {
     throw new TypeError('subscription.subscribe must be a function');

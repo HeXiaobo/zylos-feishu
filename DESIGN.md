@@ -335,9 +335,11 @@ does not mutate Core or depend on Core availability, and reconciliation can
 repair a missed reverse event from current native state.
 
 The Feishu App needs `task:task:read` and `task:task:write`, plus the
-`task.task.update_user_access_v2` event subscription. Before starting the
-long connection, the component calls the Task v2 subscription API with the
-same bot identity and fails closed if that relation cannot be established.
+`task.task.update_user_access_v2` event subscription. Before starting either
+the WebSocket or webhook event transport, their common startup gate calls the
+Task v2 subscription API with the same bot identity and fails closed if that
+relation cannot be established. Successful subscription is memoized within
+the process so concurrent or repeated startup attempts do not duplicate it.
 Bot identity covers only Tasks for which the current App is responsible; a
 user's personally followed Tasks are not part of this managed real-time SLA.
 The current native envelope's `event_types` are retained in the durable inbox:

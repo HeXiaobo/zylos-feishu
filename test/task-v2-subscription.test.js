@@ -3,10 +3,10 @@ import test from 'node:test';
 
 import {
   createTaskV2SubscriptionAdapter,
-  startTaskV2LongConnection,
+  startTaskV2Transport,
 } from '../src/lib/task-v2-subscription.js';
 
-test('Task v2 subscription Adapter calls the bot subscription endpoint exactly once', async () => {
+test('Task v2 subscription Adapter establishes one successful server-side subscription', async () => {
   const requests = [];
   const adapter = createTaskV2SubscriptionAdapter({
     client: {
@@ -17,6 +17,7 @@ test('Task v2 subscription Adapter calls the bot subscription endpoint exactly o
     },
   });
 
+  assert.deepEqual(await adapter.subscribe(), { status: 'subscribed' });
   assert.deepEqual(await adapter.subscribe(), { status: 'subscribed' });
   assert.deepEqual(requests, [{
     method: 'POST',
@@ -39,9 +40,34 @@ test('Task v2 subscription Adapter rejects a Feishu business failure', async () 
   );
 });
 
-test('Task v2 long connection subscribes before starting the event transport', async () => {
+test('Task v2 subscription Adapter coalesces concurrent startup attempts', async () => {
+  let releaseRequest;
+  let requests = 0;
+  const response = new Promise((resolve) => { releaseRequest = resolve; });
+  const adapter = createTaskV2SubscriptionAdapter({
+    client: {
+      async request() {
+        requests += 1;
+        return response;
+      },
+    },
+  });
+
+  const first = adapter.subscribe();
+  const second = adapter.subscribe();
+  assert.equal(requests, 1);
+  releaseRequest({ code: 0, msg: 'success' });
+
+  assert.deepEqual(await Promise.all([first, second]), [
+    { status: 'subscribed' },
+    { status: 'subscribed' },
+  ]);
+});
+
+test('Task v2 transport subscribes before starting a webhook or WebSocket transport', async () => {
   const order = [];
-  await startTaskV2LongConnection({
+
+  await startTaskV2Transport({
     enabled: true,
     subscription: {
       async subscribe() { order.push('subscribe'); },
@@ -52,11 +78,11 @@ test('Task v2 long connection subscribes before starting the event transport', a
   assert.deepEqual(order, ['subscribe', 'start']);
 });
 
-test('Task v2 long connection stays stopped when subscription fails', async () => {
+test('Task v2 transport stays stopped when subscription fails', async () => {
   let starts = 0;
   const outage = new Error('subscription unavailable');
 
-  await assert.rejects(startTaskV2LongConnection({
+  await assert.rejects(startTaskV2Transport({
     enabled: true,
     subscription: {
       async subscribe() { throw outage; },
