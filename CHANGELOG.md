@@ -43,13 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot provide turn-safe streaming, stable proactive card identity, and the
   native completion mapper used at runtime.
 
-## [0.3.7-rc.4.issue8.1] - 2026-08-27
+## [0.3.7-rc.4.issue8.2] - 2026-08-27
 
 ### Changed
 - Replace the repeated numbered streaming-process list with one collapsed
   current-status row whose public execution details can be expanded in place.
 - Add `message.streamProcessDisplay: "answer_only"` as a safe fallback that
   streams only the answer body while keeping the completed-card behavior.
+- Preserve the collapsed process row when CardKit conversion is unavailable
+  and the same message must be updated through ordinary card patches.
 
 ## [0.3.7-rc.4] - 2026-08-26
 

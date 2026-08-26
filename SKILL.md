@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.7-rc.4.issue8.1
+version: 0.3.7-rc.4.issue8.2
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),

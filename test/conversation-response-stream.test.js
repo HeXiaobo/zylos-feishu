@@ -213,6 +213,26 @@ test('uses the compact thinking status before tool progress arrives', () => with
   assert.equal(cardElement(card, 'zylos_progress').header.title.content, '思考中');
 }));
 
+test('keeps the collapsed process panel when CardKit falls back to ordinary card patches', () => withState(async stateDirectory => {
+  const { client, calls } = createClient({ conversion: false });
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'RunStarted'),
+      event(2, 'ProgressUpdated', { stage: 'reading' }),
+    ],
+  });
+
+  const card = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+  assert.equal(card.config.streaming_mode, false);
+  assert.equal(cardElement(card, 'zylos_progress').tag, 'collapsible_panel');
+  assert.equal(cardElement(card, 'zylos_progress').expanded, false);
+  assert.match(cardElement(card, 'zylos_progress').elements[0].content, /正在读取资料/);
+  assert.match(cardElement(card, 'zylos_answer').content, /等待回答/);
+}));
+
 test('can hide transient process UI while continuing to stream the answer', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({

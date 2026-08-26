@@ -273,6 +273,7 @@ function renderCard({
   progress = [],
   publicReasoning = '',
   streaming,
+  running = streaming,
   part,
   totalParts,
   processDisplay = 'collapsible',
@@ -281,16 +282,16 @@ function renderCard({
     ? `\n\n_续 ${part + 1}${totalParts > 1 ? ` / ${totalParts}` : ''}_`
     : '';
   const showProcess = processDisplay === 'collapsible'
-    && streaming
+    && running
     && (publicReasoning || progress.length > 0);
-  const showPhase = !streaming || (processDisplay === 'collapsible' && !showProcess);
+  const showPhase = !running || (processDisplay === 'collapsible' && !showProcess);
   const card = {
     schema: '2.0',
     config: {
       update_multi: true,
       width_mode: 'fill',
       streaming_mode: streaming,
-      summary: { content: streaming ? 'Zylos 正在处理…' : phase },
+      summary: { content: running ? 'Zylos 正在处理…' : phase },
       ...(streaming
         ? {
             streaming_config: {
@@ -309,7 +310,7 @@ function renderCard({
         {
           tag: 'markdown',
           element_id: ANSWER_ELEMENT_ID,
-          content: `${answer || (streaming ? '_等待回答…_' : '_没有可显示的回答_')}${continuation}`,
+          content: `${answer || (running ? '_等待回答…_' : '_没有可显示的回答_')}${continuation}`,
         },
       ],
     },
@@ -534,6 +535,7 @@ export function createConversationResponseStream({
       progress: state.progress,
       publicReasoning: state.publicReasoning,
       streaming: false,
+      running: true,
       part: 0,
       totalParts: 1,
       processDisplay,
@@ -590,6 +592,7 @@ export function createConversationResponseStream({
       progress: state.progress,
       publicReasoning: state.publicReasoning,
       streaming: !terminal,
+      running: !terminal && part === totalParts - 1,
       part,
       totalParts,
       processDisplay,
@@ -660,6 +663,7 @@ export function createConversationResponseStream({
         progress: state.progress,
         publicReasoning: state.publicReasoning,
         streaming: state.mode === 'cardkit' && !terminal && part === segments.length - 1,
+        running: !terminal && part === segments.length - 1,
         part,
         totalParts: segments.length,
         processDisplay,
