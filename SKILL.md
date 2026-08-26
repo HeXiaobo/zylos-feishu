@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.7-rc.4
+version: 0.3.7-rc.5
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),
@@ -174,7 +174,8 @@ task versions as CardKit update sequences, and signed callback contexts.
 The paired release's pre-install/pre-upgrade gate also requires Core's
 `c4.reply.argv-compat`, `c4.assistant-response-stream >= 2`, and
 `c4.outbound-delivery-id >= 1` capabilities, plus
-`external-task-adapter >= 1` for native completion. Response-stream v2 binds
+`external-task-adapter >= 1` for native completion and `task-reminder >= 1`
+for canonical reminder persistence. Response-stream v2 binds
 output to the exact runtime turn; the outbound-delivery capability separately
 guarantees the stable identity used by proactive cards. An older Core must fail
 the compatibility gate instead of starting this component.
@@ -217,6 +218,11 @@ The installed Commitment Core must provide
 `scripts/external-task-adapter.js#mapExternalTaskEvent`; Feishu delegates
 native completion semantics to that mapper and rejects any result other than
 the expected `SubmitForReview` command for the same Task, actor, and version.
+Reminder-aware intake sends `reminderMinutesBeforeDue` only with a canonical
+`dueAt`; `60` means one hour before the deadline. Feishu Task create/patch does
+not carry reminders, so the Task v2 Adapter uses the separate add/remove
+reminder operations and returns success only after an authoritative Task get
+reads back the exact offset.
 
 For a completion canary, record its exact Task GUID and Task v2 event ID, then
 run the live read-only gate after the status worker acknowledges the event:

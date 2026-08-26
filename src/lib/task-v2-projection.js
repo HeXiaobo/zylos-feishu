@@ -24,6 +24,14 @@ function requireText(value, field) {
   return value.trim();
 }
 
+function optionalReminderMinutes(value, field) {
+  if (value === undefined || value === null) return value;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
 function stableClientToken(parts) {
   return `zt2_${createHash('sha256').update(JSON.stringify(parts)).digest('hex').slice(0, 40)}`;
 }
@@ -55,10 +63,21 @@ function requireDeliveries(value) {
 
 function validateRemoteTask(value, operation) {
   const task = requireRecord(value, `${operation} result`);
+  const reminderMinutesBeforeDue = optionalReminderMinutes(
+    task.reminderMinutesBeforeDue,
+    `${operation} result.reminderMinutesBeforeDue`,
+  );
   return Object.freeze({
     guid: requireText(task.guid, `${operation} result.guid`),
     url: requireText(task.url, `${operation} result.url`),
+    ...(reminderMinutesBeforeDue === undefined ? {} : { reminderMinutesBeforeDue }),
   });
+}
+
+function reminderReceipt(remote) {
+  return remote.reminderMinutesBeforeDue === undefined
+    ? {}
+    : { reminderMinutesBeforeDue: remote.reminderMinutesBeforeDue };
 }
 
 function linkRemoteTask(core, task, remote) {
@@ -137,6 +156,7 @@ export function createTaskV2Projection({ core, gateway, memberMapper } = {}) {
         url: updated.url,
         created: false,
         recovered: false,
+        ...reminderReceipt(updated),
       });
     }
 
@@ -158,6 +178,7 @@ export function createTaskV2Projection({ core, gateway, memberMapper } = {}) {
         url: updated.url,
         created: false,
         recovered: true,
+        ...reminderReceipt(updated),
       });
     }
 
@@ -173,6 +194,7 @@ export function createTaskV2Projection({ core, gateway, memberMapper } = {}) {
       url: created.url,
       created: true,
       recovered: false,
+      ...reminderReceipt(created),
     });
   }
 

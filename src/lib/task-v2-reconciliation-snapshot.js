@@ -86,6 +86,7 @@ export async function collectTaskV2ReconciliationSnapshot({
   const actual = [];
   const missingLinks = [];
   const linkMismatches = [];
+  const reminderDrifts = [];
   const statusRepairCandidates = [];
   for (const [index, taskValue] of coreTasks.entries()) {
     throwIfAborted(signal);
@@ -109,6 +110,16 @@ export async function collectTaskV2ReconciliationSnapshot({
         externalId: remote.guid,
         url: remote.url,
       });
+      const expectedReminder = task.reminderMinutesBeforeDue ?? null;
+      const actualReminder = remote.reminderMinutesBeforeDue ?? null;
+      if (expectedReminder !== actualReminder) {
+        reminderDrifts.push({
+          taskId: task.id,
+          taskGuid: remote.guid,
+          expectedMinutesBeforeDue: expectedReminder,
+          actualMinutesBeforeDue: actualReminder,
+        });
+      }
       if (
         projectionStateFromCore(task) === 'open'
         && projectionStateFromRemote(remote) === 'completed'
@@ -132,6 +143,7 @@ export async function collectTaskV2ReconciliationSnapshot({
     actual: Object.freeze(actual),
     missingLinks: Object.freeze(missingLinks),
     linkMismatches: Object.freeze(linkMismatches),
+    reminderDrifts: Object.freeze(reminderDrifts),
     statusRepairCandidates: Object.freeze(statusRepairCandidates),
   });
 }

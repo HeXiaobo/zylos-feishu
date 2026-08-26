@@ -15,7 +15,7 @@ const SECRET = 'feishu-card-context-secret-32-bytes';
 test('routes an explicit create protocol to C4 with a normalized task envelope', () => {
   const route = parseExplicitTaskMessage({
     messageType: 'text',
-    text: '/zylos-task create {"title":"Follow up the customer","description":"Send the revised proposal","assigneeId":"agent:yueran","dueAt":"2026-08-28T18:00:00+08:00"}',
+    text: '/zylos-task create {"title":"Follow up the customer","description":"Send the revised proposal","assigneeId":"agent:yueran","dueAt":"2026-08-28T18:00:00+08:00","reminderMinutesBeforeDue":60}',
     messageId: 'om_task_create_1',
     actorId: 'ou_creator_1',
   });
@@ -36,6 +36,7 @@ test('routes an explicit create protocol to C4 with a normalized task envelope',
         acceptorId: 'ou_creator_1',
         assigneeId: 'agent:yueran',
         dueAt: '2026-08-28T10:00:00.000Z',
+        reminderMinutesBeforeDue: 60,
       },
     },
   });

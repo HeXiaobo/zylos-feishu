@@ -289,6 +289,15 @@ projection reopens the native Task. Updates are field-difference patches: an
 already-completed native Task is not completed again when Core advances from
 `review` to `done`.
 
+An optional Core `reminderMinutesBeforeDue` is projected only when the Task has
+a canonical deadline. Because Task v2 create/patch payloads do not own reminder
+mutation, the SDK Adapter creates or patches the base Task, then calls the
+dedicated add/remove reminder endpoints. It reads the Task back and accepts the
+projection only when the native `relative_fire_minute` exactly matches Core;
+the receipt includes that confirmed value. Existing reminder IDs are removed
+by their exact native ID before replacement, so retry/reconciliation cannot
+silently accumulate reminder drift.
+
 Remote create uses a stable `client_token` only for Feishu's short deduplication
 window. Durable identity is the Core ExternalLink plus its receipt. If create
 succeeds but link persistence is interrupted, a retry exhausts all Task search
@@ -322,7 +331,10 @@ Choose `from_beginning` instead of `from_now` only for an intentional rebuild.
 `reconcile` cursor-pages through all Core tasks and combines the platform
 snapshot with Core's generic reconciliation; it never silently truncates at
 the Core query limit. It reports missing, duplicate, state-drift, missing-link,
-and link-mismatch records without changing either system. Explicit
+link-mismatch, and reminder-drift records without changing either system.
+Reminder drift compares the canonical offset with the authoritative native
+Task readback; the next projection update replaces it and confirms the new
+value. Explicit
 `reconcile --repair-status` replays native-completed/Core-open status drift
 through the same Core status handler; it can start and submit for review but
 never accepts a Task. Its report is the detection snapshot plus applied repair

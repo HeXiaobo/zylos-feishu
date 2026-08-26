@@ -102,6 +102,7 @@ test('production runtime shares one App identity and an injectable durable statu
   const taskApi = {
     async create() {}, async patch() {}, async get() {},
     async addMembers() {}, async removeMembers() {}, async list() {},
+    async addReminders() {}, async removeReminders() {},
   };
   const runtime = createTaskV2ProjectionRuntime({
     env: { FEISHU_APP_ID: 'cli_gateway', ZYLOS_AGENT_ID: 'agent:mylos' },
@@ -301,6 +302,7 @@ test('reconciliation combines the Feishu snapshot with the Core generic diff', a
   });
   assert.equal(report.consistent, false);
   assert.deepEqual(report.missingLinks, [{ taskId: 'task-worker' }]);
+  assert.deepEqual(report.reminderDrifts, []);
   assert.deepEqual(harness.calls.map(([operation]) => operation), ['close']);
 });
 

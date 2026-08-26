@@ -29,6 +29,14 @@ function throwIfAborted(signal) {
   throw error;
 }
 
+function optionalNonNegativeInteger(value, field) {
+  if (value === undefined || value === null) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
 function taskMarker(task) {
   return JSON.stringify({
     schema: MARKER_SCHEMA,
@@ -53,6 +61,17 @@ function dueFromTask(task) {
   const milliseconds = Date.parse(requireText(task.dueAt, 'task.dueAt'));
   if (!Number.isFinite(milliseconds)) throw new TypeError('task.dueAt must be a timestamp');
   return { timestamp: String(milliseconds), is_all_day: false };
+}
+
+function reminderFromTask(task) {
+  const reminder = optionalNonNegativeInteger(
+    task.reminderMinutesBeforeDue,
+    'task.reminderMinutesBeforeDue',
+  );
+  if (reminder !== null && dueFromTask(task) === undefined) {
+    throw new TypeError('task.reminderMinutesBeforeDue requires task.dueAt');
+  }
+  return reminder;
 }
 
 function completionFromTask(task) {
@@ -89,6 +108,20 @@ function normalizeMembers(value, field = 'members') {
   });
 }
 
+function normalizeReminder(value, field = 'reminders') {
+  if (!Array.isArray(value)) throw new TypeError(`${field} must be an array`);
+  if (value.length > 1) throw new TypeError(`${field} must contain at most one reminder`);
+  if (value.length === 0) return null;
+  const reminder = requireRecord(value[0], `${field}[0]`);
+  return Object.freeze({
+    id: requireText(reminder.id, `${field}[0].id`),
+    minutesBeforeDue: optionalNonNegativeInteger(
+      reminder.relative_fire_minute,
+      `${field}[0].relative_fire_minute`,
+    ),
+  });
+}
+
 export class FeishuTaskV2Error extends Error {
   constructor(message, { retryable = true, code, cause } = {}) {
     super(message, { cause });
@@ -111,12 +144,18 @@ function taskFromResponse(response, operation) {
     throw new FeishuTaskV2Error(`Feishu Task v2 ${operation} returned no task`);
   }
   const marker = parseTaskMarker(task.extra);
+  const reminder = normalizeReminder(
+    task.reminders ?? [],
+    'Feishu Task v2 reminders',
+  );
   return Object.freeze({
     guid: requireText(task.guid, `Feishu Task v2 ${operation} guid`),
     url: requireText(task.url, `Feishu Task v2 ${operation} url`),
     summary: optionalText(task.summary, 'Feishu Task v2 summary'),
     description: optionalText(task.description, 'Feishu Task v2 description'),
     dueAt: task.due?.timestamp ? new Date(Number(task.due.timestamp)).toISOString() : null,
+    reminderMinutesBeforeDue: reminder?.minutesBeforeDue ?? null,
+    reminderId: reminder?.id ?? null,
     members: Object.freeze(normalizeMembers(task.members ?? [], 'Feishu Task v2 members')),
     completedAt: optionalText(task.completed_at, 'Feishu Task v2 completed_at') ?? '0',
     coreTaskId: marker?.coreTaskId ?? null,
@@ -188,7 +227,16 @@ function patchPayload(task, current) {
 export function createSdkTaskV2Gateway({ client } = {}) {
   const sdk = requireRecord(client, 'client');
   const taskApi = sdk.task?.v2?.task;
-  for (const operation of ['create', 'patch', 'get', 'addMembers', 'removeMembers', 'list']) {
+  for (const operation of [
+    'create',
+    'patch',
+    'get',
+    'addMembers',
+    'removeMembers',
+    'addReminders',
+    'removeReminders',
+    'list',
+  ]) {
     if (typeof taskApi?.[operation] !== 'function') {
       throw new TypeError(`client.task.v2.task.${operation} must be a function`);
     }
@@ -302,13 +350,47 @@ export function createSdkTaskV2Gateway({ client } = {}) {
     return tasks;
   }
 
+  async function syncReminder(taskGuid, current, desired) {
+    if (current.reminderMinutesBeforeDue === desired) return false;
+    if (current.reminderMinutesBeforeDue !== null) {
+      taskFromResponse(await taskApi.removeReminders({
+        path: { task_guid: taskGuid },
+        params: { user_id_type: USER_ID_TYPE },
+        data: { reminder_ids: [requireText(current.reminderId, 'current reminder id')] },
+      }), 'remove_reminders');
+    }
+    if (desired !== null) {
+      taskFromResponse(await taskApi.addReminders({
+        path: { task_guid: taskGuid },
+        params: { user_id_type: USER_ID_TYPE },
+        data: { reminders: [{ relative_fire_minute: desired }] },
+      }), 'add_reminders');
+    }
+    return true;
+  }
+
   return Object.freeze({
     async createTask({ task, members, clientToken } = {}) {
       try {
-        return taskFromResponse(await taskApi.create({
+        const normalizedTask = requireRecord(task, 'task');
+        const created = taskFromResponse(await taskApi.create({
           params: { user_id_type: USER_ID_TYPE },
-          data: createPayload(requireRecord(task, 'task'), members, clientToken),
+          data: createPayload(normalizedTask, members, clientToken),
         }), 'create');
+        const reminderMinutesBeforeDue = reminderFromTask(normalizedTask);
+        if (reminderMinutesBeforeDue === null) return created;
+        taskFromResponse(await taskApi.addReminders({
+          path: { task_guid: created.guid },
+          params: { user_id_type: USER_ID_TYPE },
+          data: { reminders: [{ relative_fire_minute: reminderMinutesBeforeDue }] },
+        }), 'add_reminders');
+        const confirmed = await getTask(created.guid);
+        if (confirmed.reminderMinutesBeforeDue !== reminderMinutesBeforeDue) {
+          throw new FeishuTaskV2Error(
+            `Feishu Task v2 reminder readback mismatch for ${created.guid}`,
+          );
+        }
+        return confirmed;
       } catch (error) {
         return wrapSdkFailure('create', error);
       }
@@ -329,7 +411,20 @@ export function createSdkTaskV2Gateway({ client } = {}) {
             data: patch,
           }), 'patch');
         await syncMembers(guid, current.members, desiredMembers, requireText(clientToken, 'clientToken'));
-        return Object.freeze({ ...patched, members: Object.freeze(desiredMembers) });
+        const desiredReminder = reminderFromTask(normalizedTask);
+        const reminderChanged = await syncReminder(
+          guid,
+          current,
+          desiredReminder,
+        );
+        if (!reminderChanged && desiredReminder === null) {
+          return Object.freeze({ ...patched, members: Object.freeze(desiredMembers) });
+        }
+        const confirmed = await getTask(guid);
+        if (confirmed.reminderMinutesBeforeDue !== desiredReminder) {
+          throw new FeishuTaskV2Error(`Feishu Task v2 reminder readback mismatch for ${guid}`);
+        }
+        return confirmed;
       } catch (error) {
         return wrapSdkFailure('update', error);
       }

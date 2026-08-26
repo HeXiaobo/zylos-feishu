@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.5] - 2026-08-26
+
+### Added
+- Project canonical `reminderMinutesBeforeDue` through Task v2's dedicated
+  add/remove reminder APIs, then require an authoritative native readback before
+  acknowledging create or update.
+- Surface confirmed reminder offsets in projection receipts and reminder drift
+  in reconciliation reports; explicit Feishu task intake now preserves the
+  same reminder policy.
+
+### Changed
+- Require Core's `task-reminder >= 1` capability before install or upgrade, so
+  reminder-aware Feishu cannot start against a Core that drops the policy.
+
 ### Fixed
 - Route short-lived Agent replies through the canonical Task comment
   coordinator before projecting them to Feishu, so exact-parent human
@@ -39,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - New deployments default ordinary assistant replies to the same completed-card format used by streaming replies.
 - Require `c4.assistant-response-stream >= 2`, `c4.outbound-delivery-id >= 1`,
-  and `external-task-adapter >= 1`, so install and upgrade reject a Core that
+  `external-task-adapter >= 1`, and `task-reminder >= 1`, so install and upgrade reject a Core that
   cannot provide turn-safe streaming, stable proactive card identity, and the
   native completion mapper used at runtime.
 

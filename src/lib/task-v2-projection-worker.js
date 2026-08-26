@@ -271,6 +271,7 @@ export async function runTaskV2Reconciliation({
       ...reconcile({ expected: snapshot.expected, actual: snapshot.actual }),
       missingLinks: snapshot.missingLinks,
       linkMismatches: snapshot.linkMismatches,
+      reminderDrifts: snapshot.reminderDrifts,
       repairs: Object.freeze(repairs),
     });
   } finally {

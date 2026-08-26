@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "product": "zylos-feishu",
-  "release": "0.3.7-rc.4",
+  "release": "0.3.7-rc.5",
   "requires": {
     "zylos-core": {
       "schemaVersion": 1,
@@ -13,7 +13,8 @@
         "work-intake": 1,
         "commitment-core": 1,
         "projection-outbox": 1,
-        "external-task-adapter": 1
+        "external-task-adapter": 1,
+        "task-reminder": 1
       }
     }
   },
