@@ -208,6 +208,63 @@ test('one worker cycle drains the durable reverse-status inbox after outbound se
   assert.equal(acknowledgements[0].result.status, 'unlinked');
 });
 
+test('one worker cycle consumes non-completion reconciliation by restoring Core projection', async () => {
+  const harness = fakeCore();
+  const event = {
+    event_id: 'evt-summary',
+    task_id: 'guid-worker',
+    app_id: 'cli_yueran',
+    event_types: ['task_summary_update'],
+  };
+  harness.core.externalLinks.query = query => (
+    query.externalId
+      ? { taskId: 'task-worker', externalId: 'guid-worker' }
+      : [{ taskId: 'task-worker', externalId: 'guid-worker' }]
+  );
+  let reconciliationQueued = false;
+  const reconciled = [];
+  const updates = [];
+  const result = await runTaskV2ProjectionOnce({
+    workerId: 'task-v2-worker',
+    operationId: 'cycle-with-reconciliation',
+    appId: 'cli_yueran',
+    statusInbox: {
+      pending() { return [event]; },
+      ack() {
+        reconciliationQueued = true;
+        return { status: 'acknowledged' };
+      },
+      fail() { throw new Error('unexpected status failure'); },
+      pendingReconciliations() { return reconciliationQueued ? [event] : []; },
+      ackReconciliation(request) {
+        reconciled.push(request);
+        return { status: 'acknowledged' };
+      },
+      failReconciliation() { throw new Error('unexpected reconciliation failure'); },
+    },
+    gateway: {
+      async findTasksByCoreTaskId() { return []; },
+      async createTask() { throw new Error('linked reconciliation must not create'); },
+      async updateTask(request) {
+        updates.push(request);
+        return { guid: request.taskGuid, url: 'https://task/guid-worker' };
+      },
+      async getTask() { throw new Error('non-completion status must not read completion state'); },
+    },
+    memberMapper: createTaskV2MemberMapper({ appId: 'cli_yueran', agentId: 'agent:yueran' }),
+    mapExternalTaskEvent() { throw new Error('non-completion status must not map completion'); },
+    openCore: () => harness.core,
+    async processBatch() { return { projection: TASK_V2_PROJECTION, idle: true }; },
+  });
+
+  assert.deepEqual(result.statusInbox.reconciliation, {
+    claimed: 1, acknowledged: 1, retryWaiting: 0, deadLettered: 0,
+  });
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].taskGuid, event.task_id);
+  assert.equal(reconciled[0].result.status, 'reconciled');
+});
+
 test('reconciliation combines the Feishu snapshot with the Core generic diff', async () => {
   const harness = fakeCore();
   harness.core.externalLinks.query = () => [];

@@ -328,11 +328,15 @@ through the same Core status handler; it can start and submit for review but
 never accepts a Task. Its report is the detection snapshot plus applied repair
 receipts, so run reconciliation again to verify the resulting clean state.
 
-Native status callbacks acknowledge only after an append and `fsync` to the
-Feishu-owned Task v2 inbox. The projection worker drains that inbox one event
-at a time with retry and dead-letter settlement. Callback processing therefore
-does not mutate Core or depend on Core availability, and reconciliation can
-repair a missed reverse event from current native state.
+Native status callbacks acknowledge only after a `synchronous=FULL` transaction
+to the Feishu-owned SQLite/WAL Task v2 inbox. Its indexed current-state rows
+replace the former append-only journals, so polling and retry do not rescan or
+grow settlement history. On first open, any existing NDJSON events and
+settlements are validated and atomically migrated while the original files
+remain unchanged as evidence; a concurrent or later legacy writer fails the
+new store closed. The projection worker drains the inbox with independent
+retry and dead-letter settlement. Callback processing therefore does not
+mutate Core or depend on Core availability.
 
 The Feishu App needs `task:task:read` and `task:task:write`, plus the
 `task.task.update_user_access_v2` event subscription. Before starting either
@@ -343,8 +347,12 @@ the process so concurrent or repeated startup attempts do not duplicate it.
 Bot identity covers only Tasks for which the current App is responsible; a
 user's personally followed Tasks are not part of this managed real-time SLA.
 The current native envelope's `event_types` are retained in the durable inbox:
-only `task_completed_update` can enter the `SubmitForReview` path, while all
-other commit types return a reconciliation signal. The legacy
+only `task_completed_update` can enter the `SubmitForReview` path. Other commit
+types are atomically transferred into a durable reconciliation queue before
+their status event is acknowledged. The same worker consumes that queue by
+restoring the canonical Core projection to the linked native Task; failures
+retry or dead-letter the reconciliation without replaying the acknowledged
+status event. The legacy
 `task.task.updated_v1` handler remains registered during migration. F3 does
 not call comment APIs;
 `task:comment:read` and `task:comment:write` belong to the later comment slice.

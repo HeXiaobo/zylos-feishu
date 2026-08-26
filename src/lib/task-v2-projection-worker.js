@@ -20,7 +20,10 @@ import {
   createTaskV2StatusInbox,
   processTaskV2StatusInboxOnce,
 } from './task-v2-status-inbox.js';
-import { createTaskV2StatusEventHandler } from './task-v2-status-event.js';
+import {
+  createTaskV2StatusEventHandler,
+  createTaskV2StatusReconciler,
+} from './task-v2-status-event.js';
 import { isTaskV2Enabled } from './task-v2-runtime-policy.js';
 
 const REGISTRATION_ACTOR = 'commitment-feishu-task-v2-projection';
@@ -200,6 +203,7 @@ export async function runTaskV2ProjectionOnce({
           appId,
           mapExternalTaskEvent,
         }),
+        reconciler: createTaskV2StatusReconciler({ core, projection, appId }),
         limit,
         retryAfterMs,
         maxAttempts,

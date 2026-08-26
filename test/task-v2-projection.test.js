@@ -12,6 +12,7 @@ import { createSdkTaskV2Gateway } from '../src/lib/task-v2-sdk-adapter.js';
 import {
   createTaskV2StatusEventHandler,
   createTaskV2StatusEventIngestor,
+  createTaskV2StatusReconciler,
 } from '../src/lib/task-v2-status-event.js';
 
 const APP_ID = 'cli_zylos_yueran';
@@ -443,6 +444,28 @@ test('native non-completion commits signal reconciliation without mutating Core'
     eventTypes: ['task_summary_update'],
   });
   assert.deepEqual(harness.commands, []);
+});
+
+test('status reconciliation fails closed without one durable projection receipt', async () => {
+  const reconciler = createTaskV2StatusReconciler({
+    appId: APP_ID,
+    core: {
+      externalLinks: {
+        query() { return { taskId: 'task-1', externalId: 'guid-1' }; },
+      },
+    },
+    projection: { async publishBatch() { return []; } },
+  });
+
+  await assert.rejects(
+    reconciler.handle({
+      event_id: 'evt-summary',
+      task_id: 'guid-1',
+      app_id: APP_ID,
+      event_types: ['task_summary_update'],
+    }),
+    /exactly one receipt/,
+  );
 });
 
 test('mixed native commits submit only completion and preserve a reconciliation signal', async () => {

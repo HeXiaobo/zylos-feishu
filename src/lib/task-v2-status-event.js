@@ -1,4 +1,4 @@
-import { TASK_V2_LINK_BACKEND } from './task-v2-projection.js';
+import { TASK_V2_LINK_BACKEND, TASK_V2_PROJECTION } from './task-v2-projection.js';
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -89,6 +89,58 @@ export function createTaskV2StatusEventIngestor({ inbox, appId } = {}) {
         created: queued.created,
         eventId: event.event_id,
         taskGuid: event.task_id,
+      });
+    },
+  });
+}
+
+/** Restore the canonical Core projection for a durable non-completion commit. */
+export function createTaskV2StatusReconciler({ core, projection, appId } = {}) {
+  if (!core || typeof core.externalLinks?.query !== 'function') {
+    throw new TypeError('core.externalLinks.query must be a function');
+  }
+  if (!projection || typeof projection.publishBatch !== 'function') {
+    throw new TypeError('projection.publishBatch must be a function');
+  }
+  const expectedAppId = requireText(appId, 'appId');
+  return Object.freeze({
+    async handle(eventInput) {
+      const event = normalizeTaskV2StatusEvent(eventInput);
+      if (event.app_id !== expectedAppId) {
+        throw new TypeError('Task v2 reconciliation event belongs to another App');
+      }
+      if (!event.event_types) {
+        throw new TypeError('Task v2 reconciliation event requires event_types');
+      }
+      const link = core.externalLinks.query({
+        backend: TASK_V2_LINK_BACKEND,
+        externalId: event.task_id,
+      });
+      if (!link) {
+        return Object.freeze({
+          status: 'unlinked',
+          sourceEventId: event.event_id,
+          taskGuid: event.task_id,
+          eventTypes: event.event_types,
+        });
+      }
+      const receipts = await projection.publishBatch({
+        deliveries: [{
+          projection: TASK_V2_PROJECTION,
+          event: { taskId: link.taskId },
+        }],
+      });
+      if (!Array.isArray(receipts) || receipts.length !== 1) {
+        throw new TypeError('Task v2 status reconciliation requires exactly one receipt');
+      }
+      const receipt = requireRecord(receipts[0], 'Task v2 status reconciliation receipt');
+      return Object.freeze({
+        status: 'reconciled',
+        sourceEventId: event.event_id,
+        taskId: link.taskId,
+        taskGuid: event.task_id,
+        eventTypes: event.event_types,
+        receipt,
       });
     },
   });
