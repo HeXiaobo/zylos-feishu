@@ -175,12 +175,18 @@ test('one worker cycle drains the durable reverse-status inbox after outbound se
   const harness = fakeCore();
   const event = { event_id: 'evt-unlinked', task_id: 'guid-unlinked', app_id: 'cli_yueran' };
   const acknowledgements = [];
+  const claims = [];
+  const receipt = { eventId: event.event_id, workerId: 'task-v2-worker', version: 2 };
   const result = await runTaskV2ProjectionOnce({
     workerId: 'task-v2-worker',
+    leaseMs: 12_345,
     operationId: 'cycle-with-inbox',
     appId: 'cli_yueran',
     statusInbox: {
-      pending() { return [event]; },
+      claim(request) {
+        claims.push(request);
+        return [{ event, receipt }];
+      },
       ack(request) {
         acknowledgements.push(request);
         return { status: 'acknowledged' };
@@ -204,7 +210,8 @@ test('one worker cycle drains the durable reverse-status inbox after outbound se
   assert.deepEqual(result.statusInbox, {
     claimed: 1, acknowledged: 1, retryWaiting: 0, deadLettered: 0,
   });
-  assert.equal(acknowledgements[0].eventId, event.event_id);
+  assert.deepEqual(claims, [{ workerId: 'task-v2-worker', leaseMs: 12_345, limit: 25 }]);
+  assert.deepEqual(acknowledgements[0].receipt, receipt);
   assert.equal(acknowledgements[0].result.status, 'unlinked');
 });
 
@@ -224,18 +231,26 @@ test('one worker cycle consumes non-completion reconciliation by restoring Core 
   let reconciliationQueued = false;
   const reconciled = [];
   const updates = [];
+  const statusReceipt = { eventId: event.event_id, workerId: 'task-v2-worker', version: 2 };
+  const reconciliationReceipt = {
+    eventId: event.event_id,
+    workerId: 'task-v2-worker',
+    version: 2,
+  };
   const result = await runTaskV2ProjectionOnce({
     workerId: 'task-v2-worker',
     operationId: 'cycle-with-reconciliation',
     appId: 'cli_yueran',
     statusInbox: {
-      pending() { return [event]; },
+      claim() { return [{ event, receipt: statusReceipt }]; },
       ack() {
         reconciliationQueued = true;
         return { status: 'acknowledged' };
       },
       fail() { throw new Error('unexpected status failure'); },
-      pendingReconciliations() { return reconciliationQueued ? [event] : []; },
+      claimReconciliations() {
+        return reconciliationQueued ? [{ event, receipt: reconciliationReceipt }] : [];
+      },
       ackReconciliation(request) {
         reconciled.push(request);
         return { status: 'acknowledged' };

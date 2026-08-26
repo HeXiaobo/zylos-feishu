@@ -197,6 +197,8 @@ export async function runTaskV2ProjectionOnce({
       ? null
       : await processTaskV2StatusInboxOnce({
         inbox: statusInbox,
+        workerId,
+        leaseMs,
         handler: createTaskV2StatusEventHandler({
           core,
           gateway,

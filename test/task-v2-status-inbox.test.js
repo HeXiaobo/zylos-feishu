@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { Worker } from 'node:worker_threads';
 
 import {
   createTaskV2StatusInbox,
@@ -51,6 +52,66 @@ test('status inbox atomically migrates legacy NDJSON evidence into its durable s
     const reopened = createTaskV2StatusInbox({ directory });
     assert.equal(reopened.query({ eventId: 'evt-sqlite' }).status, 'pending');
     reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('two concurrent first opens converge on one legacy migration result', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-status-concurrent-migration-'));
+  const records = Array.from({ length: 5_000 }, (_, index) => JSON.stringify({
+    event: {
+      event_id: `evt-legacy-${index}`,
+      task_id: `guid-legacy-${index}`,
+      app_id: 'cli_app',
+    },
+    enqueuedAt: 1_787_900_000_000 + index,
+  })).join('\n');
+  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+  const signal = new Int32Array(barrier);
+  const moduleUrl = new URL('../src/lib/task-v2-status-inbox.js', import.meta.url).href;
+  const source = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    (async () => {
+      const signal = new Int32Array(workerData.barrier);
+      const { createTaskV2StatusInbox } = await import(workerData.moduleUrl);
+      Atomics.add(signal, 0, 1);
+      Atomics.notify(signal, 0);
+      Atomics.wait(signal, 1, 0);
+      try {
+        const inbox = createTaskV2StatusInbox({ directory: workerData.directory });
+        const status = inbox.query({ eventId: 'evt-legacy-0' }).status;
+        inbox.close();
+        parentPort.postMessage({ ok: true, status });
+      } catch (error) {
+        parentPort.postMessage({ ok: false, error: error.message });
+      }
+    })();
+  `;
+  const open = () => {
+    const worker = new Worker(source, {
+      eval: true,
+      workerData: { barrier, directory, moduleUrl },
+    });
+    return new Promise((resolve, reject) => {
+      worker.once('message', resolve);
+      worker.once('error', reject);
+    });
+  };
+  try {
+    writeFileSync(path.join(directory, 'events.ndjson'), `${records}\n`);
+    const openings = [open(), open()];
+    while (Atomics.load(signal, 0) < 2) {
+      const observed = Atomics.load(signal, 0);
+      Atomics.wait(signal, 0, observed, 5_000);
+    }
+    Atomics.store(signal, 1, 1);
+    Atomics.notify(signal, 1, 2);
+
+    assert.deepEqual(await Promise.all(openings), [
+      { ok: true, status: 'pending' },
+      { ok: true, status: 'pending' },
+    ]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -164,7 +225,8 @@ test('status inbox durably deduplicates events and preserves acknowledgement acr
     assert.deepEqual(first.enqueue(event), { created: true, event });
     assert.deepEqual(first.enqueue(event), { created: false, event });
     assert.deepEqual(first.pending({ limit: 10 }), [event]);
-    first.ack({ eventId: event.event_id, result: { status: 'submitted_for_review' } });
+    const [claimed] = first.claim({ workerId: 'worker-a', leaseMs: 5_000 });
+    first.ack({ receipt: claimed.receipt, result: { status: 'submitted_for_review' } });
 
     const reopened = createTaskV2StatusInbox({
       directory,
@@ -172,6 +234,79 @@ test('status inbox durably deduplicates events and preserves acknowledgement acr
     });
     assert.deepEqual(reopened.pending({ limit: 10 }), []);
     assert.equal(reopened.query({ eventId: event.event_id }).status, 'acknowledged');
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('two status inbox connections atomically claim one event for only one worker', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-status-claim-'));
+  const event = { event_id: 'evt-claim', task_id: 'guid-claim', app_id: 'cli_app' };
+  try {
+    const first = createTaskV2StatusInbox({
+      directory,
+      clock: () => 1_787_900_000_000,
+    });
+    const second = createTaskV2StatusInbox({
+      directory,
+      clock: () => 1_787_900_000_000,
+    });
+    first.enqueue(event);
+
+    const claimed = first.claim({ workerId: 'worker-a', leaseMs: 5_000, limit: 10 });
+    assert.equal(claimed.length, 1);
+    assert.deepEqual(claimed[0].event, event);
+    assert.deepEqual(claimed[0].receipt, {
+      eventId: event.event_id,
+      workerId: 'worker-a',
+      version: 2,
+    });
+    assert.deepEqual(second.claim({ workerId: 'worker-b', leaseMs: 5_000, limit: 10 }), []);
+
+    second.close();
+    first.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an expired status lease is recovered and fences stale acknowledgement and failure', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-status-takeover-'));
+  const event = { event_id: 'evt-takeover', task_id: 'guid-takeover', app_id: 'cli_app' };
+  let now = 1_787_900_000_000;
+  try {
+    const first = createTaskV2StatusInbox({ directory, clock: () => now });
+    const second = createTaskV2StatusInbox({ directory, clock: () => now });
+    first.enqueue(event);
+    const [stale] = first.claim({ workerId: 'worker-a', leaseMs: 1_000 });
+
+    now += 1_000;
+    const [recovered] = second.claim({ workerId: 'worker-b', leaseMs: 1_000 });
+    assert.equal(recovered.receipt.eventId, stale.receipt.eventId);
+    assert.equal(recovered.receipt.version, stale.receipt.version + 1);
+    assert.equal(second.ack({
+      receipt: recovered.receipt,
+      result: { status: 'submitted_for_review' },
+    }).status, 'acknowledged');
+    assert.throws(
+      () => first.ack({ receipt: stale.receipt, result: { status: 'stale' } }),
+      error => error.code === 'LEASE_LOST',
+    );
+    assert.throws(
+      () => first.fail({
+        receipt: stale.receipt,
+        error: new Error('stale failure'),
+        retryAfterMs: 1_000,
+        maxAttempts: 3,
+      }),
+      error => error.code === 'LEASE_LOST',
+    );
+    assert.deepEqual(first.query({ eventId: event.event_id }).result, {
+      status: 'submitted_for_review',
+    });
+
+    second.close();
+    first.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -186,8 +321,9 @@ test('status inbox schedules retry and dead-letters one poison event without hid
     const inbox = createTaskV2StatusInbox({ directory, clock: () => now });
     inbox.enqueue(poison);
     inbox.enqueue(healthy);
+    const [firstAttempt] = inbox.claim({ workerId: 'worker-a', leaseMs: 5_000, limit: 1 });
     inbox.fail({
-      eventId: poison.event_id,
+      receipt: firstAttempt.receipt,
       error: new Error('temporary Core outage'),
       retryAfterMs: 1_000,
       maxAttempts: 2,
@@ -196,8 +332,9 @@ test('status inbox schedules retry and dead-letters one poison event without hid
 
     now += 1_000;
     assert.deepEqual(inbox.pending({ limit: 10 }), [poison, healthy]);
+    const [secondAttempt] = inbox.claim({ workerId: 'worker-b', leaseMs: 5_000, limit: 1 });
     inbox.fail({
-      eventId: poison.event_id,
+      receipt: secondAttempt.receipt,
       error: new Error('still unavailable'),
       retryAfterMs: 1_000,
       maxAttempts: 2,
@@ -221,6 +358,8 @@ test('status inbox worker settles each event independently and continues past po
 
     const summary = await processTaskV2StatusInboxOnce({
       inbox,
+      workerId: 'status-worker',
+      leaseMs: 5_000,
       limit: 10,
       retryAfterMs: 1_000,
       maxAttempts: 3,
@@ -249,6 +388,53 @@ test('status inbox worker settles each event independently and continues past po
   }
 });
 
+test('concurrent status worker cycles do not process the same event twice', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-status-concurrent-workers-'));
+  const event = { event_id: 'evt-once', task_id: 'guid-once', app_id: 'cli_app' };
+  try {
+    const first = createTaskV2StatusInbox({
+      directory,
+      clock: () => 1_787_900_000_000,
+    });
+    const second = createTaskV2StatusInbox({
+      directory,
+      clock: () => 1_787_900_000_000,
+    });
+    first.enqueue(event);
+    const handled = [];
+    const handler = {
+      async handle(work) {
+        handled.push(work.event_id);
+        await Promise.resolve();
+        return { status: 'submitted_for_review' };
+      },
+    };
+
+    const summaries = await Promise.all([
+      processTaskV2StatusInboxOnce({
+        inbox: first,
+        handler,
+        workerId: 'once-worker',
+        leaseMs: 5_000,
+      }),
+      processTaskV2StatusInboxOnce({
+        inbox: second,
+        handler,
+        workerId: 'pm2-worker',
+        leaseMs: 5_000,
+      }),
+    ]);
+
+    assert.deepEqual(handled, [event.event_id]);
+    assert.deepEqual(summaries.map(summary => summary.claimed).sort(), [0, 1]);
+    assert.equal(first.query({ eventId: event.event_id }).status, 'acknowledged');
+    second.close();
+    first.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('acknowledging a non-completion status durably schedules reconciliation work', async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-status-reconcile-'));
   const event = {
@@ -262,6 +448,8 @@ test('acknowledging a non-completion status durably schedules reconciliation wor
     inbox.enqueue(event);
     await processTaskV2StatusInboxOnce({
       inbox,
+      workerId: 'status-worker',
+      leaseMs: 5_000,
       handler: {
         async handle() {
           return {
@@ -286,6 +474,117 @@ test('acknowledging a non-completion status durably schedules reconciliation wor
   }
 });
 
+test('two status inbox connections atomically claim one reconciliation for only one worker', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-reconciliation-claim-'));
+  const event = {
+    event_id: 'evt-reconciliation-claim',
+    task_id: 'guid-reconciliation-claim',
+    app_id: 'cli_app',
+    event_types: ['task_summary_update'],
+  };
+  try {
+    const first = createTaskV2StatusInbox({
+      directory,
+      clock: () => 1_787_900_000_000,
+    });
+    const second = createTaskV2StatusInbox({
+      directory,
+      clock: () => 1_787_900_000_000,
+    });
+    first.enqueue(event);
+    const [status] = first.claim({ workerId: 'status-worker', leaseMs: 5_000 });
+    first.ack({
+      receipt: status.receipt,
+      result: {
+        status: 'reconciliation_required',
+        taskGuid: event.task_id,
+        eventTypes: event.event_types,
+      },
+    });
+
+    const claimed = first.claimReconciliations({
+      workerId: 'worker-a',
+      leaseMs: 5_000,
+      limit: 10,
+    });
+    assert.equal(claimed.length, 1);
+    assert.deepEqual(claimed[0].event, event);
+    assert.deepEqual(claimed[0].receipt, {
+      eventId: event.event_id,
+      workerId: 'worker-a',
+      version: 2,
+    });
+    assert.deepEqual(second.claimReconciliations({
+      workerId: 'worker-b',
+      leaseMs: 5_000,
+      limit: 10,
+    }), []);
+
+    second.close();
+    first.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an expired reconciliation lease is recovered and fences stale acknowledgement and failure', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-reconciliation-takeover-'));
+  const event = {
+    event_id: 'evt-reconciliation-takeover',
+    task_id: 'guid-reconciliation-takeover',
+    app_id: 'cli_app',
+    event_types: ['task_summary_update'],
+  };
+  let now = 1_787_900_000_000;
+  try {
+    const first = createTaskV2StatusInbox({ directory, clock: () => now });
+    const second = createTaskV2StatusInbox({ directory, clock: () => now });
+    first.enqueue(event);
+    const [status] = first.claim({ workerId: 'status-worker', leaseMs: 5_000 });
+    first.ack({
+      receipt: status.receipt,
+      result: {
+        status: 'reconciliation_required',
+        taskGuid: event.task_id,
+        eventTypes: event.event_types,
+      },
+    });
+    const [stale] = first.claimReconciliations({ workerId: 'worker-a', leaseMs: 1_000 });
+
+    now += 1_000;
+    const [recovered] = second.claimReconciliations({ workerId: 'worker-b', leaseMs: 1_000 });
+    assert.equal(recovered.receipt.version, stale.receipt.version + 1);
+    assert.equal(second.ackReconciliation({
+      receipt: recovered.receipt,
+      result: { status: 'reconciled' },
+    }).status, 'acknowledged');
+    assert.throws(
+      () => first.ackReconciliation({
+        receipt: stale.receipt,
+        result: { status: 'stale' },
+      }),
+      error => error.code === 'LEASE_LOST',
+    );
+    assert.throws(
+      () => first.failReconciliation({
+        receipt: stale.receipt,
+        error: new Error('stale failure'),
+        retryAfterMs: 1_000,
+        maxAttempts: 3,
+      }),
+      error => error.code === 'LEASE_LOST',
+    );
+    assert.deepEqual(first.queryReconciliation({ eventId: event.event_id }).result, {
+      status: 'reconciled',
+    });
+
+    second.close();
+    first.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('status acknowledgement and reconciliation enqueue commit atomically', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-status-atomic-'));
   const event = {
@@ -297,15 +596,16 @@ test('status acknowledgement and reconciliation enqueue commit atomically', () =
   try {
     const inbox = createTaskV2StatusInbox({ directory });
     inbox.enqueue(event);
+    const [claimed] = inbox.claim({ workerId: 'status-worker', leaseMs: 5_000 });
     assert.throws(() => inbox.ack({
-      eventId: event.event_id,
+      receipt: claimed.receipt,
       result: {
         status: 'reconciliation_required',
         eventTypes: event.event_types,
         invalidOversizedEvidence: 'x'.repeat(1024 * 1024),
       },
     }), /status result exceeds/);
-    assert.equal(inbox.query({ eventId: event.event_id }).status, 'pending');
+    assert.equal(inbox.query({ eventId: event.event_id }).status, 'leased');
     assert.deepEqual(inbox.pendingReconciliations({ limit: 10 }), []);
     inbox.close();
   } finally {
@@ -326,6 +626,8 @@ test('mixed completion schedules only its non-completion commit types for reconc
     inbox.enqueue(event);
     await processTaskV2StatusInboxOnce({
       inbox,
+      workerId: 'status-worker',
+      leaseMs: 5_000,
       handler: {
         async handle() {
           return {
@@ -361,6 +663,8 @@ test('reconciliation work is consumed with durable retry independent of status a
     inbox.enqueue(event);
     const first = await processTaskV2StatusInboxOnce({
       inbox,
+      workerId: 'status-worker-1',
+      leaseMs: 5_000,
       retryAfterMs: 1_000,
       maxAttempts: 3,
       handler: {
@@ -390,6 +694,8 @@ test('reconciliation work is consumed with durable retry independent of status a
     const repaired = [];
     const second = await processTaskV2StatusInboxOnce({
       inbox,
+      workerId: 'status-worker-2',
+      leaseMs: 5_000,
       retryAfterMs: 1_000,
       maxAttempts: 3,
       handler: { async handle() { throw new Error('settled status must not replay'); } },

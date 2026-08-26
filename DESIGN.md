@@ -333,10 +333,15 @@ to the Feishu-owned SQLite/WAL Task v2 inbox. Its indexed current-state rows
 replace the former append-only journals, so polling and retry do not rescan or
 grow settlement history. On first open, any existing NDJSON events and
 settlements are validated and atomically migrated while the original files
-remain unchanged as evidence; a concurrent or later legacy writer fails the
-new store closed. The projection worker drains the inbox with independent
-retry and dead-letter settlement. Callback processing therefore does not
-mutate Core or depend on Core availability.
+remain unchanged as evidence. Concurrent first opens serialize schema and
+migration ownership, then verify the same evidence signature instead of
+duplicating rows. A concurrent or later legacy writer still fails the new store
+closed. Status and reconciliation workers claim rows with an atomic
+`worker_id`/`lease_until`/`version` fence. Expired leases can be taken over, but
+an earlier worker's acknowledgement or failure cannot settle the newer lease.
+The projection worker drains both queues with independent retry and dead-letter
+settlement. Callback processing therefore does not mutate Core or depend on
+Core availability.
 
 The Feishu App needs `task:task:read` and `task:task:write`, plus the
 `task.task.update_user_access_v2` event subscription. Before starting either

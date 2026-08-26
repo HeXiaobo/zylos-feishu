@@ -10,6 +10,9 @@ const MAX_EVENT_ID_LENGTH = 512;
 const MAX_JSON_BYTES = 1024 * 1024;
 const LEGACY_MIGRATION_KEY = 'legacy-ndjson-v1';
 const RECONCILIATION_BACKFILL_KEY = 'reconciliation-backfill-v1';
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
+const SQLITE_RETRY_INTERVAL_MS = 10;
+const sqliteRetrySignal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -39,6 +42,37 @@ function requireEpoch(value, field) {
     throw new TypeError(`${field} must be a non-negative Unix epoch millisecond`);
   }
   return value;
+}
+
+function domainError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function normalizeReceipt(value, field) {
+  const receipt = requireRecord(value, field);
+  return {
+    eventId: requireText(receipt.eventId, `${field}.eventId`),
+    workerId: requireText(receipt.workerId, `${field}.workerId`),
+    version: requirePositiveInteger(receipt.version, `${field}.version`),
+  };
+}
+
+function retrySqliteBusy(operation) {
+  const deadline = Date.now() + SQLITE_BUSY_TIMEOUT_MS;
+  while (true) {
+    try {
+      return operation();
+    } catch (error) {
+      if (
+        error?.code !== 'SQLITE_BUSY'
+        && error?.code !== 'SQLITE_LOCKED'
+      ) throw error;
+      if (Date.now() >= deadline) throw error;
+      Atomics.wait(sqliteRetrySignal, 0, 0, SQLITE_RETRY_INTERVAL_MS);
+    }
+  }
 }
 
 function serializeJson(value, field) {
@@ -151,7 +185,8 @@ function assertLegacyEvidenceUnchanged(directory, expected) {
 }
 
 function initializeSchema(database) {
-  database.exec(`
+  const initialize = database.transaction(() => {
+    database.exec(`
     CREATE TABLE IF NOT EXISTS task_v2_status_inbox_meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -172,7 +207,10 @@ function initializeSchema(database) {
       result_json TEXT,
       enqueued_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
-      settled_at INTEGER
+      settled_at INTEGER,
+      version INTEGER NOT NULL DEFAULT 1,
+      worker_id TEXT,
+      lease_until INTEGER
     );
 
     CREATE INDEX IF NOT EXISTS idx_task_v2_status_pending
@@ -192,12 +230,42 @@ function initializeSchema(database) {
       enqueued_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       settled_at INTEGER,
+      version INTEGER NOT NULL DEFAULT 1,
+      worker_id TEXT,
+      lease_until INTEGER,
       FOREIGN KEY (event_id) REFERENCES task_v2_status_events(event_id) ON DELETE RESTRICT
     );
 
     CREATE INDEX IF NOT EXISTS idx_task_v2_reconciliation_pending
       ON task_v2_status_reconciliations(status, available_at, enqueued_at, event_id);
   `);
+
+    const statusColumns = new Set(database.prepare(
+      'PRAGMA table_info(task_v2_status_events)',
+    ).all().map(column => column.name));
+    if (!statusColumns.has('version')) {
+      database.exec('ALTER TABLE task_v2_status_events ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!statusColumns.has('worker_id')) {
+      database.exec('ALTER TABLE task_v2_status_events ADD COLUMN worker_id TEXT');
+    }
+    if (!statusColumns.has('lease_until')) {
+      database.exec('ALTER TABLE task_v2_status_events ADD COLUMN lease_until INTEGER');
+    }
+    const reconciliationColumns = new Set(database.prepare(
+      'PRAGMA table_info(task_v2_status_reconciliations)',
+    ).all().map(column => column.name));
+    if (!reconciliationColumns.has('version')) {
+      database.exec('ALTER TABLE task_v2_status_reconciliations ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!reconciliationColumns.has('worker_id')) {
+      database.exec('ALTER TABLE task_v2_status_reconciliations ADD COLUMN worker_id TEXT');
+    }
+    if (!reconciliationColumns.has('lease_until')) {
+      database.exec('ALTER TABLE task_v2_status_reconciliations ADD COLUMN lease_until INTEGER');
+    }
+  });
+  initialize.immediate();
 }
 
 function reconciliationTypes(result) {
@@ -272,16 +340,6 @@ function backfillReconciliations(database) {
 
 function migrateLegacyEvidence(database, directory) {
   const evidence = readLegacyEvidence(directory);
-  const migrated = database.prepare(`
-    SELECT value FROM task_v2_status_inbox_meta WHERE key = ?
-  `).get(LEGACY_MIGRATION_KEY);
-  if (migrated) {
-    if (migrated.value !== evidence.signature) {
-      throw new TypeError('legacy status inbox evidence changed after SQLite migration');
-    }
-    return evidence;
-  }
-
   const events = new Map();
   for (const [index, rawRecord] of evidence.events.records.entries()) {
     const record = requireRecord(rawRecord, `legacy status event record ${index + 1}`);
@@ -355,6 +413,15 @@ function migrateLegacyEvidence(database, directory) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const migrate = database.transaction(() => {
+    const migrated = database.prepare(`
+      SELECT value FROM task_v2_status_inbox_meta WHERE key = ?
+    `).get(LEGACY_MIGRATION_KEY);
+    if (migrated) {
+      if (migrated.value !== evidence.signature) {
+        throw new TypeError('legacy status inbox evidence changed after SQLite migration');
+      }
+      return;
+    }
     for (const { event, enqueuedAt, serialized, settlements } of events.values()) {
       const failures = settlements.filter(record => record.type === 'fail');
       const latest = settlements.at(-1);
@@ -411,12 +478,12 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
   if (typeof clock !== 'function') throw new TypeError('clock must be a function');
   fs.mkdirSync(inboxDirectory, { recursive: true, mode: 0o700 });
   const databasePath = path.join(inboxDirectory, 'status-inbox.db');
-  const database = new Database(databasePath);
+  const database = new Database(databasePath, { timeout: SQLITE_BUSY_TIMEOUT_MS });
   let legacyEvidence;
   try {
     fs.chmodSync(databasePath, 0o600);
-    database.pragma('busy_timeout = 5000');
-    database.pragma('journal_mode = WAL');
+    database.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+    retrySqliteBusy(() => database.pragma('journal_mode = WAL'));
     database.pragma('synchronous = FULL');
     database.pragma('foreign_keys = ON');
     initializeSchema(database);
@@ -449,11 +516,13 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     if (!row) return null;
     return {
       event: eventFromRow(row),
-      status: row.status === 'pending'
-        && row.next_attempt_at !== null
-        && row.next_attempt_at > now()
-        ? 'retry_wait'
-        : row.status,
+      status: row.status === 'pending' && row.worker_id !== null && row.lease_until > now()
+        ? 'leased'
+        : row.status === 'pending'
+          && row.next_attempt_at !== null
+          && row.next_attempt_at > now()
+          ? 'retry_wait'
+          : row.status,
       attempts: row.attempt,
       nextAttemptAt: row.next_attempt_at,
       error: row.last_error,
@@ -465,16 +534,31 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     if (!row) return null;
     return {
       event: eventFromRow(row),
-      status: row.status === 'pending'
-        && row.next_attempt_at !== null
-        && row.next_attempt_at > now()
-        ? 'retry_wait'
-        : row.status,
+      status: row.status === 'pending' && row.worker_id !== null && row.lease_until > now()
+        ? 'leased'
+        : row.status === 'pending'
+          && row.next_attempt_at !== null
+          && row.next_attempt_at > now()
+          ? 'retry_wait'
+          : row.status,
       attempts: row.attempt,
       nextAttemptAt: row.next_attempt_at,
       error: row.last_error,
       result: row.result_json === null ? null : JSON.parse(row.result_json),
     };
+  }
+
+  function toClaim(row) {
+    return Object.freeze({
+      event: Object.freeze(eventFromRow(row)),
+      attempt: row.attempt,
+      leaseUntil: row.lease_until,
+      receipt: Object.freeze({
+        eventId: row.event_id,
+        workerId: row.worker_id,
+        version: row.version,
+      }),
+    });
   }
 
   const enqueueTransaction = database.transaction((eventInput) => {
@@ -507,35 +591,127 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     return { created: true, event };
   });
 
-  const acknowledgeTransaction = database.transaction(({ eventId, result }) => {
-    const normalizedEventId = requireText(eventId, 'eventId');
-    const current = selectEvent.get(normalizedEventId);
-    if (!current) throw new TypeError(`status event not found: ${normalizedEventId}`);
-    if (current.status === 'acknowledged') {
-      enqueueReconciliation(database, current, JSON.parse(current.result_json), current.settled_at);
-      return toView(current);
-    }
+  const claimTransaction = database.transaction(({ workerId, leaseMs, limit }) => {
+    const normalizedWorkerId = requireText(workerId, 'status workerId');
+    requirePositiveInteger(leaseMs, 'status leaseMs');
+    requirePositiveInteger(limit, 'status claim limit');
     const timestamp = now();
+    const leaseUntil = timestamp + leaseMs;
+    const candidates = database.prepare(`
+      SELECT event_id, version
+      FROM task_v2_status_events
+      WHERE status = 'pending' AND available_at <= ?
+        AND (worker_id IS NULL OR lease_until <= ?)
+      ORDER BY sequence
+      LIMIT ?
+    `).all(timestamp, timestamp, limit);
+    const update = database.prepare(`
+      UPDATE task_v2_status_events
+      SET worker_id = ?, lease_until = ?, version = version + 1, updated_at = ?
+      WHERE event_id = ? AND version = ? AND status = 'pending' AND available_at <= ?
+        AND (worker_id IS NULL OR lease_until <= ?)
+    `);
+    const claimed = [];
+    for (const candidate of candidates) {
+      const changed = update.run(
+        normalizedWorkerId,
+        leaseUntil,
+        timestamp,
+        candidate.event_id,
+        candidate.version,
+        timestamp,
+        timestamp,
+      );
+      if (changed.changes === 1) claimed.push(toClaim(selectEvent.get(candidate.event_id)));
+    }
+    return claimed;
+  });
+
+  const claimReconciliations = database.transaction(({ workerId, leaseMs, limit }) => {
+    const normalizedWorkerId = requireText(workerId, 'reconciliation workerId');
+    requirePositiveInteger(leaseMs, 'reconciliation leaseMs');
+    requirePositiveInteger(limit, 'reconciliation claim limit');
+    const timestamp = now();
+    const leaseUntil = timestamp + leaseMs;
+    const candidates = database.prepare(`
+      SELECT event_id, version
+      FROM task_v2_status_reconciliations
+      WHERE status = 'pending' AND available_at <= ?
+        AND (worker_id IS NULL OR lease_until <= ?)
+      ORDER BY enqueued_at, event_id
+      LIMIT ?
+    `).all(timestamp, timestamp, limit);
+    const update = database.prepare(`
+      UPDATE task_v2_status_reconciliations
+      SET worker_id = ?, lease_until = ?, version = version + 1, updated_at = ?
+      WHERE event_id = ? AND version = ? AND status = 'pending' AND available_at <= ?
+        AND (worker_id IS NULL OR lease_until <= ?)
+    `);
+    const claimed = [];
+    for (const candidate of candidates) {
+      const changed = update.run(
+        normalizedWorkerId,
+        leaseUntil,
+        timestamp,
+        candidate.event_id,
+        candidate.version,
+        timestamp,
+        timestamp,
+      );
+      if (changed.changes === 1) {
+        claimed.push(toClaim(selectReconciliation.get(candidate.event_id)));
+      }
+    }
+    return claimed;
+  });
+
+  const acknowledgeTransaction = database.transaction(({ receipt, result }) => {
+    const normalizedReceipt = normalizeReceipt(receipt, 'status receipt');
+    const current = selectEvent.get(normalizedReceipt.eventId);
+    if (!current) throw domainError('INBOX_NOT_FOUND', `status event not found: ${normalizedReceipt.eventId}`);
+    const timestamp = now();
+    if (
+      current.status !== 'pending'
+      || current.worker_id !== normalizedReceipt.workerId
+      || current.version !== normalizedReceipt.version
+      || current.lease_until <= timestamp
+    ) {
+      throw domainError('LEASE_LOST', 'status processing lease is no longer current');
+    }
     enqueueReconciliation(database, current, result, timestamp);
     database.prepare(`
       UPDATE task_v2_status_events
       SET status = 'acknowledged', result_json = ?, available_at = ?,
-          next_attempt_at = NULL, last_error = NULL, updated_at = ?, settled_at = ?
-      WHERE event_id = ?
-    `).run(serializeJson(result ?? null, 'status result'), timestamp, timestamp, timestamp, normalizedEventId);
-    return toView(selectEvent.get(normalizedEventId));
+          next_attempt_at = NULL, last_error = NULL, updated_at = ?, settled_at = ?,
+          version = version + 1, worker_id = NULL, lease_until = NULL
+      WHERE event_id = ? AND status = 'pending' AND worker_id = ? AND version = ?
+    `).run(
+      serializeJson(result ?? null, 'status result'),
+      timestamp,
+      timestamp,
+      timestamp,
+      normalizedReceipt.eventId,
+      normalizedReceipt.workerId,
+      normalizedReceipt.version,
+    );
+    return toView(selectEvent.get(normalizedReceipt.eventId));
   });
 
-  const failTransaction = database.transaction(({ eventId, error, retryAfterMs, maxAttempts }) => {
-    const normalizedEventId = requireText(eventId, 'eventId');
+  const failTransaction = database.transaction(({ receipt, error, retryAfterMs, maxAttempts }) => {
+    const normalizedReceipt = normalizeReceipt(receipt, 'status receipt');
     requirePositiveInteger(retryAfterMs, 'retryAfterMs');
     requirePositiveInteger(maxAttempts, 'maxAttempts');
-    const current = selectEvent.get(normalizedEventId);
-    if (!current) throw new TypeError(`status event not found: ${normalizedEventId}`);
-    if (current.status === 'acknowledged' || current.status === 'dead_letter') {
-      return toView(current);
-    }
+    const current = selectEvent.get(normalizedReceipt.eventId);
+    if (!current) throw domainError('INBOX_NOT_FOUND', `status event not found: ${normalizedReceipt.eventId}`);
     const timestamp = now();
+    if (
+      current.status !== 'pending'
+      || current.worker_id !== normalizedReceipt.workerId
+      || current.version !== normalizedReceipt.version
+      || current.lease_until <= timestamp
+    ) {
+      throw domainError('LEASE_LOST', 'status processing lease is no longer current');
+    }
     const attempts = current.attempt + 1;
     const deadLettered = attempts >= maxAttempts || error?.retryable === false;
     const nextAttemptAt = timestamp + retryAfterMs;
@@ -543,8 +719,9 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     database.prepare(`
       UPDATE task_v2_status_events
       SET status = ?, attempt = ?, available_at = ?, next_attempt_at = ?,
-          last_error = ?, updated_at = ?, settled_at = ?
-      WHERE event_id = ?
+          last_error = ?, updated_at = ?, settled_at = ?, version = version + 1,
+          worker_id = NULL, lease_until = NULL
+      WHERE event_id = ? AND status = 'pending' AND worker_id = ? AND version = ?
     `).run(
       deadLettered ? 'dead_letter' : 'pending',
       attempts,
@@ -553,44 +730,71 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
       detail,
       timestamp,
       deadLettered ? timestamp : null,
-      normalizedEventId,
+      normalizedReceipt.eventId,
+      normalizedReceipt.workerId,
+      normalizedReceipt.version,
     );
-    return toView(selectEvent.get(normalizedEventId));
+    return toView(selectEvent.get(normalizedReceipt.eventId));
   });
 
-  const acknowledgeReconciliation = database.transaction(({ eventId, result }) => {
-    const normalizedEventId = requireText(eventId, 'reconciliation eventId');
-    const current = selectReconciliation.get(normalizedEventId);
-    if (!current) throw new TypeError(`status reconciliation not found: ${normalizedEventId}`);
-    if (current.status === 'acknowledged') return toReconciliationView(current);
+  const acknowledgeReconciliation = database.transaction(({ receipt, result }) => {
+    const normalizedReceipt = normalizeReceipt(receipt, 'reconciliation receipt');
+    const current = selectReconciliation.get(normalizedReceipt.eventId);
+    if (!current) {
+      throw domainError(
+        'INBOX_NOT_FOUND',
+        `status reconciliation not found: ${normalizedReceipt.eventId}`,
+      );
+    }
     const timestamp = now();
+    if (
+      current.status !== 'pending'
+      || current.worker_id !== normalizedReceipt.workerId
+      || current.version !== normalizedReceipt.version
+      || current.lease_until <= timestamp
+    ) {
+      throw domainError('LEASE_LOST', 'status reconciliation lease is no longer current');
+    }
     database.prepare(`
       UPDATE task_v2_status_reconciliations
       SET status = 'acknowledged', result_json = ?, available_at = ?,
-          next_attempt_at = NULL, last_error = NULL, updated_at = ?, settled_at = ?
-      WHERE event_id = ?
+          next_attempt_at = NULL, last_error = NULL, updated_at = ?, settled_at = ?,
+          version = version + 1, worker_id = NULL, lease_until = NULL
+      WHERE event_id = ? AND status = 'pending' AND worker_id = ? AND version = ?
     `).run(
       serializeJson(result ?? null, 'status reconciliation result'),
       timestamp,
       timestamp,
       timestamp,
-      normalizedEventId,
+      normalizedReceipt.eventId,
+      normalizedReceipt.workerId,
+      normalizedReceipt.version,
     );
-    return toReconciliationView(selectReconciliation.get(normalizedEventId));
+    return toReconciliationView(selectReconciliation.get(normalizedReceipt.eventId));
   });
 
   const failReconciliation = database.transaction(({
-    eventId, error, retryAfterMs, maxAttempts,
+    receipt, error, retryAfterMs, maxAttempts,
   }) => {
-    const normalizedEventId = requireText(eventId, 'reconciliation eventId');
+    const normalizedReceipt = normalizeReceipt(receipt, 'reconciliation receipt');
     requirePositiveInteger(retryAfterMs, 'reconciliation retryAfterMs');
     requirePositiveInteger(maxAttempts, 'reconciliation maxAttempts');
-    const current = selectReconciliation.get(normalizedEventId);
-    if (!current) throw new TypeError(`status reconciliation not found: ${normalizedEventId}`);
-    if (current.status === 'acknowledged' || current.status === 'dead_letter') {
-      return toReconciliationView(current);
+    const current = selectReconciliation.get(normalizedReceipt.eventId);
+    if (!current) {
+      throw domainError(
+        'INBOX_NOT_FOUND',
+        `status reconciliation not found: ${normalizedReceipt.eventId}`,
+      );
     }
     const timestamp = now();
+    if (
+      current.status !== 'pending'
+      || current.worker_id !== normalizedReceipt.workerId
+      || current.version !== normalizedReceipt.version
+      || current.lease_until <= timestamp
+    ) {
+      throw domainError('LEASE_LOST', 'status reconciliation lease is no longer current');
+    }
     const attempts = current.attempt + 1;
     const deadLettered = attempts >= maxAttempts || error?.retryable === false;
     const nextAttemptAt = timestamp + retryAfterMs;
@@ -598,8 +802,9 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     database.prepare(`
       UPDATE task_v2_status_reconciliations
       SET status = ?, attempt = ?, available_at = ?, next_attempt_at = ?,
-          last_error = ?, updated_at = ?, settled_at = ?
-      WHERE event_id = ?
+          last_error = ?, updated_at = ?, settled_at = ?, version = version + 1,
+          worker_id = NULL, lease_until = NULL
+      WHERE event_id = ? AND status = 'pending' AND worker_id = ? AND version = ?
     `).run(
       deadLettered ? 'dead_letter' : 'pending',
       attempts,
@@ -608,9 +813,11 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
       detail,
       timestamp,
       deadLettered ? timestamp : null,
-      normalizedEventId,
+      normalizedReceipt.eventId,
+      normalizedReceipt.workerId,
+      normalizedReceipt.version,
     );
-    return toReconciliationView(selectReconciliation.get(normalizedEventId));
+    return toReconciliationView(selectReconciliation.get(normalizedReceipt.eventId));
   });
 
   return Object.freeze({
@@ -619,12 +826,17 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     },
     pending({ limit = 25 } = {}) {
       requirePositiveInteger(limit, 'limit');
+      const timestamp = now();
       return withLegacyGuard(() => database.prepare(`
         SELECT * FROM task_v2_status_events
         WHERE status = 'pending' AND available_at <= ?
+          AND (worker_id IS NULL OR lease_until <= ?)
         ORDER BY sequence
         LIMIT ?
-      `).all(now(), limit).map(eventFromRow));
+      `).all(timestamp, timestamp, limit).map(eventFromRow));
+    },
+    claim({ workerId, leaseMs, limit = 25 } = {}) {
+      return withLegacyGuard(() => claimTransaction.immediate({ workerId, leaseMs, limit }));
     },
     ack(input = {}) {
       return withLegacyGuard(() => acknowledgeTransaction.immediate(input));
@@ -637,12 +849,21 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     },
     pendingReconciliations({ limit = 25 } = {}) {
       requirePositiveInteger(limit, 'limit');
+      const timestamp = now();
       return withLegacyGuard(() => database.prepare(`
         SELECT * FROM task_v2_status_reconciliations
         WHERE status = 'pending' AND available_at <= ?
+          AND (worker_id IS NULL OR lease_until <= ?)
         ORDER BY enqueued_at, event_id
         LIMIT ?
-      `).all(now(), limit).map(eventFromRow));
+      `).all(timestamp, timestamp, limit).map(eventFromRow));
+    },
+    claimReconciliations({ workerId, leaseMs, limit = 25 } = {}) {
+      return withLegacyGuard(() => claimReconciliations.immediate({
+        workerId,
+        leaseMs,
+        limit,
+      }));
     },
     ackReconciliation(input = {}) {
       return withLegacyGuard(() => acknowledgeReconciliation.immediate(input));
@@ -665,13 +886,15 @@ export async function processTaskV2StatusInboxOnce({
   inbox,
   handler,
   reconciler,
+  workerId,
+  leaseMs = 30_000,
   limit = 25,
   retryAfterMs = 5_000,
   maxAttempts = 5,
 } = {}) {
-  if (!inbox || typeof inbox.pending !== 'function'
+  if (!inbox || typeof inbox.claim !== 'function'
       || typeof inbox.ack !== 'function' || typeof inbox.fail !== 'function') {
-    throw new TypeError('inbox must provide pending, ack, and fail');
+    throw new TypeError('inbox must provide claim, ack, and fail');
   }
   if (!handler || typeof handler.handle !== 'function') {
     throw new TypeError('handler.handle must be a function');
@@ -679,31 +902,33 @@ export async function processTaskV2StatusInboxOnce({
   if (reconciler !== undefined && (!reconciler || typeof reconciler.handle !== 'function')) {
     throw new TypeError('reconciler.handle must be a function');
   }
+  const normalizedWorkerId = requireText(workerId, 'status workerId');
+  requirePositiveInteger(leaseMs, 'status leaseMs');
   requirePositiveInteger(limit, 'limit');
   requirePositiveInteger(retryAfterMs, 'retryAfterMs');
   requirePositiveInteger(maxAttempts, 'maxAttempts');
-  const events = inbox.pending({ limit });
-  if (!Array.isArray(events)) throw new TypeError('inbox.pending must return an array');
+  const events = inbox.claim({ workerId: normalizedWorkerId, leaseMs, limit });
+  if (!Array.isArray(events)) throw new TypeError('inbox.claim must return an array');
   const summary = {
     claimed: events.length,
     acknowledged: 0,
     retryWaiting: 0,
     deadLettered: 0,
   };
-  const hasReconciliationInbox = typeof inbox.pendingReconciliations === 'function'
+  const hasReconciliationInbox = typeof inbox.claimReconciliations === 'function'
     && typeof inbox.ackReconciliation === 'function'
     && typeof inbox.failReconciliation === 'function';
-  for (const event of events) {
+  for (const work of events) {
     try {
-      const result = await handler.handle(event);
+      const result = await handler.handle(work.event);
       if (reconciler !== undefined && hasReconciliationSignal(result) && !hasReconciliationInbox) {
         throw new TypeError('status inbox cannot persist required reconciliation work');
       }
-      inbox.ack({ eventId: event.event_id, result });
+      inbox.ack({ receipt: work.receipt, result });
       summary.acknowledged += 1;
     } catch (error) {
       const failed = inbox.fail({
-        eventId: event.event_id,
+        receipt: work.receipt,
         error,
         retryAfterMs,
         maxAttempts,
@@ -714,9 +939,13 @@ export async function processTaskV2StatusInboxOnce({
   }
   if (reconciler === undefined) return Object.freeze(summary);
   if (!hasReconciliationInbox) return Object.freeze(summary);
-  const work = inbox.pendingReconciliations({ limit });
+  const work = inbox.claimReconciliations({
+    workerId: normalizedWorkerId,
+    leaseMs,
+    limit,
+  });
   if (!Array.isArray(work)) {
-    throw new TypeError('inbox.pendingReconciliations must return an array');
+    throw new TypeError('inbox.claimReconciliations must return an array');
   }
   const reconciliation = {
     claimed: work.length,
@@ -724,14 +953,14 @@ export async function processTaskV2StatusInboxOnce({
     retryWaiting: 0,
     deadLettered: 0,
   };
-  for (const event of work) {
+  for (const item of work) {
     try {
-      const result = await reconciler.handle(event);
-      inbox.ackReconciliation({ eventId: event.event_id, result });
+      const result = await reconciler.handle(item.event);
+      inbox.ackReconciliation({ receipt: item.receipt, result });
       reconciliation.acknowledged += 1;
     } catch (error) {
       const failed = inbox.failReconciliation({
-        eventId: event.event_id,
+        receipt: item.receipt,
         error,
         retryAfterMs,
         maxAttempts,
