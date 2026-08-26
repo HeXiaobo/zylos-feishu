@@ -67,8 +67,8 @@ zylos uninstall feishu
 |------|-----------|
 | 私聊（管理员/白名单） | 通过 Claude 回复 |
 | 在允许的群里 @机器人 | 带上下文回复 |
-| 显式配置为 smart 的群消息 | 免 @ 回复，但不触发结构化任务摄取 |
-| 管理员在任意群 @机器人 | 始终回复 |
+| 显式配置为 smart 的群消息 | 免 @ 评估；无关或未授权的被动消息保持静默，且不触发结构化任务摄取 |
+| 管理员在任意群 @机器人 | 除非群聊被全局禁用，否则回复 |
 | 未知用户 | 忽略 |
 
 ## 自然语言 WorkIntake
@@ -97,6 +97,9 @@ WorkIntake 默认关闭。请在 `~/zylos/components/feishu/config.json` 中开�
 非 Owner 策略必须精确匹配租户；每次放行或拒绝都会写入
 `logs/member-access-audit.jsonl`。群聊中的任务与 WorkIntake 始终要求精确
 @机器人；smart 模式只兼容普通对话，免 @ 消息不会映射进结构化任务协议。
+显式配置的群以自身 `allowFrom` 作为发送者策略（包括外部成员）；全局成员
+策略继续保护私聊，以及由 `groupPolicy: "open"` 放行但未显式配置的群。
+WorkIntake 仍要求精确 @机器人，并且必须配置专用 capability。
 稳定的确认数据会先写入本地 `0600` outbox；每次投递都重新签发确认卡，
 临时故障或进程重启后会用同一个 Feishu UUID 自动重试。
 

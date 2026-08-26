@@ -9,6 +9,7 @@ export function decideGroupActivation({ chatType, mentionedBot, smartMode }) {
       process: true,
       smartMode: false,
       allowTaskIntake: true,
+      showImmediateResponse: true,
     };
   }
 
@@ -18,5 +19,6 @@ export function decideGroupActivation({ chatType, mentionedBot, smartMode }) {
     process: mentioned || explicitSmartMode,
     smartMode: !mentioned && explicitSmartMode,
     allowTaskIntake: mentioned,
+    showImmediateResponse: mentioned,
   };
 }

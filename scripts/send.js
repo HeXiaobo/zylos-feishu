@@ -33,6 +33,7 @@ import {
 } from '../src/lib/task-comment-production.js';
 import { createTaskCommentReplyProduction } from '../src/lib/task-comment-reply-production.js';
 import { isTaskCommentsEnabled } from '../src/lib/task-comment-runtime-policy.js';
+import { isSilentResponse } from '../src/lib/silent-response.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -76,7 +77,7 @@ function parseEndpoint(endpoint) {
 const parsedEndpoint = parseEndpoint(rawEndpoint);
 const endpointId = parsedEndpoint.chatId;
 
-if (message.trim() === '[SKIP]') {
+if (isSilentResponse(message)) {
   markTypingDone(parsedEndpoint.msg);
   process.exit(0);
 }
