@@ -13,6 +13,7 @@ describe('group activation policy', () => {
       process: true,
       smartMode: false,
       allowTaskIntake: true,
+      showImmediateResponse: true,
     });
   });
 
@@ -25,6 +26,7 @@ describe('group activation policy', () => {
       process: false,
       smartMode: false,
       allowTaskIntake: false,
+      showImmediateResponse: false,
     });
   });
 
@@ -37,7 +39,18 @@ describe('group activation policy', () => {
       process: true,
       smartMode: true,
       allowTaskIntake: false,
+      showImmediateResponse: false,
     });
+  });
+
+  it('keeps passive smart evaluation invisible until a substantive answer exists', () => {
+    const decision = decideGroupActivation({
+      chatType: 'group',
+      mentionedBot: false,
+      smartMode: true,
+    });
+
+    assert.equal(decision.showImmediateResponse, false);
   });
 
   it('does not apply group activation rules to direct messages', () => {
@@ -49,6 +62,7 @@ describe('group activation policy', () => {
       process: true,
       smartMode: false,
       allowTaskIntake: true,
+      showImmediateResponse: true,
     });
   });
 });
