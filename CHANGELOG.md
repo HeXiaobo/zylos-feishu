@@ -40,6 +40,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot provide turn-safe streaming, stable proactive card identity, and the
   native completion mapper used at runtime.
 
+## [0.3.7-rc.3] - 2026-08-26
+
+### Fixed
+- Run a bounded status watchdog at startup and every 60 seconds so a completely
+  missed native completion callback still advances the linked Core task to
+  `review`, never directly to `done`.
+- Record an unregistered top-level comment from the exact current App for audit
+  and follower notification without waking that same Agent or producing an
+  undeliverable reply notification addressed to the App ID.
+- Stop scheduled reconciliation cleanly on shutdown and propagate aborts
+  between the bounded Core, Feishu listing, and status-repair steps.
+
+### Changed
+- Reconciliation now pages both open and completed managed Task partitions once
+  and indexes them by Core task ID, replacing the previous per-Core-task remote
+  rescan while retaining authoritative Task reads and duplicate detection.
+
 ## [0.3.7-3ai.5] - 2026-08-26
 
 ### Fixed
