@@ -12,6 +12,8 @@ const MAX_PUBLIC_REASONING_BYTES = 12_000;
 const MAX_REASONING_DELTA_BYTES = 64 * 1024;
 const MAX_CARD_BYTES = 30_000;
 const DEFAULT_ANSWER_BYTES_PER_CARD = 12_000;
+const MAX_CHAT_LIST_SUMMARY_BYTES = 120;
+const SUMMARY_ELLIPSIS = '…';
 const DEFAULT_THROTTLE_MS = 250;
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
@@ -182,6 +184,42 @@ function splitUtf8(text, maxBytes) {
   return segments;
 }
 
+function truncateUtf8(text, maxBytes) {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let result = '';
+  let bytes = 0;
+  for (const character of text) {
+    const characterBytes = Buffer.byteLength(character, 'utf8');
+    if (bytes + characterBytes > maxBytes) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return result;
+}
+
+function completedChatListSummary(output) {
+  const normalized = typeof output === 'string'
+    ? output
+      .replace(/\r\n?/g, '\n')
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      .split('\n')
+      .map(line => line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/, '').trim())
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    : '';
+  const summary = normalized || '处理完成。';
+  if (Buffer.byteLength(summary, 'utf8') <= MAX_CHAT_LIST_SUMMARY_BYTES) return summary;
+  return `${truncateUtf8(summary, MAX_CHAT_LIST_SUMMARY_BYTES - Buffer.byteLength(SUMMARY_ELLIPSIS, 'utf8'))}${SUMMARY_ELLIPSIS}`;
+}
+
+function terminalChatListSummary(state) {
+  return state.status === 'completed'
+    ? completedChatListSummary(state.output)
+    : state.phase;
+}
+
 function publicProgressText(payload) {
   const actionText = PUBLIC_ACTION_PROGRESS[payload?.action]?.[payload?.status];
   return actionText || SAFE_PROGRESS[payload?.stage] || null;
@@ -270,6 +308,7 @@ function clearTransientProcess(state) {
 function renderCard({
   phase,
   answer,
+  summary,
   progress = [],
   publicReasoning = '',
   streaming,
@@ -291,7 +330,7 @@ function renderCard({
       update_multi: true,
       width_mode: 'fill',
       streaming_mode: streaming,
-      summary: { content: running ? '正在回复…' : phase },
+      summary: { content: summary || (running ? '正在回复…' : phase) },
       ...(streaming
         ? {
             streaming_config: {
@@ -574,7 +613,7 @@ export function createConversationResponseStream({
           settings: JSON.stringify({
             config: {
               streaming_mode: false,
-              summary: { content: state.phase },
+              summary: { content: terminalChatListSummary(state) },
             },
           }),
           sequence,
@@ -589,6 +628,7 @@ export function createConversationResponseStream({
     const card = renderCard({
       phase: state.phase,
       answer,
+      summary: terminal ? terminalChatListSummary(state) : null,
       progress: state.progress,
       publicReasoning: state.publicReasoning,
       streaming: !terminal,
@@ -660,6 +700,7 @@ export function createConversationResponseStream({
       const card = renderCard({
         phase: state.phase,
         answer: segments[part],
+        summary: terminal ? terminalChatListSummary(state) : null,
         progress: state.progress,
         publicReasoning: state.publicReasoning,
         streaming: state.mode === 'cardkit' && !terminal && part === segments.length - 1,
@@ -930,6 +971,7 @@ export function createConversationResponseStream({
             const card = renderCard({
               phase: state.phase,
               answer: segments[part],
+              summary: completedChatListSummary(output),
               streaming: false,
               part,
               totalParts: segments.length,

@@ -138,7 +138,10 @@ test('opens once, coalesces real deltas, keeps sequence monotonic, and closes th
   assert.deepEqual(updates.map(call => call.data.sequence), [1, 2]);
   assert.deepEqual(closes.map(call => call.data.sequence), [3]);
   const finalCard = JSON.parse(updates.at(-1).data.card.data);
+  const closeSettings = JSON.parse(closes[0].data.settings);
   assert.equal(finalCard.config.streaming_mode, false);
+  assert.equal(finalCard.config.summary.content, '真实完整答案');
+  assert.equal(closeSettings.config.summary.content, '真实完整答案');
   assert.equal(finalCard.body.elements[0].content, '✅ 已完成');
   assert.equal(finalCard.body.elements[1].content, '真实完整答案');
   assert.equal(finalCard.body.elements[0].element_id.length <= 20, true);
@@ -323,6 +326,58 @@ test('uses a user-facing chat-list summary in both running card modes', async ()
   }
 });
 
+test('normalizes the completed answer into the ordinary-card chat-list summary', async () => {
+  for (const chatType of ['p2p', 'group']) {
+    await withState(async stateDirectory => {
+      const { client, calls } = createClient({ conversion: false });
+      const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+      const output = '# 真实结果\n\n- 已完成 [详情](https://example.com/result)';
+
+      await stream.open({ requestId: 'assistant.feishu.om_1', target: target(chatType) });
+      await stream.apply({
+        requestId: 'assistant.feishu.om_1',
+        events: [
+          event(1, 'RunStarted'),
+          event(2, 'RunCompleted', { output }),
+        ],
+      });
+
+      const finalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+      assert.equal(finalCard.config.summary.content, '真实结果 已完成 详情');
+      assert.equal(cardElement(finalCard, 'zylos_answer').content, output);
+    });
+  }
+});
+
+test('uses a completion fallback for empty answers and preserves failure summaries', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunCompleted', { output: '' })],
+  });
+  let finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(finalCard.config.summary.content, '处理完成。');
+
+  await withState(async failedStateDirectory => {
+    const failed = createClient();
+    const failedStream = createConversationResponseStream({
+      client: failed.client,
+      stateDirectory: failedStateDirectory,
+      throttleMs: 0,
+    });
+    await failedStream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+    await failedStream.apply({
+      requestId: 'assistant.feishu.om_1',
+      events: [event(1, 'RunFailed', { retryable: true })],
+    });
+    finalCard = JSON.parse(failed.calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+    assert.equal(finalCard.config.summary.content, '⚠️ 本次处理未完成，可重试');
+  });
+}));
+
 test('can hide transient process UI while continuing to stream the answer', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({
@@ -363,6 +418,9 @@ test('keeps long completed answers free of extra copy actions', () => withState(
   });
 
   const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(Buffer.byteLength(card.config.summary.content, 'utf8') <= 120, true);
+  assert.equal(card.config.summary.content.endsWith('…'), true);
+  assert.equal(cardElement(card, 'zylos_answer').content, '这是一段需要方便复制的较长回答。'.repeat(12));
   assert.equal(card.body.elements.some(element => element.element_id === 'zylos_copy'), false);
   assert.deepEqual(card.body.elements.map(element => element.tag), ['markdown', 'markdown']);
 }));
@@ -389,6 +447,7 @@ test('sends proactive text as the same completed response card without a placeho
   assert.equal(calls.filter(([name]) => name === 'convert').length, 0);
   const card = JSON.parse(calls.find(([name]) => name === 'send')[1].data.content);
   assert.equal(card.config.streaming_mode, false);
+  assert.equal(card.config.summary.content, output);
   assert.equal(card.body.elements[0].content, '✅ 已完成');
   assert.equal(card.body.elements[1].content, output);
 }));
@@ -891,6 +950,10 @@ test('legacy full-answer completion finalizes the existing card and durable term
     output: '兼容完整答案',
   });
   assert.equal(completed.handled, true);
+  const compatibilityCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const compatibilityClose = JSON.parse(calls.filter(([name]) => name === 'close').at(-1)[1].data.settings);
+  assert.equal(compatibilityCard.config.summary.content, '兼容完整答案');
+  assert.equal(compatibilityClose.config.summary.content, '兼容完整答案');
   const apiCallCount = calls.length;
   await stream.apply({
     requestId: 'assistant.feishu.om_1',
