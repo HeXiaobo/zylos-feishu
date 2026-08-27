@@ -23,7 +23,7 @@ export const DEFAULT_CONFIG = {
     encrypt_key: '',
     verification_token: ''
   },
-  // Owner (primary partner) - auto-bound on first private chat
+  // Owner (primary partner) - must be explicitly configured by a trusted operator
   owner: {
     bound: false,
     user_id: '',
@@ -34,6 +34,15 @@ export const DEFAULT_CONFIG = {
   dmPolicy: 'owner',
   // DM allowlist — user_id or open_id values (used when dmPolicy = 'allowlist')
   dmAllowFrom: [],
+  // Optional F2 member policy. null preserves the legacy dmPolicy behavior.
+  // Supported modes: owner, tenant_members, departments, allowlist.
+  // Non-owner modes require an exact tenantKey and are audited per decision.
+  memberAccessPolicy: null,
+  workIntake: {
+    enabled: false,
+    timeZone: 'Asia/Shanghai',
+    confirmationTtlMs: 15 * 60 * 1000,
+  },
   // Group policy: 'open' (all groups), 'allowlist' (only configured groups), 'disabled' (no groups)
   groupPolicy: 'allowlist',
   // Per-group configuration map
@@ -53,7 +62,8 @@ export const DEFAULT_CONFIG = {
   // Message settings
   message: {
     context_messages: 10,
-    useMarkdownCard: false
+    useMarkdownCard: true,
+    streamProcessDisplay: 'collapsible'
   }
 };
 
@@ -69,7 +79,14 @@ export function loadConfig() {
     if (fs.existsSync(CONFIG_PATH)) {
       const content = fs.readFileSync(CONFIG_PATH, 'utf8');
       const parsed = JSON.parse(content);
-      config = { ...DEFAULT_CONFIG, ...parsed };
+      config = {
+        ...DEFAULT_CONFIG,
+        ...parsed,
+        workIntake: {
+          ...DEFAULT_CONFIG.workIntake,
+          ...(parsed.workIntake || {}),
+        },
+      };
       // Runtime backward-compat: derive groupPolicy from legacy group_whitelist,
       // but only if the file doesn't already have an explicit groupPolicy
       if (config.group_whitelist !== undefined && !('groupPolicy' in parsed)) {
@@ -92,7 +109,7 @@ export function loadConfig() {
           }
         } else {
           // Pre-whitelist era config → default to owner (safest default).
-          // Owner binding handles bootstrap: first DM user becomes owner.
+          // An unconfigured owner fails closed; inbound messages never bootstrap ownership.
           config.dmPolicy = 'owner';
         }
       }
@@ -115,6 +132,13 @@ export function getConfig() {
     loadConfig();
   }
   return config;
+}
+
+export function getStreamProcessDisplay(value = getConfig()) {
+  const configured = value?.message?.streamProcessDisplay;
+  return ['collapsible', 'answer_only'].includes(configured)
+    ? configured
+    : DEFAULT_CONFIG.message.streamProcessDisplay;
 }
 
 /**

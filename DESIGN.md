@@ -3,7 +3,7 @@
 **Version**: v1.0
 **Date**: 2026-02-14
 **Author**: Zylos Team
-**Repository**: https://github.com/zylos-ai/zylos-feishu
+**Repository**: https://github.com/HeXiaobo/zylos-feishu
 **Status**: Implemented
 
 ---
@@ -259,6 +259,140 @@ ecosystem. Only that dedicated app sets
 `COMMITMENT_FEISHU_PROJECTION_AUTOSTART=1`; the ordinary Feishu ecosystem never
 receives this worker-start capability.
 
+### 3.8 Native Task v2 projection
+
+`src/lib/task-v2-projection.js` is a second, Card-independent projection. Core
+is its only source of truth. It stores exactly one `feishu-task-v2` ExternalLink
+per Core task while leaving the existing `feishu` Card message link untouched.
+The SDK Adapter always uses the deployment's configured Feishu App tenant
+identity; there is no user OAuth path and therefore no user refresh-token
+lifecycle.
+
+The member mapping is deliberately narrow: Core Owner is a follower, a distinct
+Acceptor is another follower, and an explicit human or mapped Agent is the
+assignee. `ZYLOS_AGENT_ID` maps the current deployment Agent to
+`FEISHU_APP_ID`; additional logical Agents are configured as a JSON object in
+`FEISHU_TASK_V2_AGENT_APP_IDS`. The universal module has no built-in Agent ID.
+Colleague-facing names come from `ZYLOS_AGENT_LABEL` or
+`ZYLOS_AGENT_LABELS`; an unknown label uses a generic readable fallback while
+an unmapped Task assignee fails closed.
+
+Native completion means "submitted by the executor": `ready` is first started
+and then moved to `review`, while `in_progress` moves directly to `review`.
+The Feishu handler delegates the completion-to-command mapping to Core's
+`external-task-adapter.js` and accepts only an identity/version-preserving
+`SubmitForReview` result. It validates that result before an optional
+`StartTask`, so a bad mapper cannot leave a ready Task half-transitioned. The
+reverse Adapter never emits `AcceptTask`. Core `review`, `done`, and `cancelled`
+project as completed; `RequestChanges` returns Core to `ready` and the next
+projection reopens the native Task. Updates are field-difference patches: an
+already-completed native Task is not completed again when Core advances from
+`review` to `done`.
+
+An optional Core `reminderMinutesBeforeDue` is projected only when the Task has
+a canonical deadline. Because Task v2 create/patch payloads do not own reminder
+mutation, the SDK Adapter creates or patches the base Task, then calls the
+dedicated add/remove reminder endpoints. It reads the Task back and accepts the
+projection only when the native `relative_fire_minute` exactly matches Core;
+the receipt includes that confirmed value. Existing reminder IDs are removed
+by their exact native ID before replacement, so retry/reconciliation cannot
+silently accumulate reminder drift.
+
+Remote create uses a stable `client_token` only for Feishu's short deduplication
+window. Durable identity is the Core ExternalLink plus its receipt. If create
+succeeds but link persistence is interrupted, a retry exhausts all Task search
+pages for the exact Core marker and adopts the GUID. Multiple matching GUIDs
+are a permanent error. Core's projection worker owns retry, max-attempt
+dead-lettering, redrive, and delivery receipts; Task v2 uses its per-delivery
+Adapter seam so one poison delivery does not hold back unrelated Tasks. A
+Feishu failure never rolls back the Core Task.
+
+Both projection directions share one explicit opt-in and remain off unless
+`COMMITMENT_FEISHU_TASK_V2_ENABLED=1` is set in `~/zylos/.env`. The separate
+PM2 worker is still not part of the ordinary Feishu PM2 app. Registering the
+Core projection is safe while disabled; canary, continuous projection, reverse
+event registration, URL resolution, and reconciliation require opt-in:
+
+```bash
+node src/lib/task-v2-projection-worker.js register --bootstrap-policy from_now
+echo 'COMMITMENT_FEISHU_TASK_V2_ENABLED=1' >> ~/zylos/.env
+node src/lib/task-v2-projection-worker.js run --once
+node src/lib/task-v2-projection-worker.js reconcile
+pm2 start ecosystem.task-v2-projection.config.cjs
+```
+
+Each `run --once` result and supervisor cycle includes projection receipts with
+the native `url`, GUID, and create/recovery flags. Core's generic worker stays
+platform-neutral and does not know the Task v2 response shape.
+Resolve the same user-consumable native URL later from a Core task ID with
+`node src/lib/task-v2-projection-worker.js url <core-task-id>`.
+
+Choose `from_beginning` instead of `from_now` only for an intentional rebuild.
+`reconcile` cursor-pages through all Core tasks and combines the platform
+snapshot with Core's generic reconciliation; it never silently truncates at
+the Core query limit. It reports missing, duplicate, state-drift, missing-link,
+link-mismatch, and reminder-drift records without changing either system.
+Reminder drift compares the canonical offset with the authoritative native
+Task readback; the next projection update replaces it and confirms the new
+value. Explicit
+`reconcile --repair-status` replays native-completed/Core-open status drift
+through the same Core status handler; it can start and submit for review but
+never accepts a Task. Its report is the detection snapshot plus applied repair
+receipts, so run reconciliation again to verify the resulting clean state.
+The continuous supervisor runs that status repair once at startup and every
+60 seconds, so a completely missed completion callback still converges Core to
+`review`. Override the cadence with
+`COMMITMENT_FEISHU_TASK_V2_RECONCILIATION_INTERVAL_MS`. Each scan lists managed
+native Tasks once and indexes them by Core task ID before walking Core tasks;
+it explicitly pages both open and completed partitions and does not repeat the
+full Feishu pagination for every Core task. Shutdown aborts are checked before
+starting a scheduled scan and between bounded list/repair steps.
+
+Native status callbacks acknowledge only after a `synchronous=FULL` transaction
+to the Feishu-owned SQLite/WAL Task v2 inbox. Its indexed current-state rows
+replace the former append-only journals, so polling and retry do not rescan or
+grow settlement history. On first open, any existing NDJSON events and
+settlements are validated and atomically migrated while the original files
+remain unchanged as evidence. Concurrent first opens serialize schema and
+migration ownership, then verify the same evidence signature instead of
+duplicating rows. A concurrent or later legacy writer still fails the new store
+closed. Status and reconciliation workers claim rows with an atomic
+`worker_id`/`lease_until`/`version` fence. Expired leases can be taken over, but
+an earlier worker's acknowledgement or failure cannot settle the newer lease.
+The projection worker drains both queues with independent retry and dead-letter
+settlement. Callback processing therefore does not mutate Core or depend on
+Core availability.
+
+The Feishu App needs `task:task:read` and `task:task:write`, plus the
+`task.task.update_user_access_v2` event subscription. Before starting either
+the WebSocket or webhook event transport, their common startup gate opens and
+closes the production `status-inbox.db`. That preflight loads the native SQLite
+binding and executes schema creation, legacy migration, dual-writer evidence,
+and permission checks. Only after it succeeds does the gate call the Task v2
+subscription API with the same bot identity; either failure prevents both the
+subscription and transport startup. Successful subscription is memoized within
+the process so concurrent or repeated startup attempts do not duplicate it.
+Bot identity covers only Tasks for which the current App is responsible; a
+user's personally followed Tasks are not part of this managed real-time SLA.
+The current native envelope's `event_types` are retained in the durable inbox:
+only `task_completed_update` can enter the `SubmitForReview` path. Other commit
+types are atomically transferred into a durable reconciliation queue before
+their status event is acknowledged. The same worker consumes that queue by
+restoring the canonical Core projection to the linked native Task; failures
+retry or dead-letter the reconciliation without replaying the acknowledged
+status event. The legacy
+`task.task.updated_v1` handler remains registered during migration. F3 does
+not call comment APIs;
+`task:comment:read` and `task:comment:write` belong to the later comment slice.
+
+The first SQLite-inbox deployment is deliberately single-writer during
+migration: keep the Task v2 projection worker stopped, start one Feishu process
+with the feature enabled, wait for startup preflight to complete, and only then
+start the projection worker. Rollback to an older artifact requires disabling
+`COMMITMENT_FEISHU_TASK_V2_ENABLED` and stopping reverse-status/projection
+processing first. This explicitly drops the managed status SLA during rollback;
+an older artifact must never remain active as a legacy inbox writer.
+
 ---
 
 ## 4. C4 Integration
@@ -352,6 +486,203 @@ node send.js "oc_xxx" "[MEDIA:file]/path/to/document.pdf"
 # With image
 [Feishu DM] Howard said: [image] What is this ---- file: ~/zylos/components/feishu/media/feishu-xxx.png
 ```
+
+### 4.5 Task v2 Comment and Reliable Notification Seam
+
+The official Node SDK `EventDispatcher` registers
+`task.task.comment.updated_v1`. Its handler performs only strict event
+normalization and a synchronous SQLite inbox write, then returns. It never
+calls Task v2, Commitment Core, C4, or an Agent before acknowledging.
+
+`createTaskCommentWorker(...)` consumes the inbox behind three narrow injected
+Interfaces:
+
+```text
+taskMapping.resolve({ appId, taskGuid }) -> { taskId, wakeTarget }
+conversation.record(command) -> { event, comment }
+wakeAgent({ taskId, target, commentEventId, commentId, replyContext, idempotencyKey })
+```
+
+`taskMapping` is the only F3 integration seam. Tests use an in-memory fake;
+integration must resolve the F3 Task GUID `ExternalLink` and return the linked
+Core Task plus its Agent/session wake target. No Task v2 or SDK type crosses
+into Core.
+
+`wakeAgent` must durably honor its `idempotencyKey`: Core comment persistence
+can succeed before inbox acknowledgement, so a crash retry deliberately calls
+the wake seam again with the same key. Its opaque `replyContext` carries the
+original App, Task GUID, and comment ID so an Agent answer can set the exact
+`reply_to_comment_id`; Core does not inspect this platform context.
+
+The Worker reads content, author, timestamps, resource identity, and
+`reply_to_comment_id` through `client.task.v2.comment.get`. It maps creates and
+revisions to Core append-only comment commands. A confirmed missing/deleted
+comment maps to a Core deletion tombstone. Inbox delivery uses app/event and
+business-key deduplication, fenced leases, retry, and dead-letter state.
+
+`createTaskCommentReplyAdapter(...)` writes Agent answers with
+`client.task.v2.comment.create` and `reply_to_comment_id`. Its durable outbound
+ledger records the exact returned Feishu comment ID for echo suppression.
+Ambiguous transport failures are dead-lettered and not automatically resent,
+because Task v2 comment creation has no reusable idempotency token and a blind
+retry could duplicate an Agent reply.
+
+The caller records the Agent response in Core `TaskConversation` first, then
+uses that immutable Core event identity as the reply Adapter idempotency key.
+The Adapter is a platform projection; suppressing its returned Feishu comment
+echo therefore does not remove the Agent response from Core history.
+An unregistered top-level comment whose creator is this exact App is still
+recorded in Core for audit and human follower notification, but it is not an
+Agent wake input. This prevents an operator-authored App comment from waking
+the same Agent, replying to itself, and creating an undeliverable notification
+addressed to the App ID. Exact registered/adopted outbound echo handling and
+human same-content handling remain unchanged.
+
+`createTaskCommentReconciler(...)` lists comments every 5–10 minutes for active
+Task mappings, including mappings whose Task was not created by this App. Done
+and cancelled Tasks remain eligible for a configurable 24–72 hour grace
+window. Reconciliation enqueues the same durable work path and detects deleted
+comments previously observed locally.
+
+Core `NotificationPolicy` output is consumed by
+`createFeishuNotificationAdapter(...)`. Each `event + recipient + feishu-im`
+delivery has a durable receipt; ordinary deliveries use a 30–60 second merge
+window and per-recipient rate limit. Review and explicit action-required
+notices are immediate. The SDK sender uses a stable Feishu message UUID so a
+crash before the local acknowledgement does not create another IM.
+
+Production enables event intake explicitly with
+`FEISHU_TASK_COMMENTS_ENABLED=1`. Disabled ordinary chat startup lazy-loads
+neither the SQLite store nor its native dependency. The main process only
+writes the durable inbox; `ecosystem.task-comments.config.cjs` owns the
+separate worker, reconciliation, notification and C4 wake loops.
+
+The production worker dynamically loads the installed Core coordinator and
+comm-bridge idempotent inbound queue. A human comment is recorded in Core,
+notifies the non-acting human audience, and wakes an `agent:*` assignee through
+one durable C4 receipt. The reply endpoint is opaque and platform-owned;
+`scripts/send.js` recognizes it and writes the Agent response back with the
+exact Task v2 `reply_to_comment_id`. Agent notification identities are routed
+to C4 and are never passed to Feishu as fake `open_id` values.
+
+### 4.6 Native Task closure acceptance gate
+
+`evaluateNativeTaskClosure(...)` is the read-only acceptance Interface for a
+managed Task comment closure. It opens the Core and Task comment SQLite files
+in read-only mode and accepts a remote Reader Adapter. The production CLI uses
+only the SDK Reader and marks reports as live/attestable; injected test Readers
+are machine-distinguishable and cannot attest a pass.
+
+Every case provides only the exact Task GUID and inbound comment ID. The gate
+derives the canonical Core comment event, immutable NotificationPolicy
+decision, full recipient set, and delivery dedupe keys from the read-only Core
+database rather than trusting caller assertions. It proves all of the following
+before it passes:
+
+- the GUID and linked Core Task have a one-to-one `feishu-task-v2`
+  `ExternalLink`;
+- the exact comment arrived through the realtime event source within the
+  configured latency SLO and reached `processed`;
+- exactly one sent outbound comment targets that inbound comment;
+- the exact canonical comment has an action-required notification decision;
+  its non-empty recipient/dedupe-key set normally matches sent Feishu receipts
+  exactly, with no missing or unexpected recipient;
+- when the commenter is the only human owner/acceptor/subscriber, the empty
+  inbound decision cannot attest delivery by itself: the exact outbound ledger
+  key must identify a matching Core Agent reply event, and that reply's
+  immutable decision and sent receipt must target exactly the original human;
+- the remote Task still exists, its GUID/title/Core marker match, no same-title
+  lookalike is visible, and both remote comments belong to the same Task;
+- the remote Agent comment has the exact `reply_to_comment_id`.
+
+Failures are returned as stable codes in
+`zylos.native-task-closure-gate/v2`; one poisoned case does not stop the
+remaining cases. The CLI emits one JSON report and exits `0` for pass, `1` for
+a gate failure, or `2` for invalid input/runtime assembly:
+
+Successful case reports identify whether notification evidence came from the
+`inbound-comment` decision or, for a sole-human canary, the exact
+`agent-reply` decision. An empty inbound decision never counts as a receipt,
+cannot have an inbound delivery row, and a second human role/subscription
+disables the sole-human fallback.
+
+```bash
+npm run task-comments:gate -- --input /absolute/path/gate-input.json
+```
+
+The production CLI deliberately rejects remote fixtures. Deterministic tests
+inject Readers directly into the library Interface; those reports are marked
+non-live unless the SDK Reader is used. The gate never writes either SQLite
+database and its SDK Adapter exposes only Task/comment read operations.
+
+### 4.7 Native Task completion acceptance gate
+
+`evaluateNativeTaskCompletionClosure(...)` separately attests the status side
+of a native Task canary. Comment/reply evidence cannot substitute for this
+gate. Each case contains only the exact Task GUID and Task v2 event ID. The
+read-only gate derives every other assertion from the Feishu status inbox,
+Commitment Core database, and the live SDK Reader. It proves:
+
+- the GUID has one and only one `feishu-task-v2` link to the Core Task;
+- the exact App/event row is durably acknowledged and contains
+  `task_completed_update`;
+- its immutable settlement is `submitted_for_review`, contains
+  `SubmitForReview`, never contains `AcceptTask`, and records the exact
+  idempotency key returned by the production Core mapper;
+- the Core command at that mapper-returned key is `TaskSubmittedForReview`;
+- the Core Task is in `review` with exactly one submission and zero acceptance
+  events; and
+- the same remote Task still has the linked Core marker, title, and a non-empty
+  completion timestamp.
+
+The production command is:
+
+```bash
+npm run task-status:gate -- --input /absolute/path/completion-gate.json
+```
+
+Only the SDK-assembled Reader can produce an attestable pass. Injected Readers
+may validate deterministic tests but report `evidenceMode: injected` and fail
+attestation. The gate writes neither database and never transitions Core from
+review to accepted.
+
+### 4.8 Native Task conservation gate
+
+`auditNativeTaskConservation({ coreInventory, remote, deployment, signal })`
+is the release-time read-only conservation Interface. Core supplies
+`zylos.native-task-core-inventory/v1`, captured by its dedicated public
+Task/external-link inventory command with full pagination and a stable snapshot.
+The Feishu SDK Adapter independently scans both `todo` and `done` partitions
+twice with the current App identity. It never prefilters by projection marker,
+so an open App orphan cannot disappear before evaluation.
+
+The gate requires `ready` and `in_progress` Agent tasks to have exactly one
+linked `todo` card, and `review` tasks exactly one linked `done` card. Every
+current card must agree across its description marker,
+`extra.coreTaskId`, and persistent `feishu-task-v2` link. Active tasks without
+an assignee, unmapped/cross-App Agent scopes, missing or duplicate links/cards,
+malformed SDK rows, pagination faults, identity mismatch, snapshot movement,
+abort, and timeout all fail closed. Human-assigned tasks do not force an App
+card. Terminal Core tasks and unknown historical `done` cards are outside the
+current cardinality denominator; a terminal task retaining a `todo` App card
+is still an orphan failure.
+
+The independent CLI accepts exactly one Core inventory source:
+
+```bash
+npm run task-conservation:gate -- \
+  --core-inventory-file /absolute/path/native-task-core-inventory.json \
+  --timeout-ms 60000
+```
+
+It can instead read `--core-inventory-stdin`, or execute a shell-free command
+with `--core-inventory-command <executable>` and repeatable
+`--core-inventory-arg <arg>`. Deployment identity is taken from
+`ZYLOS_AGENT_ID`, `FEISHU_APP_ID`, and `FEISHU_TASK_V2_AGENT_APP_IDS`;
+an explicitly configured `C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID` must match the
+deployment Agent. Output schema is `zylos.native-task-conservation-gate/v1`:
+exit `0` means pass, `1` means a deterministic conservation gap, and `2`
+means invalid input, malformed inventory, API failure, abort, or timeout.
 
 ---
 

@@ -19,7 +19,7 @@ function task() {
     state: 'ready',
     ownerId: 'ou_owner',
     acceptorId: 'ou_acceptor',
-    assigneeId: 'agent:yueran',
+    assigneeId: 'agent:mylos',
     version: 1,
     createdAt: '2026-08-24T10:00:00.000Z',
     updatedAt: '2026-08-25T10:00:00.000Z',
@@ -30,7 +30,10 @@ test('exports the narrow Core projection runtime without credentials in Core', a
   const creates = [];
   const patches = [];
   const runtime = await createFeishuProjectionRuntime({
-    env: { FEISHU_TASK_CONTEXT_SECRET: SECRET },
+    env: {
+      FEISHU_TASK_CONTEXT_SECRET: SECRET,
+      ZYLOS_AGENT_LABELS: JSON.stringify({ 'agent:mylos': 'Mylos（AI）' }),
+    },
     client: {
       im: {
         message: {
@@ -75,6 +78,7 @@ test('exports the narrow Core projection runtime without credentials in Core', a
   assert.equal(creates.length, 1);
   assert.equal(creates[0].data.receive_id, 'ou_acceptor');
   assert.equal(patches.length, 1);
+  assert.match(patches[0].data.content, /Mylos（AI）/);
 });
 
 test('fails closed when the dedicated task context secret is missing', async () => {

@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.6
+version: 0.3.7-rc.8
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),
@@ -33,7 +33,7 @@ lifecycle:
     - data/
 
 upgrade:
-  repo: zylos-ai/zylos-feishu
+  repo: HeXiaobo/zylos-feishu
   branch: main
 
 config:
@@ -171,6 +171,84 @@ this signing secret inside the component; Commitment Core receives only the
 narrow publisher Interface. Cards use Card JSON 2.0, stable create UUIDs, Core
 task versions as CardKit update sequences, and signed callback contexts.
 
+The paired release's pre-install/pre-upgrade gate also requires Core's
+`c4.reply.argv-compat`, `c4.assistant-response-stream >= 3`, and
+`c4.outbound-delivery-id >= 1` capabilities, plus
+`external-task-adapter >= 1` for native completion, `task-reminder >= 1`
+for canonical reminder persistence, and `native-task-conservation-inventory >= 1`
+for the release-time read-only cardinality gate. Response-stream v3 serializes admission to
+each runtime turn until its terminal stop, preventing a later message or
+background run from entering the active turn; the outbound-delivery capability
+separately guarantees the stable identity used by proactive cards. An older Core
+must fail the compatibility gate instead of starting this component.
+
+Configure deployment identity explicitly in `~/zylos/.env`; the universal
+component has no built-in Agent name or logical Agent-to-App mapping:
+
+```sh
+ZYLOS_AGENT_ID=agent:your-agent
+ZYLOS_AGENT_LABEL="Your Agent（AI）"
+ZYLOS_AGENT_LABELS='{"agent:another-agent":"Another Agent（AI）"}'
+FEISHU_TASK_V2_AGENT_APP_IDS='{"agent:another-agent":"cli_other_app"}'
+```
+
+`ZYLOS_AGENT_ID` maps the current deployment's logical Agent to
+`FEISHU_APP_ID`. `FEISHU_TASK_V2_AGENT_APP_IDS` supplies any additional App
+identities, and `ZYLOS_AGENT_LABELS` controls colleague-facing card names.
+Unknown logical Agents fail closed in Task v2 projection; missing labels fall
+back to a readable generic AI-employee label.
+
+The paired Core/Feishu release requires Node.js 20.20.0 or newer. Before the
+canary, grant `task:task:read`, `task:task:write`, and task-comment read/write
+permissions, then subscribe to `task.task.update_user_access_v2`,
+`task.task.comment.updated_v1`, and `card.action.trigger`. Task v2 status sync
+requires `COMMITMENT_FEISHU_TASK_V2_ENABLED=1`; comment sync additionally
+requires `FEISHU_TASK_COMMENTS_ENABLED=1`.
+
+When Task v2 status sync is enabled, the common WebSocket/Webhook startup gate
+first opens and closes `task-v2-status-inbox/status-inbox.db`. This preflight
+loads the native SQLite binding and runs schema, legacy migration,
+dual-writer-evidence, and filesystem permission checks before any server-side
+subscription or event transport can start. It then creates the Task v2
+subscription relation with the configured App identity and fails closed if
+either phase fails. One successful relation is reused within the process
+instead of issuing duplicate subscription calls. App identity receives
+real-time changes only for Tasks for which that App is responsible; personally
+followed user Tasks are outside the managed real-time SLA. The legacy
+`task.task.updated_v1` handler remains registered only for the migration window.
+The installed Commitment Core must provide
+`scripts/external-task-adapter.js#mapExternalTaskEvent`; Feishu delegates
+native completion semantics to that mapper and rejects any result other than
+the expected `SubmitForReview` command for the same Task, actor, and version.
+Reminder-aware intake sends `reminderMinutesBeforeDue` only with a canonical
+`dueAt`; `60` means one hour before the deadline. Feishu Task create/patch does
+not carry reminders, so the Task v2 Adapter uses the separate add/remove
+reminder operations and returns success only after an authoritative Task get
+reads back the exact offset.
+
+For a completion canary, record its exact Task GUID and Task v2 event ID, then
+run the live read-only gate after the status worker acknowledges the event:
+
+```sh
+npm run task-status:gate -- --input /absolute/path/completion-gate.json
+```
+
+The input names `coreDbPath`, `statusInboxDbPath`, `appId`, and a non-empty
+`cases` array of `{ "taskGuid": "...", "eventId": "..." }`. A pass proves the
+same remote Task is completed, the exact durable status settlement returned
+`submitted_for_review`, the command receipt at the exact idempotency key
+returned by the production Core mapper exists, and the linked Core Task has
+exactly one review submission and zero acceptance events. This gate does not
+accept a Task on the reviewer's behalf.
+
+For the first SQLite inbox rollout, keep the Task v2 projection worker stopped
+and start exactly one Feishu process with Task v2 enabled. Let that process
+finish the preflight migration before starting the projection worker. To roll
+back to an older artifact, first disable
+`COMMITMENT_FEISHU_TASK_V2_ENABLED` and stop the reverse-status/projection
+worker. That rollback suspends the managed native-status SLA; never leave
+reverse-status enabled while an older artifact can write the legacy inbox.
+
 Do not start projection implicitly. An operator must first register one
 history policy in Commitment Core (`from_now` for a new business canary;
 `from_beginning` only after reviewing all existing tasks), then run one bounded
@@ -282,8 +360,9 @@ After changes, restart: `pm2 restart zylos-feishu`
 
 ## Downloading Media by Resource Key
 
-In smart group mode, images and files sent without @mention are logged with
-metadata only (image_key/file_key). Use `download.js` to fetch them on demand:
+In smart group mode, authorized images and files sent without @mention use the
+normal media path. For resource keys surfaced only in historical context, use
+`download.js` to fetch them on demand:
 
 ```bash
 # Download image
@@ -420,14 +499,17 @@ DM and group access are controlled by **independent** top-level policies:
 2. `groupPolicy` = `open`? → respond to @mentions from any group
 3. `groupPolicy` = `allowlist`? → only configured groups; unlisted groups → only owner passes, others dropped silently
 4. Per-group `allowFrom` set? → only listed senders pass (owner always bypasses)
-5. Smart group (mode: `smart`)? → receive all messages, no @mention needed
-6. Not smart? → only @mentions are processed, other messages are logged only
+5. Smart group (mode: `smart`)? → receive ordinary chat without @mention; task protocols remain mention-gated
+6. Not smart? → only exact bot @mentions are processed; other messages are ignored before content parsing
 
 **Key points:**
-- Owner always bypasses all access checks
+- Owner bypasses group allowlists and sender filters, but not `groupPolicy: "disabled"`
 - `dmPolicy` and `groupPolicy` are fully independent — changing one never affects the other
 - Group access is controlled by `groupPolicy` + `groups` config + per-group `allowFrom`
 - No user-level whitelist for groups; use per-group `allowFrom` if you need to restrict specific senders
+- Smart mode is opt-in compatibility behavior. A no-mention smart message is not mapped into the structured Commitment Core task protocol.
+- An explicitly configured group owns its `allowFrom` sender policy, including for external members. The global `memberAccessPolicy` still protects direct messages and unconfigured groups admitted by `groupPolicy: "open"`; WorkIntake remains exact-mention gated and requires its dedicated capability configuration.
+- Passive Smart-group authorization failures and terminal runtime `[SKIP]` decisions produce no typing indicator, card, or permission reply. A visible denial is reserved for an explicit bot @mention.
 
 ### Groups Config Format
 
@@ -460,7 +542,13 @@ Groups are stored in a map keyed by `chat_id`:
 
 ### Markdown Card
 
-Outgoing messages can be rendered as interactive cards with proper markdown formatting (code blocks, tables, headers, etc.):
+Assistant text is rendered consistently as an interactive response card,
+including plain text, Markdown, streamed replies, and proactive C4 delivery:
+
+Passive Smart-group evaluation does not open a placeholder card. A card is sent
+only when the runtime returns substantive user-facing content; a terminal
+standalone `[SKIP]` marker (with or without a preceding runtime explanation) is
+treated as a compatibility control response and is not delivered.
 
 ```json
 {
@@ -470,7 +558,21 @@ Outgoing messages can be rendered as interactive cards with proper markdown form
 }
 ```
 
-On by default. Note mobile display limitation: cards cannot be long-pressed to copy on mobile. Can be disabled via `node admin.js set-markdown-card off`. When enabled (cards cannot be long-pressed to copy on mobile). When enabled, messages containing markdown are auto-detected and sent as cards; plain text messages are sent normally. Falls back to plain text if card sending fails.
+On by default. Ordinary conversations open one placeholder card and update that
+same card; proactive delivery sends the same completed-card format directly.
+Core supplies `C4_ASSISTANT_REQUEST_ID` or a persisted `C4_DELIVERY_ID`, from
+which this component derives a stable Feishu UUID. An ambiguous network outcome
+is never followed by a second text message: the pending intent is persisted and
+retried with the same UUID. Plain text is used only after Feishu explicitly
+rejects card creation, also with a stable UUID. Without a stable C4 delivery
+identity, proactive card delivery degrades safely to the legacy plain path.
+
+Running progress and public work summaries disappear at terminal state. The
+local stream record is then compacted to a tombstone containing hashes and
+delivery metadata, not the full answer or process summary. Mobile Feishu cards
+cannot always be long-pressed to copy; there is intentionally no custom
+"copyable text" action. Disable cards with
+`node admin.js set-markdown-card off` if native text selection is required.
 
 ## Group Context
 
