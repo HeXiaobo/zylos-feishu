@@ -16,6 +16,7 @@
     "task-comments:gate": "node scripts/native-task-closure-gate.js",
     "task-status:gate": "node scripts/native-task-completion-gate.js",
     "task-conservation:gate": "node scripts/native-task-conservation-gate.js",
+    "task-v2:legacy-adoption": "node scripts/task-v2-legacy-adoption-bootstrap.js",
     "test": "node --test"
   },
   "larkCli": {
