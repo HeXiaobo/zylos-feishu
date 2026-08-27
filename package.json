@@ -7,6 +7,11 @@
   "scripts": {
     "start": "node src/index.js",
     "cli": "node src/cli.js",
+    "governance:check": "node scripts/agent-governance-check.js check",
+    "governance:inspect": "node scripts/agent-governance-check.js inspect",
+    "governance:release": "node scripts/agent-governance-check.js release",
+    "governance:deploy": "node scripts/agent-governance-check.js deploy",
+    "governance:test": "node --test test/agent-governance-check.test.js",
     "test": "node --test"
   },
   "larkCli": {

@@ -1,0 +1,39 @@
+name: Agent governance
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agent-governance:
+    name: agent-governance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run branch and release metadata gate
+        run: npm run governance:check -- --base "origin/${{ github.base_ref || 'main' }}"
+
+      - name: Run governance tests
+        run: npm run governance:test
+
+      - name: Run repository tests
+        run: npm test
