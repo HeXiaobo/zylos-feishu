@@ -1,5 +1,28 @@
 {
   "schemaVersion": 1,
   "product": "zylos-feishu",
-  "release": "0.3.6"
+  "release": "0.3.7-rc.7",
+  "requires": {
+    "zylos-core": {
+      "schemaVersion": 1,
+      "protocols": {
+        "c4.reply": 2,
+        "c4.reply.argv-compat": 1,
+        "c4.assistant-response-stream": 3,
+        "c4.outbound-delivery-id": 1,
+        "work-intake": 1,
+        "commitment-core": 1,
+        "projection-outbox": 1,
+        "external-task-adapter": 1,
+        "task-reminder": 1
+      }
+    }
+  },
+  "provides": {
+    "feishu.conversation-response-stream": 1,
+    "feishu.work-intake-confirmation": 1,
+    "feishu.task-card-projection": 1,
+    "feishu.task-v2-projection": 1,
+    "feishu.task-comments": 1
+  }
 }

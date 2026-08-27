@@ -16,8 +16,17 @@ const CREATE_PAYLOAD_FIELDS = Object.freeze([
   'description',
   'acceptorId',
   'assigneeId',
+  'dueAt',
+  'reminderMinutesBeforeDue',
 ]);
 const ACTION_PAYLOAD_FIELDS = Object.freeze(['action', 'context']);
+
+function requireRecord(value, field) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${field} must be an object`);
+  }
+  return value;
+}
 
 function parsePayload(payloadJson) {
   let payload;
@@ -84,6 +93,8 @@ export function parseExplicitTaskMessage(
         ownerId: actorId,
         acceptorId: payload.acceptorId,
         assigneeId: payload.assigneeId,
+        dueAt: payload.dueAt,
+        reminderMinutesBeforeDue: payload.reminderMinutesBeforeDue,
       }),
     };
   }
@@ -113,7 +124,14 @@ export function buildC4ReceiveArgs({
   endpoint,
   content,
   taskEnvelope,
+  assistantRequest,
+  workIntakeEnvelope,
+  workIntakeConfirmation,
+  workIntakeConfirmationEffect,
 }) {
+  if (taskEnvelope && assistantRequest) {
+    throw new TypeError('taskEnvelope and assistantRequest are mutually exclusive');
+  }
   const args = [
     receiverPath,
     '--channel', source,
@@ -122,6 +140,35 @@ export function buildC4ReceiveArgs({
   ];
   if (taskEnvelope) {
     args.push('--task-envelope-json', JSON.stringify(taskEnvelope));
+  }
+  if (assistantRequest) {
+    const request = requireRecord(assistantRequest, 'assistantRequest');
+    requirePayloadFields(request, ['requestId', 'sourceId'], ['requestId', 'sourceId']);
+    args.push(
+      '--assistant-request-id', requireText(request.requestId, 'assistantRequest.requestId'),
+      '--assistant-source-id', requireText(request.sourceId, 'assistantRequest.sourceId'),
+      '--block-queue-until-idle',
+    );
+  }
+  if (workIntakeEnvelope) {
+    args.push('--work-intake-envelope-json', JSON.stringify(workIntakeEnvelope));
+  }
+  if (workIntakeConfirmation) {
+    args.push('--work-intake-confirmation-json', JSON.stringify(workIntakeConfirmation));
+  }
+  if (workIntakeConfirmationEffect) {
+    args.push(
+      '--work-intake-confirmation-effect-json',
+      JSON.stringify(workIntakeConfirmationEffect),
+    );
+  }
+  if ([
+    taskEnvelope,
+    workIntakeEnvelope,
+    workIntakeConfirmation,
+    workIntakeConfirmationEffect,
+  ].filter(Boolean).length > 1) {
+    throw new TypeError('task and WorkIntake protocols are mutually exclusive');
   }
   args.push('--content', content);
   return args;

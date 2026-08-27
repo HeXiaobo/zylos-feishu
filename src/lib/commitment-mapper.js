@@ -17,9 +17,30 @@ function optionalText(value, field) {
   return requireText(value, field);
 }
 
+function optionalTimestamp(value, field) {
+  if (value === undefined || value === null) return undefined;
+  const timestamp = requireText(value, field);
+  if (!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp)) {
+    throw new TypeError(`${field} must be an RFC 3339 timestamp`);
+  }
+  const milliseconds = Date.parse(timestamp);
+  if (!Number.isFinite(milliseconds)) {
+    throw new TypeError(`${field} must be an RFC 3339 timestamp`);
+  }
+  return new Date(milliseconds).toISOString();
+}
+
 function requirePositiveInteger(value, field) {
   if (!Number.isInteger(value) || value < 1) {
     throw new TypeError(`${field} must be a positive integer`);
+  }
+  return value;
+}
+
+function optionalNonNegativeInteger(value, field) {
+  if (value === undefined || value === null) return undefined;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a non-negative safe integer`);
   }
   return value;
 }
@@ -49,6 +70,8 @@ export function mapFeishuTaskIntent(input) {
     ownerId: rawOwnerId,
     acceptorId: rawAcceptorId,
     assigneeId: rawAssigneeId,
+    dueAt: rawDueAt,
+    reminderMinutesBeforeDue: rawReminderMinutesBeforeDue,
   } = requireRecord(input, 'task intent');
   const messageId = requireText(rawMessageId, 'messageId');
   const senderId = requireText(rawSenderId, 'senderId');
@@ -57,6 +80,14 @@ export function mapFeishuTaskIntent(input) {
   const ownerId = requireText(rawOwnerId, 'ownerId');
   const acceptorId = optionalText(rawAcceptorId, 'acceptorId') ?? ownerId;
   const assigneeId = optionalText(rawAssigneeId, 'assigneeId');
+  const dueAt = optionalTimestamp(rawDueAt, 'dueAt');
+  const reminderMinutesBeforeDue = optionalNonNegativeInteger(
+    rawReminderMinutesBeforeDue,
+    'reminderMinutesBeforeDue',
+  );
+  if (reminderMinutesBeforeDue !== undefined && dueAt === undefined) {
+    throw new TypeError('reminderMinutesBeforeDue requires dueAt');
+  }
 
   return {
     idempotencyKey: `feishu:${messageId}:task-intent`,
@@ -71,6 +102,8 @@ export function mapFeishuTaskIntent(input) {
       ownerId,
       acceptorId,
       assigneeId,
+      ...(dueAt === undefined ? {} : { dueAt }),
+      ...(reminderMinutesBeforeDue === undefined ? {} : { reminderMinutesBeforeDue }),
     },
   };
 }

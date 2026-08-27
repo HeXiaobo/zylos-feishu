@@ -21,6 +21,26 @@ function loadDefaultEnvironment() {
   return process.env;
 }
 
+function parseAgentLabels(env) {
+  let labels = {};
+  if (env.ZYLOS_AGENT_LABELS?.trim()) {
+    try {
+      labels = JSON.parse(env.ZYLOS_AGENT_LABELS);
+    } catch {
+      throw new TypeError('ZYLOS_AGENT_LABELS must be a JSON object');
+    }
+    if (!labels || typeof labels !== 'object' || Array.isArray(labels)) {
+      throw new TypeError('ZYLOS_AGENT_LABELS must be a JSON object');
+    }
+  }
+  const agentId = env.ZYLOS_AGENT_ID?.trim();
+  const agentLabel = env.ZYLOS_AGENT_LABEL?.trim();
+  if (agentId && agentLabel && labels[agentId] === undefined) {
+    labels = { ...labels, [agentId]: agentLabel };
+  }
+  return labels;
+}
+
 /**
  * Component-owned production assembly for Commitment Core's projection worker.
  * Core imports this factory by an explicit local module path, so credentials,
@@ -46,6 +66,7 @@ export async function createFeishuProjectionRuntime(options = {}) {
     issueTaskActionContext: claims => signer.issue(claims),
     clock,
     actionContextTtlMs: ACTION_CONTEXT_TTL_MS,
+    agentLabels: parseAgentLabels(env),
   });
   return Object.freeze({ publisher });
 }

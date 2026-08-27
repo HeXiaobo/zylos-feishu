@@ -16,6 +16,8 @@ test('mapFeishuTaskIntent maps a normalized Feishu intent to a Core SourceEnvelo
       ownerId: 'ou_owner_1',
       acceptorId: 'ou_acceptor_1',
       assigneeId: 'agent:yueran',
+      dueAt: '2026-08-28T18:00:00+08:00',
+      reminderMinutesBeforeDue: 60,
     }),
     {
       idempotencyKey: 'feishu:om_message_1:task-intent',
@@ -30,6 +32,8 @@ test('mapFeishuTaskIntent maps a normalized Feishu intent to a Core SourceEnvelo
         ownerId: 'ou_owner_1',
         acceptorId: 'ou_acceptor_1',
         assigneeId: 'agent:yueran',
+        dueAt: '2026-08-28T10:00:00.000Z',
+        reminderMinutesBeforeDue: 60,
       },
     },
   );
@@ -88,6 +92,13 @@ test('mapFeishuTaskIntent rejects missing or blank normalized fields with TypeEr
     { ...valid, description: '' },
     { ...valid, acceptorId: '' },
     { ...valid, assigneeId: '' },
+    { ...valid, dueAt: 'next Friday' },
+    { ...valid, reminderMinutesBeforeDue: 60 },
+    {
+      ...valid,
+      dueAt: '2026-08-28T18:00:00+08:00',
+      reminderMinutesBeforeDue: -1,
+    },
   ];
 
   for (const input of invalidInputs) {

@@ -18,11 +18,17 @@
 import fs from 'fs';
 import path from 'path';
 
+import { requireCompatibleCore } from '../src/lib/core-compatibility.js';
+
 const HOME = process.env.HOME;
 const DATA_DIR = path.join(HOME, 'zylos/components/feishu');
 const configPath = path.join(DATA_DIR, 'config.json');
 
 console.log('[pre-upgrade] Running feishu pre-upgrade checks...\n');
+
+// Validate the target Feishu release against the already-upgraded Core before
+// creating backups or allowing the component pipeline to replace any files.
+requireCompatibleCore();
 
 // 1. Backup config before upgrade
 if (fs.existsSync(configPath)) {

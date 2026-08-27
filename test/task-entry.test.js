@@ -15,7 +15,7 @@ const SECRET = 'feishu-card-context-secret-32-bytes';
 test('routes an explicit create protocol to C4 with a normalized task envelope', () => {
   const route = parseExplicitTaskMessage({
     messageType: 'text',
-    text: '/zylos-task create {"title":"Follow up the customer","description":"Send the revised proposal","assigneeId":"agent:yueran"}',
+    text: '/zylos-task create {"title":"Follow up the customer","description":"Send the revised proposal","assigneeId":"agent:yueran","dueAt":"2026-08-28T18:00:00+08:00","reminderMinutesBeforeDue":60}',
     messageId: 'om_task_create_1',
     actorId: 'ou_creator_1',
   });
@@ -35,6 +35,8 @@ test('routes an explicit create protocol to C4 with a normalized task envelope',
         ownerId: 'ou_creator_1',
         acceptorId: 'ou_creator_1',
         assigneeId: 'agent:yueran',
+        dueAt: '2026-08-28T10:00:00.000Z',
+        reminderMinutesBeforeDue: 60,
       },
     },
   });
@@ -54,6 +56,29 @@ test('routes an explicit create protocol to C4 with a normalized task envelope',
       '--json',
       '--task-envelope-json', JSON.stringify(route.taskEnvelope),
       '--content', '[Feishu DM] Creator said: create a task',
+    ],
+  );
+
+  assert.deepEqual(
+    buildC4ReceiveArgs({
+      receiverPath: '/opt/zylos/c4-receive.js',
+      source: 'feishu',
+      endpoint: 'oc_chat|type:p2p|msg:om_ordinary',
+      content: '[Feishu DM] Sender said: ordinary chat',
+      assistantRequest: {
+        requestId: 'assistant.feishu.om_ordinary',
+        sourceId: 'om_ordinary',
+      },
+    }),
+    [
+      '/opt/zylos/c4-receive.js',
+      '--channel', 'feishu',
+      '--endpoint', 'oc_chat|type:p2p|msg:om_ordinary',
+      '--json',
+      '--assistant-request-id', 'assistant.feishu.om_ordinary',
+      '--assistant-source-id', 'om_ordinary',
+      '--block-queue-until-idle',
+      '--content', '[Feishu DM] Sender said: ordinary chat',
     ],
   );
 });
@@ -118,6 +143,87 @@ test('recognizes only the explicit text protocol and leaves ordinary chat on the
       '--content', '[Feishu DM] Sender said: ordinary chat',
     ],
   );
+});
+
+test('passes a channel-neutral WorkIntake envelope to C4 without a task envelope', () => {
+  const workIntakeEnvelope = {
+    source: {
+      channel: 'feishu',
+      messageId: 'om_natural',
+      conversationId: 'oc_natural',
+      conversationType: 'direct',
+      threadId: null,
+    },
+    sender: { id: 'ou_sender', kind: 'human' },
+    text: '请玥然整理客户记录',
+    intentRevision: 1,
+    receivedAt: null,
+    timeZone: 'Asia/Shanghai',
+    people: [],
+  };
+  assert.deepEqual(buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_natural|type:p2p|msg:om_natural',
+    content: '[Feishu DM] Sender said: natural task',
+    workIntakeEnvelope,
+  }), [
+    '/opt/zylos/c4-receive.js',
+    '--channel', 'feishu',
+    '--endpoint', 'oc_natural|type:p2p|msg:om_natural',
+    '--json',
+    '--work-intake-envelope-json', JSON.stringify(workIntakeEnvelope),
+    '--content', '[Feishu DM] Sender said: natural task',
+  ]);
+
+  assert.throws(() => buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_natural',
+    content: 'invalid dual route',
+    taskEnvelope: { idempotencyKey: 'task' },
+    workIntakeEnvelope,
+  }), /mutually exclusive/);
+});
+
+test('passes a confirmation choice to the Core-owned WorkIntake resolver', () => {
+  const confirmationRequest = {
+    sourceKey: 'feishu:om_confirm:work-intake:r1',
+    action: 'create_task',
+    actorId: 'ou_sender',
+  };
+  const args = buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_chat|type:p2p|msg:om_confirm',
+    content: '[WorkIntake confirmation]',
+    workIntakeConfirmation: confirmationRequest,
+  });
+  assert.deepEqual(args.slice(-4), [
+    '--work-intake-confirmation-json', JSON.stringify(confirmationRequest),
+    '--content', '[WorkIntake confirmation]',
+  ]);
+});
+
+test('passes a delivered confirmation effect to the Core-owned effect acknowledger', () => {
+  const effect = {
+    sourceKey: 'feishu:om_confirm:work-intake:r1',
+    action: 'edit',
+    actorId: 'ou_sender',
+    effectKey: 'feishu:om_confirm:work-intake:r1:edit-guidance',
+    capability: 'wic1.payload.signature',
+  };
+  const args = buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_chat|type:p2p|msg:om_confirm',
+    content: '[WorkIntake confirmation effect]',
+    workIntakeConfirmationEffect: effect,
+  });
+  assert.deepEqual(args.slice(-4), [
+    '--work-intake-confirmation-effect-json', JSON.stringify(effect),
+    '--content', '[WorkIntake confirmation effect]',
+  ]);
 });
 
 test('verifies an explicit complete action and binds the trusted event actor before invoking Core', () => {

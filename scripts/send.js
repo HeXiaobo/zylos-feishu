@@ -17,11 +17,28 @@ import fs from 'fs';
 import path from 'path';
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
-import { getConfig, DATA_DIR } from '../src/lib/config.js';
+import {
+  getConfig,
+  getStreamProcessDisplay,
+  DATA_DIR,
+  getCredentials,
+} from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
-import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
+import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage } from '../src/lib/message.js';
 import { initMention, buildMentionContent, buildMentionMarkdown } from '../src/lib/mention.js';
+import { getClient } from '../src/lib/client.js';
+import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
+import {
+  completedCardFailureAction,
+  requestIdForC4Delivery,
+} from '../src/lib/c4-delivery-policy.js';
+import {
+  parseTaskCommentReplyEndpoint,
+} from '../src/lib/task-comment-production.js';
+import { createTaskCommentReplyProduction } from '../src/lib/task-comment-reply-production.js';
+import { isTaskCommentsEnabled } from '../src/lib/task-comment-runtime-policy.js';
+import { isSilentResponse } from '../src/lib/silent-response.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -38,6 +55,7 @@ if (args.length < 2) {
 
 const rawEndpoint = args[0];
 const message = args.slice(1).join(' ');
+const taskCommentReplyEndpoint = parseTaskCommentReplyEndpoint(rawEndpoint);
 
 /**
  * Parse structured endpoint string.
@@ -64,7 +82,7 @@ function parseEndpoint(endpoint) {
 const parsedEndpoint = parseEndpoint(rawEndpoint);
 const endpointId = parsedEndpoint.chatId;
 
-if (message.trim() === '[SKIP]') {
+if (isSilentResponse(message)) {
   markTypingDone(parsedEndpoint.msg);
   process.exit(0);
 }
@@ -158,62 +176,9 @@ function splitMessage(text, maxLength) {
 }
 
 /**
- * Check if text contains markdown formatting worth rendering as a card.
- * Returns true for code blocks, headers, bold, lists, tables, etc.
- */
-function hasMarkdownContent(text) {
-  // Code blocks (``` or indented)
-  if (/```/.test(text)) return true;
-  // Headers (# at start of line)
-  if (/^#{1,6}\s/m.test(text)) return true;
-  // Bold (**text**)
-  if (/\*\*[^*]+\*\*/.test(text)) return true;
-  // Bullet or numbered lists (- item or 1. item at start of line)
-  if (/^[\s]*[-*]\s/m.test(text) || /^[\s]*\d+\.\s/m.test(text)) return true;
-  // Tables (| col | col |)
-  if (/\|.+\|/.test(text) && /^[\s]*\|[\s]*[-:]+/m.test(text)) return true;
-  return false;
-}
-
-// Card max content length (Feishu card body limit ~28KB JSON; keep text under 4000 for safety)
-const CARD_MAX_LENGTH = 4000;
-
-/**
- * Send a single chunk as a markdown card, with routing logic.
- * Falls back to plain text on card failure.
- */
-async function sendCardChunk(chunk, isFirstChunk) {
-  const { chatId } = parsedEndpoint;
-  // The card API speaks a different @-mention syntax than text messages do
-  // (<at id=x></at> vs <at user_id="x">Name</at>). Callers write the text form —
-  // it is the only one documented for c4-send and the one that works on the
-  // text path — so convert here, or every mention in a markdown-bearing message
-  // renders as literal text and notifies nobody. See src/lib/at-mention.js.
-  const cardChunk = convertAtMentionsForCard(buildMentionMarkdown(chunk));
-  // p2p DMs never reply-to (invisible in the 1:1 view); only groups reply.
-  const replyTarget = chooseReplyTarget(parsedEndpoint, { isFirstChunk });
-  let result;
-
-  if (replyTarget) {
-    try {
-      result = await replyMarkdownCard(replyTarget, cardChunk);
-    } catch (err) {
-      console.log('[feishu] Card reply threw, falling back:', err.message);
-      result = { success: false };
-    }
-    if (!result.success) {
-      result = await sendMarkdownCard(chatId, cardChunk);
-    }
-  } else {
-    result = await sendMarkdownCard(chatId, cardChunk);
-  }
-
-  return result;
-}
-
-/**
  * Send text message with auto-chunking.
- * When useMarkdownCard is enabled and text contains markdown, sends as interactive card.
+ * When useMarkdownCard is enabled, all ordinary assistant text uses the same
+ * completed response card as the direct streaming conversation path.
  * Routing logic (unified for DM and group):
  *   - Topic/reply (root exists): ALL chunks reply to parent||root (stay in thread)
  *   - Group @mention (no root): first chunk replies to msg, rest use sendToGroup
@@ -222,34 +187,44 @@ async function sendCardChunk(chunk, isFirstChunk) {
  * Reply failures fall back to sendMessage (DM) or sendToGroup (group).
  */
 async function sendText(endpoint, text) {
-  const useCard = config.message?.useMarkdownCard && hasMarkdownContent(text);
-  const maxLen = useCard ? CARD_MAX_LENGTH : MAX_LENGTH;
-  const chunks = splitMessage(text, maxLen);
-  const { chatId, root, parent, msg, type } = parsedEndpoint;
+  const useCard = config.message?.useMarkdownCard === true;
+  const { chatId, type } = parsedEndpoint;
   const isDM = type === 'p2p';
-  const isGroup = type === 'group';
+
+  if (useCard) {
+    const requestId = requestIdForC4Delivery(process.env);
+    if (!requestId) {
+      console.warn('[feishu] Unified card skipped: Core did not provide a stable C4 delivery identity');
+    } else {
+      const replyToMessageId = chooseReplyTarget(parsedEndpoint, { isFirstChunk: true }) || null;
+      const cardText = convertAtMentionsForCard(buildMentionMarkdown(text));
+      try {
+        const responseStream = createConversationResponseStream({
+          client: getClient(),
+          processDisplay: getStreamProcessDisplay(config),
+        });
+        await responseStream.sendCompleted({
+          requestId,
+          target: {
+            chatId,
+            chatType: isDM ? 'p2p' : 'group',
+            replyToMessageId,
+          },
+          output: cardText,
+        });
+        return;
+      } catch (error) {
+        if (completedCardFailureAction(error) !== 'fallback_text') throw error;
+        console.log('[feishu] Completed card send failed, falling back to text:', error.message);
+      }
+    }
+  }
+
+  const chunks = splitMessage(text, MAX_LENGTH);
 
   for (let i = 0; i < chunks.length; i++) {
-    let result;
     const isFirstChunk = i === 0;
-
-    if (useCard) {
-      // Apply @mention conversion for markdown card path
-      const cardChunk = buildMentionMarkdown(chunks[i]);
-      result = await sendCardChunk(cardChunk, isFirstChunk);
-      // Fall back to plain text if card sending fails
-      if (!result.success) {
-        console.log('[feishu] Card send failed, falling back to text:', result.message);
-        // Re-split: card chunks (up to 4000) may exceed plain text limit (2000)
-        const subChunks = splitMessage(chunks[i], MAX_LENGTH);
-        for (let j = 0; j < subChunks.length; j++) {
-          result = await sendPlainTextChunk(endpoint, subChunks[j], isFirstChunk && j === 0);
-          if (!result.success) break;
-        }
-      }
-    } else {
-      result = await sendPlainTextChunk(endpoint, chunks[i], isFirstChunk);
-    }
+    const result = await sendPlainTextChunk(endpoint, chunks[i], isFirstChunk);
 
     if (!result.success) {
       throw new Error(result.message);
@@ -435,13 +410,80 @@ async function recordOutgoing(text) {
 
 async function send() {
   try {
-    if (mediaMatch) {
-      const [, mediaType, mediaPath] = mediaMatch;
-      await sendMedia(mediaType, mediaPath);
-      await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');
+    if (taskCommentReplyEndpoint) {
+      if (!isTaskCommentsEnabled(process.env)) {
+        throw new Error('Task comment replies are disabled');
+      }
+      if (mediaMatch) throw new Error('Task comment replies currently support text only');
+      const [
+        { getClient },
+        { openTaskCommentStore },
+        { loadTaskCommentReplyCoreDependencies },
+      ] = await Promise.all([
+        import('../src/lib/client.js'),
+        import('../src/lib/task-comment-store.js'),
+        import('../src/lib/task-comment-core-dependencies.js'),
+      ]);
+      const appId = getCredentials().app_id;
+      if (!appId) throw new Error('FEISHU_APP_ID is required for Task comment replies');
+      const scopedTaskCommentReplyEndpoint = parseTaskCommentReplyEndpoint(rawEndpoint, { appId });
+      const { openCore, createCoordinator } = await loadTaskCommentReplyCoreDependencies({
+        env: process.env,
+      });
+      const core = openCore();
+      let store;
+      try {
+        store = openTaskCommentStore({ dbPath: path.join(DATA_DIR, 'task-comments.db') });
+        const outbound = createTaskCommentReplyProduction({
+          appId,
+          core,
+          store,
+          client: getClient(),
+          createCoordinator,
+        });
+        await outbound.reply({
+          ...scopedTaskCommentReplyEndpoint,
+          content: message,
+        });
+      } finally {
+        try {
+          store?.close();
+        } finally {
+          core.close();
+        }
+      }
     } else {
-      await sendText(endpointId, message);
-      await recordOutgoing(message);
+      const assistantRequestId = process.env.C4_ASSISTANT_REQUEST_ID || null;
+      let streamed = false;
+      if (assistantRequestId && !mediaMatch) {
+        try {
+          const responseStream = createConversationResponseStream({
+            client: getClient(),
+            processDisplay: getStreamProcessDisplay(config),
+          });
+          const result = await responseStream.completeWithFullAnswer({
+            requestId: assistantRequestId,
+            output: message,
+          });
+          streamed = result.handled === true;
+        } catch (error) {
+          // The placeholder already owns this assistant request. Any error here
+          // is retried against that same durable stream; emitting a fresh
+          // message would risk a duplicate after an ambiguous Feishu outcome.
+          throw error;
+        }
+      }
+
+      if (streamed) {
+        await recordOutgoing(message);
+      } else if (mediaMatch) {
+        const [, mediaType, mediaPath] = mediaMatch;
+        await sendMedia(mediaType, mediaPath);
+        await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');
+      } else {
+        await sendText(endpointId, message);
+        await recordOutgoing(message);
+      }
     }
     // Mark the trigger message as replied (for typing indicator removal)
     markTypingDone(parsedEndpoint.msg);

@@ -7,7 +7,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.7] - 2026-08-27
+
+### Changed
+- Require Core's `c4.assistant-response-stream >= 3` runtime-turn admission so
+  later messages and background runs cannot enter an active runtime turn and
+  shift replies onto the wrong Feishu card.
+
+### Fixed
+- Keep interleaved requests and background completions isolated in both CardKit
+  and ordinary-card modes, and ignore diagnosed late events after a canonical
+  terminal state without mutating the completed card.
+
+## [0.3.7-rc.6] - 2026-08-27
+
+### Changed
+- Consolidate the tested `0.3.7-rc.5` native-task reminder release with the
+  Issue 8 collapsed streaming-process presentation in one release line.
+
+## [0.3.7-rc.5] - 2026-08-26
+
 ### Added
+- Project canonical `reminderMinutesBeforeDue` through Task v2's dedicated
+  add/remove reminder APIs, then require an authoritative native readback before
+  acknowledging create or update.
+- Surface confirmed reminder offsets in projection receipts and reminder drift
+  in reconciliation reports; explicit Feishu task intake now preserves the
+  same reminder policy.
+
+### Changed
+- Require Core's `task-reminder >= 1` capability before install or upgrade, so
+  reminder-aware Feishu cannot start against a Core that drops the policy.
+
+### Fixed
+- Route short-lived Agent replies through the canonical Task comment
+  coordinator before projecting them to Feishu, so exact-parent human
+  notification decisions are persisted and delivered idempotently instead of
+  being bypassed by the C4 send path; retries also reuse the first Core comment
+  timestamp (including concurrent first-delivery races) so notification and
+  transport recovery remain valid after restart.
+- Require exact configured-App authorship before adopting an ambiguous Task
+  comment echo, and independently verify App author, parent, and content in the
+  native closure gate so a human same-content comment cannot produce a false
+  Agent-reply receipt.
+- Add a live, read-only native completion gate that proves one exact Task v2
+  completion event settled durably, produced the expected Core command receipt,
+  left the linked Core Task in review, and did not auto-accept it.
+- Preflight the production Task v2 status inbox through an explicit open/close
+  before server-side subscription or WebSocket/webhook startup, so native
+  binding, schema, migration, dual-writer, and permission failures stop reverse
+  status intake before the component claims readiness.
+- Gate install and upgrade on Core's native Task mapper protocol, and establish
+  the Task v2 server-side subscription once through the shared WebSocket/webhook
+  startup gate before either transport can receive events.
+- Restore zero-visible Smart-group evaluation: passive authorization failures no longer emit permission replies or typing/card placeholders, and terminal runtime `[SKIP]` decisions are suppressed even when preceded by explanatory text.
+- Treat an explicitly configured group's `allowFrom` policy as authoritative across tenant boundaries, while retaining the global member policy for direct messages and unconfigured open groups.
+- Keep passive Smart-group messages out of both explicit task handling and natural-language WorkIntake unless the bot is exactly @mentioned.
+- Persist response-card delivery intent before sending, retry ambiguous Feishu outcomes with the same UUID, and use a single idempotent plain fallback only after explicit card rejection.
+- Derive proactive card identity from Core's stable `C4_DELIVERY_ID`; sends without a durable identity degrade safely instead of inventing a new UUID on every process invocation.
+- Compact terminal response-stream state to a hash-only tombstone so full answers and public work summaries are not retained indefinitely.
+- Remove the universal Task v2 and card-label defaults for a specific Agent; deployment identity now comes from `ZYLOS_AGENT_ID`, `FEISHU_TASK_V2_AGENT_APP_IDS`, and `ZYLOS_AGENT_LABELS`.
+
+### Changed
+- New deployments default ordinary assistant replies to the same completed-card format used by streaming replies.
+- Use “正在回复…” for running response-card summaries in Feishu chat lists
+  instead of exposing the internal platform name to end users.
+- Require `c4.assistant-response-stream >= 2`, `c4.outbound-delivery-id >= 1`,
+  `external-task-adapter >= 1`, and `task-reminder >= 1`, so install and upgrade reject a Core that
+  cannot provide turn-safe streaming, stable proactive card identity, and the
+  native completion mapper used at runtime.
+
+## [0.3.7-rc.4.issue8.2] - 2026-08-27
+
+### Changed
+- Replace the repeated numbered streaming-process list with one collapsed
+  current-status row whose public execution details can be expanded in place.
+- Add `message.streamProcessDisplay: "answer_only"` as a safe fallback that
+  streams only the answer body while keeping the completed-card behavior.
+- Preserve the collapsed process row when CardKit conversion is unavailable
+  and the same message must be updated through ordinary card patches.
+
+## [0.3.7-rc.4] - 2026-08-26
+
+### Fixed
+- Run a bounded status watchdog at startup and every 60 seconds so a completely
+  missed native completion callback still advances the linked Core task to
+  `review`, never directly to `done`.
+- Record an unregistered top-level comment from the exact current App for audit
+  and follower notification without waking that same Agent or producing an
+  undeliverable reply notification addressed to the App ID.
+- Stop scheduled reconciliation cleanly on shutdown and propagate aborts
+  between the bounded Core, Feishu listing, and status-repair steps.
+
+### Changed
+- Reconciliation now pages both open and completed managed Task partitions once
+  and indexes them by Core task ID, replacing the previous per-Core-task remote
+  rescan while retaining authoritative Task reads and duplicate detection.
+
+## [0.3.7-3ai.5] - 2026-08-26
+
+### Fixed
+- All ordinary assistant replies now use the same completed response-card format as streamed replies, including proactive updates; text fallback remains available before any card part is delivered.
+- Public progress and model-authored public work summaries remain visible only while a response is running and are removed from the completed or failed card.
+- Group response cards reply to the triggering message only when a reply target is present; direct messages and proactive group updates use the base send path.
+- Long completed cards no longer add a custom copy action.
+
+### Changed
+- The component upgrade route now targets the fork's `main` branch so general-purpose agents do not inherit a deployment-specific release branch.
+- Release metadata and compatibility fixtures no longer name a particular hosted agent or runtime deployment.
+
+## [0.3.7-3ai.4] - 2026-08-26
+
+### Fixed
+- Ordinary streamed replies now enter C4 with `--block-queue-until-idle`, keeping a second Feishu prompt durably queued until the active runtime turn settles instead of allowing two cards to compete for one runtime session.
+
+## [0.3.7-3ai.3] - 2026-08-25
+
+### Changed
+- The fail-closed pre-install/pre-upgrade check now requires Core's `c4.reply.argv-compat` capability, preventing a paired rollout from proceeding against a Core version that can disconnect older endpoint-addressed reply callers.
+
+## [0.3.7-3ai.2] - 2026-08-25
+
+### Added
+- A machine-readable capability manifest covering response streaming, WorkIntake, task projections, and task comments.
+- A fail-closed Core protocol check in pre-install and pre-upgrade hooks.
+
+### Changed
+- The fork upgrade route now points to the paired `codex/mylos-capability-bundle-rc` branch.
+
+## [0.3.7-3ai.1] - 2026-08-25
+
+### Added
+- Safe response streaming, durable WorkIntake confirmations, Task v2 projection and reverse events, reliable task-comment reconciliation, and CardKit replay idempotency from the task-management MVP integration branch.
 - Fork-only `@mention` resolution module (`src/lib/mention.js`): outgoing
   `@name` references can be resolved from a paginated source-group member sync
   plus a config-driven override map. The cache is written atomically and has a
@@ -16,6 +147,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolation, override priority, and unknown/empty-ID fallbacks.
 
 ### Changed
+- Release metadata and the component upgrade route now point to `HeXiaobo/zylos-feishu` branch `codex/mylos-compat-release` so fork deployments do not drift back to the canonical component.
+- Explicit smart groups retain legacy no-mention conversation handling, while task and WorkIntake protocols remain exact-mention gated.
 - Plain-text sends use Feishu rich-text `post` content when configured names
   resolve successfully; markdown-card sends use the verified interactive-card
   `<at id=ou_xxx></at>` form. Existing structured `<at user_id="...">` input
