@@ -18,7 +18,7 @@ import path from 'path';
 import readline from 'readline';
 import { fileURLToPath } from 'url';
 import {
-  requireMinCoreVersion,
+  requireCompatibleCore,
   installLarkCliBinary,
   installLarkCliSkills,
   syncCredentialsToLarkCli,
@@ -126,7 +126,7 @@ if (isInteractive) {
 }
 
 // 5. lark-cli integration (idempotent — safe to re-run on reinstall)
-requireMinCoreVersion();
+requireCompatibleCore();
 console.log('\nIntegrating lark-cli...');
 try {
   installLarkCliBinary();

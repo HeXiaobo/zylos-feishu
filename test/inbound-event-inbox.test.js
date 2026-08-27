@@ -1,0 +1,220 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+
+import {
+  openInboundEventInbox,
+  processInboundEventInboxOnce,
+} from '../src/lib/inbound-event-inbox.js';
+
+function inbound(overrides = {}) {
+  return {
+    eventId: overrides.eventId ?? 'evt_message_1',
+    messageId: overrides.messageId ?? 'om_message_1',
+    payload: overrides.payload ?? {
+      message: { message_id: 'om_message_1', text: '任务：整理客户记录' },
+      sender: { sender_id: { open_id: 'ou_sender' } },
+    },
+  };
+}
+
+test('inbound inbox durably deduplicates event and message identities across reopen', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  try {
+    const first = openInboundEventInbox({
+      dbPath,
+      clock: () => 1_787_900_000_000,
+      maxAttempts: 3,
+    });
+    const created = first.receive(inbound());
+    assert.equal(created.created, true);
+    assert.equal(created.entry.status, 'received');
+    assert.equal(first.receive(inbound()).created, false);
+    first.close();
+
+    const reopened = openInboundEventInbox({
+      dbPath,
+      clock: () => 1_787_900_001_000,
+      maxAttempts: 3,
+    });
+    const replayByMessage = reopened.receive(inbound({ eventId: 'evt_message_retry' }));
+    assert.equal(replayByMessage.created, false);
+    assert.equal(replayByMessage.entry.messageId, 'om_message_1');
+    assert.equal(reopened.query({ eventId: 'evt_message_1' }).status, 'received');
+    assert.equal(reopened.query({ eventId: 'evt_message_retry' }).status, 'received');
+    reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('worker leases a received event and commits it with a fenced receipt', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-lease-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  try {
+    const inbox = openInboundEventInbox({
+      dbPath,
+      clock: () => 1_787_900_000_000,
+      maxAttempts: 3,
+    });
+    inbox.receive(inbound());
+
+    const [claimed] = inbox.claim({ workerId: 'worker-a', leaseMs: 5_000, limit: 10 });
+    assert.equal(claimed.status, 'processing');
+    assert.equal(claimed.attempt, 1);
+    assert.deepEqual(claimed.payload, inbound().payload);
+    assert.deepEqual(claimed.receipt, {
+      id: claimed.id,
+      workerId: 'worker-a',
+      version: 2,
+    });
+
+    const committed = inbox.commit({
+      receipt: claimed.receipt,
+      result: { accepted: true },
+    });
+    assert.equal(committed.status, 'committed');
+    assert.deepEqual(committed.result, { accepted: true });
+    assert.deepEqual(inbox.claim({ workerId: 'worker-b', leaseMs: 5_000, limit: 10 }), []);
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an expired processing lease is recovered and fences the stale worker', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-recover-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  let now = 1_787_900_000_000;
+  try {
+    const inbox = openInboundEventInbox({ dbPath, clock: () => now, maxAttempts: 3 });
+    inbox.receive(inbound());
+    const [stale] = inbox.claim({ workerId: 'worker-a', leaseMs: 1_000 });
+
+    now += 1_000;
+    const [recovered] = inbox.claim({ workerId: 'worker-b', leaseMs: 1_000 });
+    assert.equal(recovered.id, stale.id);
+    assert.equal(recovered.attempt, 2);
+    assert.throws(
+      () => inbox.commit({ receipt: stale.receipt, result: { accepted: true } }),
+      (error) => error.code === 'LEASE_LOST',
+    );
+    assert.equal(inbox.commit({
+      receipt: recovered.receipt,
+      result: { accepted: true },
+    }).status, 'committed');
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('failed handling waits before retry and dead-letters at the configured attempt limit', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-fail-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  let now = 1_787_900_000_000;
+  try {
+    const inbox = openInboundEventInbox({ dbPath, clock: () => now, maxAttempts: 2 });
+    inbox.receive(inbound());
+    const [first] = inbox.claim({ workerId: 'worker-a', leaseMs: 5_000 });
+    const failed = inbox.fail({
+      receipt: first.receipt,
+      error: new Error('temporary Core outage'),
+      retryAfterMs: 1_000,
+    });
+    assert.equal(failed.status, 'failed');
+    assert.deepEqual(inbox.claim({ workerId: 'worker-b', leaseMs: 5_000 }), []);
+
+    now += 1_000;
+    const [second] = inbox.claim({ workerId: 'worker-b', leaseMs: 5_000 });
+    assert.equal(second.attempt, 2);
+    const dead = inbox.fail({
+      receipt: second.receipt,
+      error: new Error('still unavailable'),
+      retryAfterMs: 1_000,
+    });
+    assert.equal(dead.status, 'dead_letter');
+    assert.match(dead.lastError, /still unavailable/);
+    assert.deepEqual(inbox.claim({ workerId: 'worker-c', leaseMs: 5_000 }), []);
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('repeated worker crashes dead-letter an event after its final lease expires', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-crash-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  let now = 1_787_900_000_000;
+  try {
+    const inbox = openInboundEventInbox({ dbPath, clock: () => now, maxAttempts: 2 });
+    inbox.receive(inbound());
+    inbox.claim({ workerId: 'worker-a', leaseMs: 1_000 });
+
+    now += 1_000;
+    const [lastAttempt] = inbox.claim({ workerId: 'worker-b', leaseMs: 1_000 });
+    assert.equal(lastAttempt.attempt, 2);
+
+    now += 1_000;
+    assert.deepEqual(inbox.claim({ workerId: 'worker-c', leaseMs: 1_000 }), []);
+    const dead = inbox.query({ eventId: 'evt_message_1' });
+    assert.equal(dead.status, 'dead_letter');
+    assert.match(dead.lastError, /lease expired/i);
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('worker processes claimed payloads and independently settles poison events', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-worker-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  try {
+    const inbox = openInboundEventInbox({
+      dbPath,
+      clock: () => 1_787_900_000_000,
+      maxAttempts: 3,
+    });
+    inbox.receive({ eventId: 'evt_poison', messageId: 'om_poison', payload: { kind: 'poison' } });
+    inbox.receive({ eventId: 'evt_healthy', messageId: 'om_healthy', payload: { kind: 'healthy' } });
+    const handled = [];
+
+    const summary = await processInboundEventInboxOnce({
+      inbox,
+      workerId: 'worker-a',
+      leaseMs: 5_000,
+      limit: 10,
+      handleMessage: async (payload, metadata) => {
+        handled.push({ payload, metadata });
+        if (payload.kind === 'poison') {
+          const error = new Error('malformed event');
+          error.retryable = false;
+          throw error;
+        }
+        return { accepted: true };
+      },
+    });
+
+    assert.deepEqual(summary, {
+      claimed: 2,
+      committed: 1,
+      failed: 0,
+      deadLettered: 1,
+    });
+    assert.equal(handled.length, 2);
+    assert.deepEqual(handled[1].metadata, {
+      inboxId: handled[1].metadata.inboxId,
+      eventId: 'evt_healthy',
+      messageId: 'om_healthy',
+      attempt: 1,
+    });
+    assert.equal(inbox.query({ eventId: 'evt_poison' }).status, 'dead_letter');
+    assert.equal(inbox.query({ eventId: 'evt_healthy' }).status, 'committed');
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -31,7 +31,13 @@ async function getAccessToken() {
 /**
  * Send message to a chat (group or individual)
  */
-export async function sendMessage(receiveId, content, receiveIdType = 'chat_id', msgType = 'text') {
+export async function sendMessage(
+  receiveId,
+  content,
+  receiveIdType = 'chat_id',
+  msgType = 'text',
+  options = {},
+) {
   const client = getClient();
 
   let messageContent;
@@ -42,13 +48,15 @@ export async function sendMessage(receiveId, content, receiveIdType = 'chat_id',
   }
 
   try {
+    const data = {
+      receive_id: receiveId,
+      msg_type: msgType,
+      content: messageContent,
+    };
+    if (typeof options.uuid === 'string' && options.uuid !== '') data.uuid = options.uuid;
     const res = await client.im.message.create({
       params: { receive_id_type: receiveIdType },
-      data: {
-        receive_id: receiveId,
-        msg_type: msgType,
-        content: messageContent,
-      },
+      data,
     });
 
     if (res.code === 0) {
@@ -83,7 +91,7 @@ export async function sendMessage(receiveId, content, receiveIdType = 'chat_id',
  * Reply to a specific message (used for thread/topic routing and reply threading).
  * Uses the im.message.reply API to create a reply in the same thread.
  */
-export async function replyToMessage(messageId, content, msgType = 'text') {
+export async function replyToMessage(messageId, content, msgType = 'text', options = {}) {
   const client = getClient();
 
   let messageContent;
@@ -94,12 +102,14 @@ export async function replyToMessage(messageId, content, msgType = 'text') {
   }
 
   try {
+    const data = {
+      msg_type: msgType,
+      content: messageContent,
+    };
+    if (typeof options.uuid === 'string' && options.uuid !== '') data.uuid = options.uuid;
     const res = await client.im.message.reply({
       path: { message_id: messageId },
-      data: {
-        msg_type: msgType,
-        content: messageContent,
-      },
+      data,
     });
 
     if (res.code === 0) {

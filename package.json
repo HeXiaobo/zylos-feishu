@@ -1,6 +1,6 @@
 {
   "name": "zylos-feishu",
-  "version": "0.3.6",
+  "version": "0.3.7-rc.8",
   "description": "Feishu communication channel",
   "type": "module",
   "main": "src/index.js",
@@ -12,18 +12,22 @@
     "governance:release": "node scripts/agent-governance-check.js release",
     "governance:deploy": "node scripts/agent-governance-check.js deploy",
     "governance:test": "node --test test/agent-governance-check.test.js",
+    "task-comments:once": "node src/lib/task-comment-worker.js run --once",
+    "task-comments:gate": "node scripts/native-task-closure-gate.js",
+    "task-status:gate": "node scripts/native-task-completion-gate.js",
+    "task-conservation:gate": "node scripts/native-task-conservation-gate.js",
     "test": "node --test"
   },
   "larkCli": {
     "version": "1.0.81"
   },
-  "homepage": "https://github.com/zylos-ai/zylos-feishu#readme",
+  "homepage": "https://github.com/HeXiaobo/zylos-feishu#readme",
   "bugs": {
-    "url": "https://github.com/zylos-ai/zylos-feishu/issues"
+    "url": "https://github.com/HeXiaobo/zylos-feishu/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zylos-ai/zylos-feishu.git"
+    "url": "git+https://github.com/HeXiaobo/zylos-feishu.git"
   },
   "keywords": [
     "zylos",
@@ -33,11 +37,12 @@
   "author": "Zylos AI",
   "license": "MIT",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.20.0"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.72.0",
     "axios": "^1.18.0",
+    "better-sqlite3": "^12.6.2",
     "dotenv": "^16.4.5",
     "express": "^4.22.2",
     "form-data": "^4.0.6"

@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg" alt="Node.js"></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D20.20.0-brightgreen.svg" alt="Node.js"></a>
   <a href="https://discord.gg/GS2J39EGff"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://x.com/ZylosAI"><img src="https://img.shields.io/badge/X-follow-000000?logo=x&logoColor=white" alt="X"></a>
   <a href="https://zylos.ai"><img src="https://img.shields.io/badge/website-zylos.ai-blue" alt="Website"></a>
@@ -26,8 +26,8 @@
 ---
 
 - **Talk through Feishu** — your AI agent speaks Feishu, both private chats and group conversations
-- **Smart group monitoring** — automatically follow designated group discussions, no @mention needed
-- **Zero-config start** — first message auto-binds you as admin, no setup wizards
+- **Explicit group activation** — group messages require @mention by default; trusted groups can opt into legacy smart mode
+- **Trusted owner setup** — owner identity is explicitly configured; inbound messages cannot claim admin
 - **Rich Feishu integration** — documents, spreadsheets, calendar — not just messaging
 
 ## Getting Started
@@ -51,7 +51,6 @@ Just tell your Zylos agent what you need:
 | Task | Example |
 |------|---------|
 | Add user to whitelist | "Add user xxx to feishu whitelist" |
-| Enable smart group | "Make this group a smart group" |
 | Check status | "Show feishu bot status" |
 | Restart bot | "Restart feishu bot" |
 | Upgrade | "Upgrade feishu component" |
@@ -69,10 +68,45 @@ zylos uninstall feishu
 | Scenario | Bot Response |
 |----------|--------------|
 | Private chat (owner/whitelisted) | Responds via Claude |
-| Smart group message | Receives all messages |
 | @mention in allowed group | Responds with recent context |
-| Owner @mention in any group | Always responds |
+| Message in an explicitly configured smart group | Evaluated without @mention; irrelevant or unauthorized passive traffic stays silent, and structured task intake remains disabled |
+| Owner @mention in any group | Responds unless group chat is globally disabled |
 | Unknown user | Ignored |
+
+## Natural-language WorkIntake
+
+WorkIntake is opt-in. Set `workIntake.enabled` in
+`~/zylos/components/feishu/config.json`, configure a member policy, and provide
+`FEISHU_WORK_INTAKE_CONTEXT_SECRET` (at least 32 bytes) in `~/zylos/.env`:
+
+```json
+{
+  "workIntake": {
+    "enabled": true,
+    "timeZone": "Asia/Shanghai",
+    "confirmationTtlMs": 900000
+  },
+  "memberAccessPolicy": {
+    "mode": "tenant_members",
+    "tenantKey": "your-tenant-key",
+    "memberIds": [],
+    "departmentIds": []
+  }
+}
+```
+
+`mode` can be `owner`, `tenant_members`, `departments`, or `allowlist`.
+Non-owner policies require an exact tenant match and every decision is appended
+to `logs/member-access-audit.jsonl`. Group task and WorkIntake entry always
+require an exact bot @mention. Smart mode affects ordinary conversation only;
+no-mention messages are not mapped into the structured task protocol. An
+explicitly configured group uses its own `allowFrom` sender policy, including
+for external members; the global member policy still protects direct messages
+and unconfigured groups admitted by `groupPolicy: "open"`. WorkIntake remains
+exact-mention gated and requires its dedicated capability configuration.
+Stable confirmation data is persisted to a local `0600` outbox before delivery.
+Each attempt signs a fresh card, and transient failures or process restarts retry
+with the same Feishu UUID.
 
 ## Documentation
 

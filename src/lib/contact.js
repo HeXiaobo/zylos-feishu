@@ -87,6 +87,7 @@ export async function getUserInfo(userId) {
           email: res.data.user?.email,
           mobile: res.data.user?.mobile,
           avatar: res.data.user?.avatar?.avatar_origin,
+          departmentIds: res.data.user?.department_ids || [],
         },
       };
     } else {

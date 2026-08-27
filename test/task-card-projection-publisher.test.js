@@ -155,6 +155,71 @@ test('SDK publisher forwards the stable create UUID to the placeholder message',
   assert.equal(JSON.parse(patches[0].data.content).header.title.content, '任务待验收');
 });
 
+test('SDK publisher resolves Feishu member IDs to names before projecting a task card', async () => {
+  const signer = createTaskActionContextSigner({ secret: SECRET, clock: () => NOW });
+  const patches = [];
+  const names = new Map([
+    ['ou_owner', '业务负责人'],
+    ['ou_acceptor', '任务验收人'],
+    ['ou_assignee', '任务执行人'],
+  ]);
+  const client = {
+    contact: {
+      user: {
+        async get(payload) {
+          return {
+            code: 0,
+            data: { user: { name: names.get(payload.path.user_id) } },
+          };
+        },
+      },
+    },
+    im: {
+      message: {
+        async create() {
+          return { code: 0, data: { message_id: 'om_named_task' } };
+        },
+      },
+      v1: {
+        message: {
+          async patch(payload) {
+            patches.push(payload);
+            return { code: 0, data: {} };
+          },
+        },
+      },
+    },
+    cardkit: {
+      v1: {
+        card: {
+          async idConvert() {
+            return { code: 230001, msg: 'CardKit unavailable' };
+          },
+        },
+      },
+    },
+  };
+  const publisher = createSdkTaskCardProjectionPublisher({
+    client,
+    issueTaskActionContext: claims => signer.issue(claims),
+    clock: () => NOW,
+    actionContextTtlMs: 10 * 60_000,
+  });
+
+  await publisher.createTask({
+    target: { receiveId: 'ou_acceptor', receiveIdType: 'open_id' },
+    task: task({ assigneeId: 'ou_assignee' }),
+    idempotencyKey: 'feishu:create:task-projection-named',
+  });
+
+  const projectedCard = JSON.parse(patches[0].data.content);
+  const serialized = JSON.stringify(projectedCard);
+  assert.match(serialized, /负责人：业务负责人/);
+  assert.match(serialized, /验收人：任务验收人/);
+  assert.match(serialized, /执行人：任务执行人/);
+  assert.doesNotMatch(serialized, /ou_owner|ou_acceptor|ou_assignee/);
+});
+
 test('SDK publisher uses native CardKit streaming for task-card creation', async () => {
   const signer = createTaskActionContextSigner({ secret: SECRET, clock: () => NOW });
   const calls = [];
@@ -266,6 +331,43 @@ test('SDK publisher converts a message ID and performs one CardKit full update',
   assert.equal(updates[0].data.card.type, 'card_json');
   assert.equal(JSON.parse(updates[0].data.card.data).header.title.content, '任务执行中');
   assert.equal(JSON.parse(updates[0].data.card.data).schema, '2.0');
+});
+
+test('SDK publisher treats an already-applied CardKit sequence as an idempotent replay', async () => {
+  const signer = createTaskActionContextSigner({ secret: SECRET, clock: () => NOW });
+  let updates = 0;
+  const client = {
+    im: { message: { async create() { throw new Error('create must not run'); } } },
+    cardkit: {
+      v1: {
+        card: {
+          async idConvert() {
+            return { code: 0, data: { card_id: 'AA-replayed-card' } };
+          },
+          async update() {
+            updates += 1;
+            return { code: 300317, msg: 'sequence number compare failed' };
+          },
+        },
+      },
+    },
+  };
+  const publisher = createSdkTaskCardProjectionPublisher({
+    client,
+    issueTaskActionContext: claims => signer.issue(claims),
+    clock: () => NOW,
+    actionContextTtlMs: 10 * 60_000,
+  });
+
+  const result = await publisher.updateTask({
+    target: { receiveId: 'ou_acceptor', receiveIdType: 'open_id' },
+    externalId: 'om_replayed_task',
+    task: task({ state: 'done', version: 8 }),
+    idempotencyKey: 'feishu:update:task-projection-1:8',
+  });
+
+  assert.deepEqual(result, { externalId: 'om_replayed_task' });
+  assert.equal(updates, 1);
 });
 
 test('fails closed on ambiguous request fields and unbounded identities', async () => {
