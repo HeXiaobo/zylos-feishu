@@ -233,57 +233,78 @@ export function createTaskV2LegacyAdoption({ adapter, appId } = {}) {
   }
   const expectedAppId = requireText(appId, 'appId');
 
-  return Object.freeze({
-    async adoptTaskMarker({ taskGuid, coreTaskId, coreTaskVersion = 1 } = {}) {
-      const expectedGuid = requireText(taskGuid, 'taskGuid');
-      const expectedCoreTaskId = requireText(coreTaskId, 'coreTaskId');
-      if (!Number.isSafeInteger(coreTaskVersion) || coreTaskVersion < 0) {
-        throw new TypeError('coreTaskVersion must be a non-negative safe integer');
-      }
-      const marker = markerFor(expectedCoreTaskId, coreTaskVersion);
-      const markerLine = markerLineFor(expectedCoreTaskId);
+  async function inspectTaskMarker({ taskGuid, coreTaskId, coreTaskVersion = 1 } = {}) {
+    const expectedGuid = requireText(taskGuid, 'taskGuid');
+    const expectedCoreTaskId = requireText(coreTaskId, 'coreTaskId');
+    if (!Number.isSafeInteger(coreTaskVersion) || coreTaskVersion < 0) {
+      throw new TypeError('coreTaskVersion must be a non-negative safe integer');
+    }
 
-      let before;
-      try {
-        before = normalizeTask(
-          await adapter.getTask(expectedGuid),
-          'Task v2 adoption precheck',
-        );
-      } catch (error) {
-        if (error instanceof TaskV2AdoptionError) throw error;
-        throw new TaskV2AdoptionError('Task v2 adoption precheck failed', {
-          code: 'PRECHECK_FAILED',
-          hold: true,
-          cause: error,
-        });
-      }
-      validateCandidate(before, { taskGuid: expectedGuid, appId: expectedAppId });
-      const state = validateMarkerState(before, {
-        coreTaskId: expectedCoreTaskId,
-        marker,
-        markerLine,
+    let before;
+    try {
+      before = normalizeTask(
+        await adapter.getTask(expectedGuid),
+        'Task v2 adoption precheck',
+      );
+    } catch (error) {
+      if (error instanceof TaskV2AdoptionError) throw error;
+      throw new TaskV2AdoptionError('Task v2 adoption precheck failed', {
+        code: 'PRECHECK_FAILED',
+        hold: true,
+        cause: error,
       });
-      if (!state.descriptionNeedsPatch && !state.extraNeedsPatch) {
+    }
+    validateCandidate(before, { taskGuid: expectedGuid, appId: expectedAppId });
+    const marker = markerFor(expectedCoreTaskId, coreTaskVersion);
+    const markerLine = markerLineFor(expectedCoreTaskId);
+    const state = validateMarkerState(before, {
+      coreTaskId: expectedCoreTaskId,
+      marker,
+      markerLine,
+    });
+    const expectedDescription = state.descriptionNeedsPatch
+      ? appendDescriptionMarker(before.description, markerLine)
+      : before.description;
+    const changedFields = [
+      ...(state.descriptionNeedsPatch ? ['description'] : []),
+      ...(state.extraNeedsPatch ? ['extra'] : []),
+    ];
+    return {
+      taskGuid: expectedGuid,
+      coreTaskId: expectedCoreTaskId,
+      coreTaskVersion,
+      status: changedFields.length === 0 ? 'noop' : 'planned',
+      changedFields,
+      before,
+      expectedDescription,
+      marker,
+    };
+  }
+
+  return Object.freeze({
+    inspectTaskMarker,
+    async adoptTaskMarker({ taskGuid, coreTaskId, coreTaskVersion = 1 } = {}) {
+      const plan = await inspectTaskMarker({ taskGuid, coreTaskId, coreTaskVersion });
+      if (plan.status === 'noop') {
         return freezeResult({
           status: 'noop',
-          taskGuid: expectedGuid,
-          coreTaskId: expectedCoreTaskId,
+          taskGuid: plan.taskGuid,
+          coreTaskId: plan.coreTaskId,
           recovered: false,
         });
       }
 
-      const expectedDescription = state.descriptionNeedsPatch
-        ? appendDescriptionMarker(before.description, markerLine)
-        : before.description;
-      const updateFields = [
-        ...(state.descriptionNeedsPatch ? ['description'] : []),
-        ...(state.extraNeedsPatch ? ['extra'] : []),
-      ];
+      const {
+        before,
+        expectedDescription,
+        marker,
+        changedFields: updateFields,
+      } = plan;
       const request = {
-        taskGuid: expectedGuid,
+        taskGuid: plan.taskGuid,
         updateFields,
-        ...(state.descriptionNeedsPatch ? { description: expectedDescription } : {}),
-        ...(state.extraNeedsPatch ? { extra: marker } : {}),
+        ...(updateFields.includes('description') ? { description: expectedDescription } : {}),
+        ...(updateFields.includes('extra') ? { extra: marker } : {}),
       };
 
       let recovered = false;
@@ -299,7 +320,7 @@ export function createTaskV2LegacyAdoption({ adapter, appId } = {}) {
         }
         let readback;
         try {
-          readback = await adapter.getTask(expectedGuid);
+          readback = await adapter.getTask(plan.taskGuid);
         } catch (readbackError) {
           throw new TaskV2AdoptionError('Task v2 patch timed out and readback failed', {
             code: 'PATCH_TIMEOUT_READBACK_FAILED',
@@ -307,14 +328,14 @@ export function createTaskV2LegacyAdoption({ adapter, appId } = {}) {
             cause: readbackError,
           });
         }
-        postcheck(before, readback, expectedDescription, marker, expectedGuid);
+        postcheck(before, readback, expectedDescription, marker, plan.taskGuid);
         recovered = true;
       }
 
       if (!recovered) {
         let readback;
         try {
-          readback = await adapter.getTask(expectedGuid);
+          readback = await adapter.getTask(plan.taskGuid);
         } catch (error) {
           throw new TaskV2AdoptionError('Task v2 adoption postcheck failed', {
             code: 'POSTCHECK_FAILED',
@@ -322,12 +343,12 @@ export function createTaskV2LegacyAdoption({ adapter, appId } = {}) {
             cause: error,
           });
         }
-        postcheck(before, readback, expectedDescription, marker, expectedGuid);
+        postcheck(before, readback, expectedDescription, marker, plan.taskGuid);
       }
       return freezeResult({
         status: 'adopted',
-        taskGuid: expectedGuid,
-        coreTaskId: expectedCoreTaskId,
+        taskGuid: plan.taskGuid,
+        coreTaskId: plan.coreTaskId,
         changedFields: updateFields,
         recovered,
       });

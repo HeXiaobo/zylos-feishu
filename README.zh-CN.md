@@ -103,6 +103,40 @@ WorkIntake 仍要求精确 @机器人，并且必须配置专用 capability。
 稳定的确认数据会先写入本地 `0600` outbox；每次投递都重新签发确认卡，
 临时故障或进程重启后会用同一个 Feishu UUID 自动重试。
 
+## 既有 Task v2 纳管（一次性）
+
+`scripts/task-v2-legacy-adoption-bootstrap.js` 用于把已经存在、且已经有
+Commitment Core `feishu-task-v2` ExternalLink 的 Task v2 卡补上 Core marker。
+默认命令是只读 stable double-read plan；只有显式提供 `--commit` 才会逐项调用
+`task-v2-legacy-adoption` 深模块。它不会创建、完成、取消或删除任务，且首个
+失败会停止并在 JSON 回执中标出已完成和未执行项目。
+
+manifest 只允许精确的 `appId`、`taskGuid`、`coreTaskId` 和可选的
+`coreTaskVersion`：
+
+```json
+{
+  "schema": "zylos.feishu-task-v2-legacy-adoption/v1",
+  "appId": "cli_example",
+  "entries": [
+    { "taskGuid": "<existing-task-guid>", "coreTaskId": "<core-task-id>", "coreTaskVersion": 1 }
+  ]
+}
+```
+
+从临时源码目录运行时，只需让该目录拥有自身依赖，并将凭证放在指定的
+`--env-file`（或 `ZYLOS_DIR/.env`）中：
+
+```bash
+node scripts/task-v2-legacy-adoption-bootstrap.js --manifest /tmp/manifest.json
+node scripts/task-v2-legacy-adoption-bootstrap.js --manifest /tmp/manifest.json --commit
+node scripts/task-v2-legacy-adoption-bootstrap.js --manifest /tmp/manifest.json --commit \
+  --gate-core-inventory /tmp/core-inventory.json
+```
+
+最后一个命令会在全部 marker 纳管成功后调用现有 native-task conservation gate；
+gate 失败仍返回 `HOLD`，不会回避门禁。
+
 ## 文档
 
 - [SKILL.md](./SKILL.md) — 组件规格说明
