@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.8] - 2026-08-27
+
+### Added
+- Add a read-only native Task conservation gate that compares a stable,
+  full-pagination Core Task/external-link inventory with two stable,
+  full-pagination Feishu App inventories before a paired release can pass.
+- Emit a deterministic complete report for Core Task, `feishu-task-v2`
+  persistent-link, description marker, `extra.coreTaskId`, App identity,
+  assignee mapping, and native status gaps.
+
+### Changed
+- Require Core's `native-task-conservation-inventory >= 1` protocol, and expose
+  `feishu.native-task-conservation-gate = 1` for immutable pair compatibility.
+- Treat `ready` and `in_progress` as native `todo`, `review` as native `done`,
+  and exclude historical terminal/completed cards from current cardinality
+  while still failing any terminal Core task that retains an open App card.
+
 ## [0.3.7-rc.7] - 2026-08-27
 
 ### Changed

@@ -1,6 +1,6 @@
 {
   "name": "zylos-feishu",
-  "version": "0.3.7-rc.7",
+  "version": "0.3.7-rc.8",
   "description": "Feishu communication channel",
   "type": "module",
   "main": "src/index.js",
@@ -10,6 +10,7 @@
     "task-comments:once": "node src/lib/task-comment-worker.js run --once",
     "task-comments:gate": "node scripts/native-task-closure-gate.js",
     "task-status:gate": "node scripts/native-task-completion-gate.js",
+    "task-conservation:gate": "node scripts/native-task-conservation-gate.js",
     "test": "node --test"
   },
   "larkCli": {

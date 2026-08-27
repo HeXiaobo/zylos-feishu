@@ -36,6 +36,7 @@ test('accepts a Core that satisfies every required protocol', (t) => {
       'projection-outbox': 1,
       'external-task-adapter': 1,
       'task-reminder': 1,
+      'native-task-conservation-inventory': 1,
     },
   });
 
@@ -63,6 +64,7 @@ test('rejects stream-v2 Core because it can inject a second message into the act
       'projection-outbox': 1,
       'external-task-adapter': 1,
       'task-reminder': 1,
+      'native-task-conservation-inventory': 1,
     },
   });
 
@@ -102,6 +104,7 @@ test('reports every missing or outdated protocol before upgrade', (t) => {
     'Protocol projection-outbox requires >= 1, found missing',
     'Protocol external-task-adapter requires >= 1, found missing',
     'Protocol task-reminder requires >= 1, found missing',
+    'Protocol native-task-conservation-inventory requires >= 1, found missing',
   ]);
 });
 
@@ -119,6 +122,7 @@ test('rejects a stream-v3 Core that lacks stable outbound delivery identity', (t
       'projection-outbox': 1,
       'external-task-adapter': 1,
       'task-reminder': 1,
+      'native-task-conservation-inventory': 1,
     },
   });
 
@@ -146,6 +150,7 @@ test('rejects an otherwise compatible Core that lacks the external Task mapper p
       'commitment-core': 1,
       'projection-outbox': 1,
       'task-reminder': 1,
+      'native-task-conservation-inventory': 1,
     },
   });
 
@@ -173,6 +178,7 @@ test('rejects an otherwise compatible Core that cannot persist canonical task re
       'commitment-core': 1,
       'projection-outbox': 1,
       'external-task-adapter': 1,
+      'native-task-conservation-inventory': 1,
     },
   });
 
@@ -183,6 +189,34 @@ test('rejects an otherwise compatible Core that cannot persist canonical task re
   assert.equal(result.ok, false);
   assert.deepEqual(result.errors, [
     'Protocol task-reminder requires >= 1, found missing',
+  ]);
+});
+
+test('rejects an otherwise compatible Core without the stable conservation inventory', (t) => {
+  const cli = fakeZylos(t, {
+    schemaVersion: 1,
+    product: 'zylos-core',
+    release: '0.7.2-rc.14',
+    protocols: {
+      'c4.reply': 2,
+      'c4.reply.argv-compat': 1,
+      'c4.assistant-response-stream': 3,
+      'c4.outbound-delivery-id': 1,
+      'work-intake': 1,
+      'commitment-core': 1,
+      'projection-outbox': 1,
+      'external-task-adapter': 1,
+      'task-reminder': 1,
+    },
+  });
+
+  const result = checkCoreCompatibility({
+    env: { ...process.env, ZYLOS_CLI_PATH: cli },
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.errors, [
+    'Protocol native-task-conservation-inventory requires >= 1, found missing',
   ]);
 });
 
@@ -206,6 +240,7 @@ test('pre-upgrade aborts before backup when Core lacks the external Task mapper'
       'commitment-core': 1,
       'projection-outbox': 1,
       'task-reminder': 1,
+      'native-task-conservation-inventory': 1,
     },
   });
   const result = spawnSync(process.execPath, [path.join(ROOT, 'hooks', 'pre-upgrade.js')], {

@@ -646,6 +646,44 @@ may validate deterministic tests but report `evidenceMode: injected` and fail
 attestation. The gate writes neither database and never transitions Core from
 review to accepted.
 
+### 4.8 Native Task conservation gate
+
+`auditNativeTaskConservation({ coreInventory, remote, deployment, signal })`
+is the release-time read-only conservation Interface. Core supplies
+`zylos.native-task-core-inventory/v1`, captured by its dedicated public
+Task/external-link inventory command with full pagination and a stable snapshot.
+The Feishu SDK Adapter independently scans both `todo` and `done` partitions
+twice with the current App identity. It never prefilters by projection marker,
+so an open App orphan cannot disappear before evaluation.
+
+The gate requires `ready` and `in_progress` Agent tasks to have exactly one
+linked `todo` card, and `review` tasks exactly one linked `done` card. Every
+current card must agree across its description marker,
+`extra.coreTaskId`, and persistent `feishu-task-v2` link. Active tasks without
+an assignee, unmapped/cross-App Agent scopes, missing or duplicate links/cards,
+malformed SDK rows, pagination faults, identity mismatch, snapshot movement,
+abort, and timeout all fail closed. Human-assigned tasks do not force an App
+card. Terminal Core tasks and unknown historical `done` cards are outside the
+current cardinality denominator; a terminal task retaining a `todo` App card
+is still an orphan failure.
+
+The independent CLI accepts exactly one Core inventory source:
+
+```bash
+npm run task-conservation:gate -- \
+  --core-inventory-file /absolute/path/native-task-core-inventory.json \
+  --timeout-ms 60000
+```
+
+It can instead read `--core-inventory-stdin`, or execute a shell-free command
+with `--core-inventory-command <executable>` and repeatable
+`--core-inventory-arg <arg>`. Deployment identity is taken from
+`ZYLOS_AGENT_ID`, `FEISHU_APP_ID`, and `FEISHU_TASK_V2_AGENT_APP_IDS`;
+an explicitly configured `C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID` must match the
+deployment Agent. Output schema is `zylos.native-task-conservation-gate/v1`:
+exit `0` means pass, `1` means a deterministic conservation gap, and `2`
+means invalid input, malformed inventory, API failure, abort, or timeout.
+
 ---
 
 ## 5. Configuration
