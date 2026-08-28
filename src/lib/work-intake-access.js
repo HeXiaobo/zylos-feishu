@@ -43,6 +43,12 @@ function normalizeIds(value, field) {
   return [...new Set(value.map((id, index) => requireText(id, `${field}[${index}]`)))];
 }
 
+export function normalizeOptionalIdentityId(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text === '' ? null : text;
+}
+
 function normalizePolicy(input) {
   const policy = requireRecord(input, 'member access policy');
   requireExactFields(policy, POLICY_FIELDS, 'member access policy');

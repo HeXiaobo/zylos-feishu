@@ -51,6 +51,7 @@ import {
 import {
   createMemberAccessPolicy,
   decideLegacyDmAccess,
+  normalizeOptionalIdentityId,
   trustedOwnerIds,
 } from './lib/work-intake-access.js';
 import {
@@ -1807,8 +1808,8 @@ async function isDmAllowed(userId, openId, sender) {
     ownerMatched: isOwner(userId, openId),
     policy: config.dmPolicy || 'owner',
     allowFrom: Array.isArray(config.dmAllowFrom) ? config.dmAllowFrom : [],
-    userId: userId === undefined || userId === null ? null : String(userId),
-    openId: openId === undefined || openId === null ? null : String(openId),
+    userId: normalizeOptionalIdentityId(userId),
+    openId: normalizeOptionalIdentityId(openId),
   }).allowed;
 }
 

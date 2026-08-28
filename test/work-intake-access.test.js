@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   createMemberAccessPolicy,
   decideLegacyDmAccess,
+  normalizeOptionalIdentityId,
   trustedOwnerIds,
 } from '../src/lib/work-intake-access.js';
 
@@ -128,4 +129,24 @@ test('only an explicitly bound owner contributes trusted policy identities', () 
     user_id: '  ',
     open_id: 'ou_owner',
   }), ['ou_owner']);
+});
+
+test('normalizes missing and blank sender identities before legacy DM access checks', () => {
+  assert.equal(normalizeOptionalIdentityId(undefined), null);
+  assert.equal(normalizeOptionalIdentityId(null), null);
+  assert.equal(normalizeOptionalIdentityId(''), null);
+  assert.equal(normalizeOptionalIdentityId('   '), null);
+  assert.equal(normalizeOptionalIdentityId('  ou_cross_tenant  '), 'ou_cross_tenant');
+
+  assert.deepEqual(decideLegacyDmAccess({
+    ownerBound: true,
+    ownerMatched: false,
+    policy: 'allowlist',
+    allowFrom: ['ou_cross_tenant'],
+    userId: normalizeOptionalIdentityId(''),
+    openId: normalizeOptionalIdentityId('  ou_cross_tenant  '),
+  }), {
+    allowed: true,
+    reasonCode: 'ACCESS_LEGACY_ALLOWLIST',
+  });
 });
