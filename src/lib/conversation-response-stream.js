@@ -232,7 +232,7 @@ function phaseForEvent(event) {
     case 'RunStarted': return '思考中';
     case 'ProgressUpdated': return publicProgressText(event.payload);
     case 'OutputDelta': return '正在生成回答';
-    case 'RunCompleted': return '✅ 已完成';
+    case 'RunCompleted': return null;
     case 'RunFailed': return event.payload?.retryable
       ? '⚠️ 本次处理未完成，可重试'
       : '⚠️ 本次处理未完成';
@@ -323,7 +323,8 @@ function renderCard({
   const showProcess = processDisplay === 'collapsible'
     && running
     && (publicReasoning || progress.length > 0);
-  const showPhase = !running || (processDisplay === 'collapsible' && !showProcess);
+  const showPhase = Boolean(phase)
+    && (!running || (processDisplay === 'collapsible' && !showProcess));
   const card = {
     schema: '2.0',
     config: {
@@ -949,7 +950,7 @@ export function createConversationResponseStream({
             mode: 'ordinary_card',
             delivery: { kind: 'completed_cards', status: 'pending' },
             status: 'completed',
-            phase: '✅ 已完成',
+            phase: '',
             progress: [],
             publicReasoning: '',
             output,
@@ -1140,6 +1141,7 @@ export function createConversationResponseStream({
             if (event.type === 'RunCompleted') {
               canonicalOutput = event.payload.output;
               canonicalStatus = 'completed';
+              canonicalPhase = '';
               clearTransientProcess(state);
               terminal = true;
             }
@@ -1160,6 +1162,7 @@ export function createConversationResponseStream({
             if (event.type === 'RunCompleted') {
               state.output = event.payload.output;
               state.status = 'completed';
+              state.phase = '';
               clearTransientProcess(state);
               terminal = true;
             }
@@ -1222,7 +1225,7 @@ export function createConversationResponseStream({
           id,
           typeof output === 'string' ? output : String(output || ''),
           'completed',
-          '✅ 已完成',
+          '',
         );
       } finally {
         release();
