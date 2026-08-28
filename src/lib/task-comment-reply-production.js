@@ -5,13 +5,24 @@ import {
 import { createTaskCommentReplyAdapter } from './task-comment-runtime.js';
 import {
   createFeishuNotificationAdapter,
+  feishuNotificationDedupeKey,
   createSdkFeishuNotificationSender,
 } from './task-notification-adapter.js';
+import {
+  createTaskCommentNativeNotification,
+} from './task-comment-native-notification.js';
 import { createSdkTaskV2CommentApi } from './task-v2-comment-api.js';
 
 function requireRecord(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError(`${field} must be an object`);
+  }
+  return value;
+}
+
+function requireText(value, field) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new TypeError(`${field} must be a non-empty string`);
   }
   return value;
 }
@@ -40,6 +51,7 @@ export function createTaskCommentReplyProduction({
     createCoordinator,
     'Task comment reply createCoordinator',
   );
+  const publications = new Map();
   const notifications = createFeishuNotificationAdapter({
     store: canonicalStore,
     sender: createSdkFeishuNotificationSender({ client: sdkClient }),
@@ -47,18 +59,42 @@ export function createTaskCommentReplyProduction({
   const conversation = coordinatorFactory({
     core: canonicalCore,
     async publishNotification(publication) {
-      notifications.enqueue(publication);
+      const eventId = requireText(
+        publication?.decision?.eventId,
+        'Task comment publication event ID',
+      );
+      publications.set(eventId, publication);
     },
+  });
+  function fallbackExists(publication) {
+    const deliveries = publication?.decision?.deliveries;
+    if (!Array.isArray(deliveries) || deliveries.length === 0) return false;
+    return deliveries.every((delivery) => canonicalStore.notifications.query({
+      dedupeKey: feishuNotificationDedupeKey(delivery.dedupeKey),
+    }));
+  }
+  const primaryReply = createTaskCommentReplyAdapter({
+    appId,
+    store: canonicalStore,
+    commentApi: createSdkTaskV2CommentApi({ client: sdkClient }),
+  });
+  const nativeReply = createTaskCommentReplyAdapter({
+    appId,
+    store: canonicalStore,
+    commentApi: createSdkTaskV2CommentApi({ client: sdkClient }),
   });
   return createCoreFirstTaskCommentReply({
     appId,
     taskMapping: createCoreTaskV2CommentMapping({ core: canonicalCore }),
     commentQuery: canonicalCore.conversation,
     conversation,
-    replyAdapter: createTaskCommentReplyAdapter({
-      appId,
-      store: canonicalStore,
-      commentApi: createSdkTaskV2CommentApi({ client: sdkClient }),
+    replyAdapter: createTaskCommentNativeNotification({
+      primaryReply,
+      nativeReply,
+      publicationForCoreEvent: (eventId) => publications.get(eventId) ?? null,
+      releasePublication: (eventId) => publications.delete(eventId),
+      enqueueFallback: (publication) => notifications.enqueue(publication),
+      fallbackExists,
     }),
     ...(clock === undefined ? {} : { clock }),
   });
