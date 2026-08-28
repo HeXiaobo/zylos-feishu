@@ -142,10 +142,10 @@ test('opens once, coalesces real deltas, keeps sequence monotonic, and closes th
   assert.equal(finalCard.config.streaming_mode, false);
   assert.equal(finalCard.config.summary.content, '真实完整答案');
   assert.equal(closeSettings.config.summary.content, '真实完整答案');
-  assert.equal(finalCard.body.elements[0].content, '✅ 已完成');
-  assert.equal(finalCard.body.elements[1].content, '真实完整答案');
-  assert.equal(finalCard.body.elements[0].element_id.length <= 20, true);
-  assert.equal(finalCard.body.elements[1].element_id.length <= 20, true);
+  assert.equal(cardElement(finalCard, 'zylos_phase'), undefined);
+  assert.equal(cardElement(finalCard, 'zylos_answer').content, '真实完整答案');
+  assert.equal(finalCard.body.elements.length, 1);
+  assert.equal(cardElement(finalCard, 'zylos_answer').element_id.length <= 20, true);
 }));
 
 for (const conversion of [true, false]) {
@@ -241,7 +241,8 @@ test('phase events stay visible while running and disappear when completion supp
     events: [event(5, 'RunCompleted', { output: '只有完整答案，没有伪造 token 流。' })],
   });
   const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(finalCard.body.elements[1].content, '只有完整答案，没有伪造 token 流。');
+  assert.equal(cardElement(finalCard, 'zylos_phase'), undefined);
+  assert.equal(cardElement(finalCard, 'zylos_answer').content, '只有完整答案，没有伪造 token 流。');
   assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
 }));
 
@@ -422,7 +423,7 @@ test('keeps long completed answers free of extra copy actions', () => withState(
   assert.equal(card.config.summary.content.endsWith('…'), true);
   assert.equal(cardElement(card, 'zylos_answer').content, '这是一段需要方便复制的较长回答。'.repeat(12));
   assert.equal(card.body.elements.some(element => element.element_id === 'zylos_copy'), false);
-  assert.deepEqual(card.body.elements.map(element => element.tag), ['markdown', 'markdown']);
+  assert.deepEqual(card.body.elements.map(element => element.tag), ['markdown']);
 }));
 
 test('sends proactive text as the same completed response card without a placeholder', () => withState(async stateDirectory => {
@@ -448,8 +449,9 @@ test('sends proactive text as the same completed response card without a placeho
   const card = JSON.parse(calls.find(([name]) => name === 'send')[1].data.content);
   assert.equal(card.config.streaming_mode, false);
   assert.equal(card.config.summary.content, output);
-  assert.equal(card.body.elements[0].content, '✅ 已完成');
-  assert.equal(card.body.elements[1].content, output);
+  assert.equal(cardElement(card, 'zylos_phase'), undefined);
+  assert.equal(cardElement(card, 'zylos_answer').content, output);
+  assert.equal(card.body.elements.length, 1);
 }));
 
 test('persists proactive delivery intent and retries the same Feishu UUID after an unknown outcome', () => withState(async stateDirectory => {
@@ -954,6 +956,8 @@ test('legacy full-answer completion finalizes the existing card and durable term
   const compatibilityClose = JSON.parse(calls.filter(([name]) => name === 'close').at(-1)[1].data.settings);
   assert.equal(compatibilityCard.config.summary.content, '兼容完整答案');
   assert.equal(compatibilityClose.config.summary.content, '兼容完整答案');
+  assert.equal(cardElement(compatibilityCard, 'zylos_phase'), undefined);
+  assert.equal(cardElement(compatibilityCard, 'zylos_answer').content, '兼容完整答案');
   const apiCallCount = calls.length;
   await stream.apply({
     requestId: 'assistant.feishu.om_1',
@@ -991,8 +995,8 @@ test('canonical Core completion corrects an earlier local ambiguous failure on t
   assert.equal(completed.status, 'completed');
   const finalUpdate = calls.filter(([name]) => name === 'update').at(-1)[1];
   const finalCard = JSON.parse(finalUpdate.data.card.data);
-  assert.equal(finalCard.body.elements[0].content, '✅ 已完成');
-  assert.equal(finalCard.body.elements[1].content, 'Core 的最终答案');
+  assert.equal(cardElement(finalCard, 'zylos_phase'), undefined);
+  assert.equal(cardElement(finalCard, 'zylos_answer').content, 'Core 的最终答案');
 }));
 
 test('canonical Core completion corrects an earlier local failure in plain-text fallback', () => withState(async stateDirectory => {
