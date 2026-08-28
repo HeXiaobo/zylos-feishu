@@ -8,6 +8,7 @@ import { feishuNotificationDedupeKey } from './task-notification-adapter.js';
 const REPORT_SCHEMA = 'zylos.native-task-closure-gate/v2';
 const LINK_BACKEND = 'feishu-task-v2';
 const CORE_EVENT_OUTBOUND_PREFIX = 'task-comment-core-event:';
+const NATIVE_NOTIFICATION_OUTBOUND_PREFIX = 'task-comment-native-notification:';
 const HUMAN_OPEN_ID = /^ou_[A-Za-z0-9_-]+$/;
 
 function requireRecord(value, field) {
@@ -468,15 +469,60 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
     WHERE event_id = ? AND task_id = ?
     ORDER BY recipient_id, dedupe_key
   `).all(notificationEventId, link.taskId);
+  const nativeNotificationRows = notificationOrigin === 'agent-reply'
+    ? commentsDb.prepare(`
+        SELECT idempotency_key AS idempotencyKey,
+               reply_to_comment_id AS replyToCommentId,
+               content, status, comment_id AS commentId
+        FROM feishu_task_comment_outbound
+        WHERE app_id = ? AND task_guid = ?
+          AND reply_to_comment_id = ? AND idempotency_key = ?
+        ORDER BY idempotency_key
+      `).all(
+        appId,
+        item.taskGuid,
+        outbound.commentId,
+        `${NATIVE_NOTIFICATION_OUTBOUND_PREFIX}${notificationEventId}`,
+      )
+    : [];
+  if (nativeNotificationRows.length > 1) {
+    return failedCase(
+      item,
+      'NATIVE_NOTIFICATION_NOT_UNIQUE',
+      'More than one native self-reply claims the canonical Agent notification',
+      { eventId: notificationEventId, matches: nativeNotificationRows.length },
+    );
+  }
+  const nativeNotification = nativeNotificationRows.find(row => (
+    row.status === 'sent' && row.commentId
+  )) ?? null;
+  if (nativeNotification && notificationRows.length > 0) {
+    return failedCase(
+      item,
+      'NOTIFICATION_CHANNEL_DUPLICATE',
+      'The same Agent reply has both a native self-reply and an IM fallback receipt',
+      {
+        eventId: notificationEventId,
+        nativeCommentId: nativeNotification.commentId,
+        imDeliveries: notificationRows.map(row => ({
+          dedupeKey: row.dedupeKey,
+          recipientId: row.recipientId,
+          status: row.status,
+        })),
+      },
+    );
+  }
   const expectedDeliveries = new Map(notificationDecision.deliveries.map(delivery => (
     [`${delivery.recipientId}\u0000${delivery.dedupeKey}`, delivery]
   )));
   const observedDeliveries = new Map(notificationRows.map(row => (
     [`${row.recipientId}\u0000${row.dedupeKey}`, row]
   )));
-  const missingDeliveries = [...expectedDeliveries]
-    .filter(([key]) => !observedDeliveries.has(key))
-    .map(([, delivery]) => delivery);
+  const missingDeliveries = nativeNotification
+    ? []
+    : [...expectedDeliveries]
+      .filter(([key]) => !observedDeliveries.has(key))
+      .map(([, delivery]) => delivery);
   if (missingDeliveries.length > 0) {
     return failedCase(
       item,
@@ -700,6 +746,104 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
     );
   }
 
+  if (nativeNotification) {
+    let remoteNativeNotification;
+    try {
+      remoteNativeNotification = await remoteReader.getComment({
+        taskGuid: item.taskGuid,
+        commentId: nativeNotification.commentId,
+      });
+    } catch (error) {
+      return failedCase(
+        item,
+        'REMOTE_NATIVE_NOTIFICATION_READ_ERROR',
+        'Native Task self-reply notification could not be read',
+        { error: String(error?.message ?? error ?? 'unknown native reply read error').slice(0, 4_000) },
+      );
+    }
+    if (remoteNativeNotification?.kind === 'missing') {
+      return failedCase(
+        item,
+        'REMOTE_NATIVE_NOTIFICATION_MISSING',
+        'Native Task self-reply notification is deleted or no longer exists',
+        { commentId: nativeNotification.commentId },
+      );
+    }
+    if (
+      remoteNativeNotification?.kind !== 'found'
+      || remoteNativeNotification.comment?.resourceType !== 'task'
+      || remoteNativeNotification.comment?.resourceId !== item.taskGuid
+    ) {
+      return failedCase(
+        item,
+        'REMOTE_NATIVE_NOTIFICATION_TASK_MISMATCH',
+        'Native Task self-reply notification belongs to a different resource or Task GUID',
+        {
+          expectedTaskGuid: item.taskGuid,
+          observedTaskGuid: remoteNativeNotification?.comment?.resourceId ?? null,
+          observedResourceType: remoteNativeNotification?.comment?.resourceType ?? null,
+        },
+      );
+    }
+    if (
+      remoteNativeNotification.comment?.creator?.type !== 'app'
+      || remoteNativeNotification.comment?.creator?.id !== appId
+    ) {
+      return failedCase(
+        item,
+        'REMOTE_NATIVE_NOTIFICATION_CREATOR_MISMATCH',
+        'Native Task self-reply notification was not authored by the configured App identity',
+        {
+          expectedCreator: { id: appId, type: 'app' },
+          observedCreator: remoteNativeNotification.comment?.creator ?? null,
+        },
+      );
+    }
+    if (remoteNativeNotification.comment?.replyToCommentId !== outbound.commentId) {
+      return failedCase(
+        item,
+        'REMOTE_NATIVE_NOTIFICATION_PARENT_MISMATCH',
+        'Native Task self-reply notification does not target the exact Agent reply',
+        {
+          expectedReplyToCommentId: outbound.commentId,
+          observedReplyToCommentId:
+            remoteNativeNotification.comment?.replyToCommentId ?? null,
+        },
+      );
+    }
+    if (remoteNativeNotification.comment?.content !== nativeNotification.content) {
+      return failedCase(
+        item,
+        'REMOTE_NATIVE_NOTIFICATION_CONTENT_MISMATCH',
+        'Native Task self-reply notification content differs from its durable outbound receipt',
+        { contentMatchesOutbound: false },
+      );
+    }
+  }
+
+  const notificationChannel = nativeNotification
+    ? 'native-task-comment'
+    : 'feishu-im';
+  const notificationReceipts = nativeNotification
+    ? [Object.freeze({
+        idempotencyKey: nativeNotification.idempotencyKey,
+        commentId: nativeNotification.commentId,
+        replyToCommentId: nativeNotification.replyToCommentId,
+        status: nativeNotification.status,
+      })]
+    : notificationRows
+      .filter(row => row.status === 'sent' && row.sentAt)
+      .map(row => Object.freeze({
+        dedupeKey: row.dedupeKey,
+        recipientId: row.recipientId,
+        status: row.status,
+        sentAt: row.sentAt,
+      }))
+      .sort((left, right) => (
+        left.recipientId.localeCompare(right.recipientId)
+        || left.dedupeKey.localeCompare(right.dedupeKey)
+      ));
+
   return Object.freeze({
     taskGuid: item.taskGuid,
     commentId: item.commentId,
@@ -722,19 +866,9 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
     notifications: Object.freeze({
       eventId: notificationEventId,
       origin: notificationOrigin,
+      channel: notificationChannel,
       recipients: Object.freeze(notificationDecision.deliveries.map(({ recipientId }) => recipientId)),
-      receipts: Object.freeze(notificationRows
-        .filter(row => row.status === 'sent' && row.sentAt)
-        .map(row => Object.freeze({
-          dedupeKey: row.dedupeKey,
-          recipientId: row.recipientId,
-          status: row.status,
-          sentAt: row.sentAt,
-        }))
-        .sort((left, right) => (
-          left.recipientId.localeCompare(right.recipientId)
-          || left.dedupeKey.localeCompare(right.dedupeKey)
-        ))),
+      receipts: Object.freeze(notificationReceipts),
     }),
   });
 }

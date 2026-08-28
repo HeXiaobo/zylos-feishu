@@ -235,6 +235,7 @@ function createRemoteReader({
 
 function createLiveRemoteReader({
   agentReplyCreator = { id: APP_ID, type: 'app' },
+  nativeReminder = null,
 } = {}) {
   return createSdkNativeTaskGateReader({
     client: {
@@ -267,19 +268,24 @@ function createLiveRemoteReader({
           comment: {
             async get({ path: { comment_id: commentId } }) {
               const agentReply = commentId === 'comment-agent-1';
+              const nativeReply = nativeReminder?.id === commentId;
               return {
                 code: 0,
                 data: { comment: {
                   id: commentId,
-                  content: agentReply ? 'Closed.' : 'Please close this canary.',
-                  creator: agentReply
+                  content: nativeReply
+                    ? nativeReminder.content
+                    : agentReply ? 'Closed.' : 'Please close this canary.',
+                  creator: agentReply || nativeReply
                     ? agentReplyCreator
                     : { id: 'ou_requester', type: 'user' },
                   created_at: '2026-08-26T10:00:00.000Z',
                   updated_at: '2026-08-26T10:00:00.000Z',
                   resource_type: 'task',
                   resource_id: 'task-guid-1',
-                  ...(agentReply ? { reply_to_comment_id: 'comment-human-1' } : {}),
+                  ...(nativeReply
+                    ? { reply_to_comment_id: nativeReminder.replyToCommentId }
+                    : agentReply ? { reply_to_comment_id: 'comment-human-1' } : {}),
                 } },
               };
             },
@@ -527,6 +533,91 @@ test('a sole human can prove closure from the exact Agent reply notification', a
       status: 'sent',
       sentAt: '2026-08-26T10:00:04.000Z',
     }]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a sole human can prove closure from the exact native self-reply notification', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare('DELETE FROM feishu_task_notifications WHERE event_id = ?')
+      .run('core-agent-reply-event-1');
+    comments.prepare(`
+      INSERT INTO feishu_task_comment_outbound (
+        app_id, idempotency_key, task_guid, reply_to_comment_id, content, status, comment_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      APP_ID,
+      'task-comment-native-notification:core-agent-reply-event-1',
+      'task-guid-1',
+      'comment-agent-1',
+      '请查看上方 BOT 回复。',
+      'sent',
+      'comment-native-reminder-1',
+    );
+    comments.close();
+
+    const report = await evaluateFixture(fixture, {
+      remoteReader: createLiveRemoteReader({
+        nativeReminder: {
+          id: 'comment-native-reminder-1',
+          content: '请查看上方 BOT 回复。',
+          replyToCommentId: 'comment-agent-1',
+        },
+      }),
+    });
+
+    assert.equal(report.validationPassed, true);
+    assert.equal(report.passed, true);
+    assert.deepEqual(report.failureCodes, []);
+    assert.equal(report.cases[0].notifications.origin, 'agent-reply');
+    assert.equal(report.cases[0].notifications.channel, 'native-task-comment');
+    assert.deepEqual(report.cases[0].notifications.receipts, [{
+      idempotencyKey: 'task-comment-native-notification:core-agent-reply-event-1',
+      commentId: 'comment-native-reminder-1',
+      replyToCommentId: 'comment-agent-1',
+      status: 'sent',
+    }]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a native self-reply and IM fallback cannot both satisfy one notification decision', async () => {
+  const fixture = createFixture();
+  try {
+    makeSoleHumanClosure(fixture);
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare(`
+      INSERT INTO feishu_task_comment_outbound (
+        app_id, idempotency_key, task_guid, reply_to_comment_id, content, status, comment_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      APP_ID,
+      'task-comment-native-notification:core-agent-reply-event-1',
+      'task-guid-1',
+      'comment-agent-1',
+      '请查看上方 BOT 回复。',
+      'sent',
+      'comment-native-reminder-1',
+    );
+    comments.close();
+
+    const report = await evaluateFixture(fixture, {
+      remoteReader: createLiveRemoteReader({
+        nativeReminder: {
+          id: 'comment-native-reminder-1',
+          content: '请查看上方 BOT 回复。',
+          replyToCommentId: 'comment-agent-1',
+        },
+      }),
+    });
+
+    assert.equal(report.validationPassed, false);
+    assert.deepEqual(report.failureCodes, ['NOTIFICATION_CHANNEL_DUPLICATE']);
   } finally {
     fixture.cleanup();
   }
