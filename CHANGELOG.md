@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.9] - 2026-08-28
+
+### Fixed
+- Deliver bot comment-reply reminders through a deterministic native Task
+  self-reply, falling back to one idempotent ordinary IM only when native
+  delivery is explicitly rejected.
+- Suppress comment echoes and fail the native closure gate when one logical
+  reply appears through duplicate notification channels.
+
 ## [0.3.7-rc.8] - 2026-08-27
 
 ### Added

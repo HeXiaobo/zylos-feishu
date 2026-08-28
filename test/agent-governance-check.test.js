@@ -40,10 +40,10 @@ function writeFixtureMetadata(root, version) {
   fs.writeFileSync(path.join(root, 'SKILL.md'), `---\nname: feishu\nversion: ${version}\n---\n`);
 }
 
-test('repository release metadata is aligned at the release 0.3.7-rc.8 baseline', () => {
+test('repository release metadata is aligned at the release 0.3.7-rc.9 baseline', () => {
   const result = validateReleaseMetadata(ROOT);
   assert.deepEqual(result.failures, []);
-  assert.equal(result.packageVersion, '0.3.7-rc.8');
+  assert.equal(result.packageVersion, '0.3.7-rc.9');
 });
 
 test('classifies protected, release, and feature branches', () => {
