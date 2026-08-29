@@ -358,6 +358,14 @@ export function createSdkTaskV2Gateway({ client } = {}) {
         params: { user_id_type: USER_ID_TYPE },
         data: { reminder_ids: [requireText(current.reminderId, 'current reminder id')] },
       }), 'remove_reminders');
+      if (desired === null) {
+        const confirmed = await getTask(taskGuid);
+        if (confirmed.reminderMinutesBeforeDue !== null) {
+          throw new FeishuTaskV2Error(
+            `Feishu Task v2 reminder readback mismatch for ${taskGuid}`,
+          );
+        }
+      }
     }
     if (desired !== null) {
       taskFromResponse(await taskApi.addReminders({
@@ -403,6 +411,17 @@ export function createSdkTaskV2Gateway({ client } = {}) {
         const current = await getTask(guid);
         const normalizedTask = requireRecord(task, 'task');
         const patch = patchPayload(normalizedTask, current);
+        const desiredReminder = reminderFromTask(normalizedTask);
+        const normalizedClientToken = requireText(clientToken, 'clientToken');
+        // A reminder update is a separate native API operation. Complete the
+        // reminder transition first so a rejected close cannot leave a Task
+        // completed while its old alarm remains active. A retry can safely
+        // resume from the authoritative Task state after a partial transition.
+        const reminderChanged = await syncReminder(
+          guid,
+          current,
+          desiredReminder,
+        );
         const patched = patch.update_fields.length === 0
           ? current
           : taskFromResponse(await taskApi.patch({
@@ -410,12 +429,11 @@ export function createSdkTaskV2Gateway({ client } = {}) {
             params: { user_id_type: USER_ID_TYPE },
             data: patch,
           }), 'patch');
-        await syncMembers(guid, current.members, desiredMembers, requireText(clientToken, 'clientToken'));
-        const desiredReminder = reminderFromTask(normalizedTask);
-        const reminderChanged = await syncReminder(
+        await syncMembers(
           guid,
-          current,
-          desiredReminder,
+          current.members,
+          desiredMembers,
+          normalizedClientToken,
         );
         if (!reminderChanged && desiredReminder === null) {
           return Object.freeze({ ...patched, members: Object.freeze(desiredMembers) });

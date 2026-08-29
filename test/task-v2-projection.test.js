@@ -804,6 +804,195 @@ test('SDK Adapter replaces an existing reminder and confirms the update by readb
   assert.equal(result.reminderMinutesBeforeDue, 60);
 });
 
+test('SDK Adapter fails closed before completing a Task when reminder removal is rejected', async () => {
+  const calls = [];
+  const task = coreTask({
+    state: 'done',
+    version: 2,
+    updatedAt: '2026-08-26T12:00:00.000Z',
+    reminderMinutesBeforeDue: null,
+  });
+  const members = createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }).map(task);
+  const remoteTask = sdkTask({
+    summary: task.title,
+    description: `${task.description}\n\nZylos Core Task: ${task.id}`,
+    due: { timestamp: String(Date.parse(DUE_AT)), is_all_day: false },
+    members,
+    reminders: [{ id: 'reminder-60', relative_fire_minute: 60 }],
+  });
+  const response = value => ({ code: 0, data: { task: value } });
+  const client = {
+    task: { v2: { task: {
+      async create() { throw new Error('unexpected create'); },
+      async get() {
+        calls.push('get');
+        return response(remoteTask);
+      },
+      async patch() {
+        calls.push('patch');
+        throw new Error('patch must not run after reminder removal failure');
+      },
+      async addMembers() { throw new Error('unexpected addMembers'); },
+      async removeMembers() { throw new Error('unexpected removeMembers'); },
+      async addReminders() { throw new Error('unexpected addReminders'); },
+      async removeReminders(payload) {
+        calls.push(['removeReminders', payload]);
+        const error = new Error('missing required reminder close argument');
+        error.response = { status: 400 };
+        throw error;
+      },
+      async list() { throw new Error('unexpected list'); },
+    } } },
+  };
+
+  await assert.rejects(
+    () => createSdkTaskV2Gateway({ client }).updateTask({
+      taskGuid: remoteTask.guid,
+      task,
+      members,
+      clientToken: 'zt2_reminder_close',
+    }),
+    /missing required reminder close argument/,
+  );
+  assert.deepEqual(calls.map(call => Array.isArray(call) ? call[0] : call), [
+    'get',
+    'removeReminders',
+  ]);
+  assert.deepEqual(calls[1][1].data, { reminder_ids: ['reminder-60'] });
+  assert.deepEqual(calls[1][1].params, { user_id_type: 'open_id' });
+});
+
+test('SDK Adapter safely resumes an idempotent completion after reminder removal loses its response', async () => {
+  const calls = [];
+  const task = coreTask({
+    state: 'done',
+    version: 3,
+    updatedAt: '2026-08-26T12:30:00.000Z',
+    reminderMinutesBeforeDue: null,
+  });
+  const members = createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }).map(task);
+  let remoteTask = sdkTask({
+    summary: task.title,
+    description: `${task.description}\n\nZylos Core Task: ${task.id}`,
+    due: { timestamp: String(Date.parse(DUE_AT)), is_all_day: false },
+    members,
+    reminders: [{ id: 'reminder-60', relative_fire_minute: 60 }],
+  });
+  let removeAttempts = 0;
+  const response = value => ({ code: 0, data: { task: value } });
+  const client = {
+    task: { v2: { task: {
+      async create() { throw new Error('unexpected create'); },
+      async get() {
+        calls.push('get');
+        return response(remoteTask);
+      },
+      async patch(payload) {
+        calls.push(['patch', payload]);
+        remoteTask = {
+          ...remoteTask,
+          completed_at: payload.data.task.completed_at,
+          extra: payload.data.task.extra,
+        };
+        return response(remoteTask);
+      },
+      async addMembers() { throw new Error('unexpected addMembers'); },
+      async removeMembers() { throw new Error('unexpected removeMembers'); },
+      async addReminders() { throw new Error('unexpected addReminders'); },
+      async removeReminders(payload) {
+        calls.push(['removeReminders', payload]);
+        removeAttempts += 1;
+        remoteTask = { ...remoteTask, reminders: [] };
+        if (removeAttempts === 1) {
+          const error = new Error('response lost after reminder removal');
+          error.response = { status: 503 };
+          throw error;
+        }
+        return response(remoteTask);
+      },
+      async list() { throw new Error('unexpected list'); },
+    } } },
+  };
+  const gateway = createSdkTaskV2Gateway({ client });
+  const request = {
+    taskGuid: remoteTask.guid,
+    task,
+    members,
+    clientToken: 'zt2_reminder_retry',
+  };
+
+  await assert.rejects(() => gateway.updateTask(request), /response lost after reminder removal/);
+  assert.equal(remoteTask.reminders.length, 0);
+  assert.equal(calls.some(call => Array.isArray(call) && call[0] === 'patch'), false);
+
+  const result = await gateway.updateTask(request);
+
+  assert.equal(result.completedAt, String(Date.parse(task.updatedAt)));
+  assert.equal(result.reminderMinutesBeforeDue, null);
+  assert.deepEqual(calls.map(call => Array.isArray(call) ? call[0] : call), [
+    'get',
+    'removeReminders',
+    'get',
+    'patch',
+  ]);
+  assert.equal(removeAttempts, 1);
+});
+
+test('SDK Adapter refuses completion when reminder removal readback still finds the alarm', async () => {
+  const calls = [];
+  const task = coreTask({
+    state: 'done',
+    version: 4,
+    updatedAt: '2026-08-26T13:00:00.000Z',
+    reminderMinutesBeforeDue: null,
+  });
+  const members = createTaskV2MemberMapper({ appId: APP_ID, agentId: 'agent:yueran' }).map(task);
+  const remoteTask = sdkTask({
+    summary: task.title,
+    description: `${task.description}\n\nZylos Core Task: ${task.id}`,
+    due: { timestamp: String(Date.parse(DUE_AT)), is_all_day: false },
+    members,
+    reminders: [{ id: 'reminder-60', relative_fire_minute: 60 }],
+  });
+  const response = value => ({ code: 0, data: { task: value } });
+  const client = {
+    task: { v2: { task: {
+      async create() { throw new Error('unexpected create'); },
+      async get() {
+        calls.push('get');
+        return response(remoteTask);
+      },
+      async patch() {
+        calls.push('patch');
+        throw new Error('patch must not run before reminder readback');
+      },
+      async addMembers() { throw new Error('unexpected addMembers'); },
+      async removeMembers() { throw new Error('unexpected removeMembers'); },
+      async addReminders() { throw new Error('unexpected addReminders'); },
+      async removeReminders(payload) {
+        calls.push(['removeReminders', payload]);
+        return response(remoteTask);
+      },
+      async list() { throw new Error('unexpected list'); },
+    } } },
+  };
+
+  await assert.rejects(
+    () => createSdkTaskV2Gateway({ client }).updateTask({
+      taskGuid: remoteTask.guid,
+      task,
+      members,
+      clientToken: 'zt2_reminder_readback',
+    }),
+    /reminder readback mismatch/,
+  );
+  assert.deepEqual(calls.map(call => Array.isArray(call) ? call[0] : call), [
+    'get',
+    'removeReminders',
+    'get',
+  ]);
+});
+
 test('SDK Adapter re-reads an unchanged reminder after updating another Task field', async () => {
   const calls = [];
   const response = task => ({ code: 0, data: { task } });
