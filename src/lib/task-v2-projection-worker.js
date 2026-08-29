@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -28,6 +29,8 @@ import { isTaskV2Enabled } from './task-v2-runtime-policy.js';
 import { resolveTaskV2DeploymentIdentity } from './task-v2-deployment-identity.js';
 
 const REGISTRATION_ACTOR = 'commitment-feishu-task-v2-projection';
+const READONLY_SNAPSHOT_PREFIX = 'zylos-task-v2-readonly-';
+const READONLY_SNAPSHOT_ATTEMPTS = 3;
 const DEFAULTS = Object.freeze({
   limit: 25,
   leaseMs: 30_000,
@@ -76,6 +79,110 @@ function sleep(intervalMs, signal) {
   });
 }
 
+function defaultCoreDbPath(env = process.env) {
+  const zylosDir = env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+  return path.join(zylosDir, 'commitments', 'commitments.db');
+}
+
+function fingerprintFile(filePath) {
+  const stat = fs.statSync(filePath);
+  if (!stat.isFile()) throw new TypeError(`Core database sidecar must be a regular file: ${filePath}`);
+  return {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+    dev: stat.dev,
+    ino: stat.ino,
+    sha256: createHash('sha256').update(fs.readFileSync(filePath)).digest('hex'),
+  };
+}
+
+function sourceDatabaseFiles(sourcePath) {
+  const files = [sourcePath, `${sourcePath}-wal`];
+  if (fs.existsSync(`${sourcePath}-journal`)) {
+    throw new Error('Core database has an active rollback journal');
+  }
+  return files.flatMap((filePath) => {
+    try {
+      return [{ path: filePath, fingerprint: fingerprintFile(filePath) }];
+    } catch (error) {
+      if (error?.code === 'ENOENT' && filePath !== sourcePath) return [];
+      throw error;
+    }
+  });
+}
+
+function sameDatabaseFiles(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function copyReadOnlyDatabaseSnapshot(sourcePath, snapshotPath) {
+  // Opening a live WAL database for a SQLite backup can materialize sidecars on
+  // the source. Copy the main database and any WAL only after stable
+  // fingerprints, so Core's normal open/migration path runs against the copy.
+  let lastError;
+  for (let attempt = 0; attempt < READONLY_SNAPSHOT_ATTEMPTS; attempt += 1) {
+    try {
+      const before = sourceDatabaseFiles(sourcePath);
+      for (const file of before) {
+        const suffix = file.path.slice(sourcePath.length);
+        fs.copyFileSync(file.path, `${snapshotPath}${suffix}`);
+      }
+      const after = sourceDatabaseFiles(sourcePath);
+      if (sameDatabaseFiles(before, after)) return;
+    } catch (error) {
+      lastError = error;
+    }
+    fs.rmSync(snapshotPath, { force: true });
+    fs.rmSync(`${snapshotPath}-wal`, { force: true });
+  }
+  throw new Error('Core database changed while creating a read-only snapshot', { cause: lastError });
+}
+
+function wrapReadOnlyCore(core, cleanup) {
+  let closed = false;
+  return Object.freeze({
+    query: core.query.bind(core),
+    externalLinks: core.externalLinks,
+    close() {
+      if (closed) return;
+      closed = true;
+      try {
+        core.close();
+      } finally {
+        cleanup();
+      }
+    },
+  });
+}
+
+async function openReadOnlyCore({ openCore, dbPath } = {}) {
+  if (typeof openCore !== 'function') throw new TypeError('openCore must be a function');
+  const sourcePath = path.resolve(dbPath || defaultCoreDbPath());
+  let snapshotDir;
+  try {
+    const stat = fs.statSync(sourcePath);
+    if (!stat.isFile()) throw new TypeError(`Core database must be a regular file: ${sourcePath}`);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return openCore({ dbPath: ':memory:' });
+    throw error;
+  }
+
+  try {
+    snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), READONLY_SNAPSHOT_PREFIX));
+    const snapshotPath = path.join(snapshotDir, 'commitments.db');
+    copyReadOnlyDatabaseSnapshot(sourcePath, snapshotPath);
+
+    const core = await openCore({ dbPath: snapshotPath });
+    return wrapReadOnlyCore(core, () => {
+      fs.rmSync(snapshotDir, { recursive: true, force: true });
+    });
+  } catch (error) {
+    if (snapshotDir) fs.rmSync(snapshotDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 export async function loadCommitmentProjectionDependencies({
   env = process.env,
   importModule = specifier => import(specifier),
@@ -107,6 +214,10 @@ export async function loadCommitmentProjectionDependencies({
   }
   return Object.freeze({
     openCore: coreModule.openCommitmentCore,
+    openReadOnlyCore: () => openReadOnlyCore({
+      openCore: coreModule.openCommitmentCore,
+      dbPath: defaultCoreDbPath(env),
+    }),
     processBatch: workerModule.processProjectionBatch,
     reconcile: reconciliationModule.reconcileProjection,
     mapExternalTaskEvent: externalTaskModule.mapExternalTaskEvent,
@@ -226,6 +337,7 @@ export async function runTaskV2ProjectionOnce({
 
 export async function runTaskV2Reconciliation({
   openCore,
+  openReadOnlyCore: readOnlyOpener,
   reconcile,
   gateway,
   tasks,
@@ -237,8 +349,13 @@ export async function runTaskV2Reconciliation({
   if (typeof openCore !== 'function') throw new TypeError('openCore must be a function');
   if (typeof reconcile !== 'function') throw new TypeError('reconcile must be a function');
   if (typeof repairStatus !== 'boolean') throw new TypeError('repairStatus must be a boolean');
+  if (readOnlyOpener !== undefined && typeof readOnlyOpener !== 'function') {
+    throw new TypeError('openReadOnlyCore must be a function');
+  }
   throwIfAborted(signal);
-  const core = openCore();
+  const core = await (repairStatus || readOnlyOpener === undefined
+    ? openCore()
+    : readOnlyOpener());
   try {
     const snapshot = await collectTaskV2ReconciliationSnapshot({
       core,
@@ -387,6 +504,7 @@ async function main(args = process.argv.slice(2), env = process.env) {
     const runtime = createTaskV2ProjectionRuntime({ env });
     const result = await runTaskV2Reconciliation({
       openCore: dependencies.openCore,
+      openReadOnlyCore: dependencies.openReadOnlyCore,
       reconcile: dependencies.reconcile,
       gateway: runtime.gateway,
       appId: runtime.appId,
@@ -441,6 +559,7 @@ async function main(args = process.argv.slice(2), env = process.env) {
     runOnce: runTaskV2ProjectionOnce,
     runReconciliation: ({ signal: reconciliationSignal } = {}) => runTaskV2Reconciliation({
       openCore: dependencies.openCore,
+      openReadOnlyCore: dependencies.openReadOnlyCore,
       reconcile: dependencies.reconcile,
       gateway: runtime.gateway,
       repairStatus: true,

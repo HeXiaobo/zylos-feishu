@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { createTaskV2MemberMapper } from '../src/lib/task-v2-member-mapper.js';
@@ -286,7 +290,10 @@ test('reconciliation combines the Feishu snapshot with the Core generic diff', a
   harness.core.externalLinks.query = () => [];
   const report = await runTaskV2Reconciliation({
     openCore: () => harness.core,
-    gateway: { async findTasksByCoreTaskId() { return []; } },
+    gateway: {
+      async findTasksByCoreTaskId() { return []; },
+      async getTask() { throw new Error('no repairs expected'); },
+    },
     tasks: [harness.core.query({ taskId: 'task-worker' })],
     reconcile({ expected, actual }) {
       assert.equal(expected.length, 1);
@@ -304,6 +311,160 @@ test('reconciliation combines the Feishu snapshot with the Core generic diff', a
   assert.deepEqual(report.missingLinks, [{ taskId: 'task-worker' }]);
   assert.deepEqual(report.reminderDrifts, []);
   assert.deepEqual(harness.calls.map(([operation]) => operation), ['close']);
+});
+
+test('read-only reconciliation uses an isolated Core snapshot without mutating the live database', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-readonly-'));
+  try {
+    const dbPath = path.join(root, 'commitments', 'commitments.db');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    const source = new Database(dbPath);
+    source.pragma('journal_mode = WAL');
+    source.exec('CREATE TABLE source_marker (value TEXT); INSERT INTO source_marker VALUES (\'unchanged\')');
+    source.close();
+    const before = fs.readFileSync(dbPath);
+    const beforeFiles = fs.readdirSync(path.dirname(dbPath)).sort();
+    const openedPaths = [];
+    const openCommitmentCore = ({ dbPath: openedPath = dbPath } = {}) => {
+      openedPaths.push(openedPath);
+      const database = new Database(openedPath, { fileMustExist: true });
+      database.exec('CREATE TABLE snapshot_marker (value TEXT)');
+      return {
+        query() {
+          return [{
+            id: 'task-readonly',
+            state: 'ready',
+            reminderMinutesBeforeDue: null,
+          }];
+        },
+        externalLinks: { query() { return []; } },
+        close() { database.close(); },
+      };
+    };
+    const modules = new Map([
+      ['core.js', { openCommitmentCore }],
+      ['projection-worker.js', { processProjectionBatch() {} }],
+      ['reconcile-projection.js', { reconcileProjection() {
+        return {
+          consistent: false,
+          missing: [{ key: 'task-readonly', state: 'open' }],
+          unexpected: [],
+          stateMismatches: [],
+          duplicateKeys: [],
+        };
+      } }],
+      ['external-task-adapter.js', { mapExternalTaskEvent() {} }],
+    ]);
+    const dependencies = await loadCommitmentProjectionDependencies({
+      env: { ZYLOS_DIR: root },
+      async importModule(specifier) {
+        const name = [...modules.keys()].find(candidate => specifier.endsWith(candidate));
+        return modules.get(name);
+      },
+    });
+
+    const report = await runTaskV2Reconciliation({
+      openCore: dependencies.openCore,
+      openReadOnlyCore: dependencies.openReadOnlyCore,
+      reconcile: dependencies.reconcile,
+      gateway: { async findTasksByCoreTaskId() { return []; } },
+      tasks: [{ id: 'task-readonly', state: 'ready', reminderMinutesBeforeDue: null }],
+    });
+
+    assert.equal(report.consistent, false);
+    assert.deepEqual(openedPaths.length, 1);
+    assert.notEqual(openedPaths[0], dbPath);
+    assert.deepEqual(fs.readFileSync(dbPath), before);
+    assert.deepEqual(fs.readdirSync(path.dirname(dbPath)).sort(), beforeFiles);
+    const verify = new Database(dbPath, { readonly: true, fileMustExist: true });
+    assert.deepEqual(verify.prepare('SELECT value FROM source_marker').all(), [{ value: 'unchanged' }]);
+    verify.close();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('status repair keeps using the writable Core opener', async () => {
+  const harness = fakeCore();
+  let readOnlyOpens = 0;
+  const report = await runTaskV2Reconciliation({
+    openCore: () => harness.core,
+    openReadOnlyCore: () => {
+      readOnlyOpens += 1;
+      throw new Error('status repair must not use a read-only snapshot');
+    },
+    reconcile: () => ({
+      consistent: true,
+      missing: [],
+      unexpected: [],
+      stateMismatches: [],
+      duplicateKeys: [],
+    }),
+    gateway: {
+      async findTasksByCoreTaskId() { return []; },
+      async getTask() { throw new Error('no repairs expected'); },
+    },
+    tasks: [harness.core.query({ taskId: 'task-worker' })],
+    repairStatus: true,
+    appId: 'cli_yueran',
+    mapExternalTaskEvent() { throw new Error('no repairs expected'); },
+  });
+
+  assert.equal(report.consistent, true);
+  assert.equal(readOnlyOpens, 0);
+  assert.deepEqual(harness.calls.map(([operation]) => operation), ['close']);
+});
+
+test('read-only reconciliation does not create a missing Core database', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-readonly-empty-'));
+  try {
+    const dbPath = path.join(root, 'commitments', 'commitments.db');
+    const openedPaths = [];
+    const openCommitmentCore = ({ dbPath: openedPath } = {}) => {
+      openedPaths.push(openedPath);
+      const database = new Database(openedPath);
+      return {
+        query() { return []; },
+        externalLinks: { query() { return []; } },
+        close() { database.close(); },
+      };
+    };
+    const modules = new Map([
+      ['core.js', { openCommitmentCore }],
+      ['projection-worker.js', { processProjectionBatch() {} }],
+      ['reconcile-projection.js', { reconcileProjection() {
+        return {
+          consistent: true,
+          missing: [],
+          unexpected: [],
+          stateMismatches: [],
+          duplicateKeys: [],
+        };
+      } }],
+      ['external-task-adapter.js', { mapExternalTaskEvent() {} }],
+    ]);
+    const dependencies = await loadCommitmentProjectionDependencies({
+      env: { ZYLOS_DIR: root },
+      async importModule(specifier) {
+        const name = [...modules.keys()].find(candidate => specifier.endsWith(candidate));
+        return modules.get(name);
+      },
+    });
+
+    const report = await runTaskV2Reconciliation({
+      openCore: dependencies.openCore,
+      openReadOnlyCore: dependencies.openReadOnlyCore,
+      reconcile: dependencies.reconcile,
+      gateway: { async findTasksByCoreTaskId() { return []; } },
+      tasks: [],
+    });
+
+    assert.equal(report.consistent, true);
+    assert.deepEqual(openedPaths, [':memory:']);
+    assert.equal(fs.existsSync(dbPath), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('explicit reconciliation repair converts linked native completion only to Core review', async () => {
