@@ -384,6 +384,71 @@ test('read-only reconciliation uses an isolated Core snapshot without mutating t
   }
 });
 
+test('read-only reconciliation preserves uncheckpointed WAL data in its isolated snapshot', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-readonly-wal-'));
+  let source;
+  try {
+    const dbPath = path.join(root, 'commitments', 'commitments.db');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    source = new Database(dbPath);
+    source.pragma('journal_mode = WAL');
+    source.pragma('wal_autocheckpoint = 0');
+    source.exec('CREATE TABLE source_marker (value TEXT); INSERT INTO source_marker VALUES (\'from-wal\')');
+    assert.equal(fs.existsSync(`${dbPath}-wal`), true);
+    const beforeMain = fs.readFileSync(dbPath);
+    const beforeWal = fs.readFileSync(`${dbPath}-wal`);
+    const openedPaths = [];
+    const openCommitmentCore = ({ dbPath: openedPath } = {}) => {
+      openedPaths.push(openedPath);
+      const database = new Database(openedPath, { fileMustExist: true });
+      assert.deepEqual(database.prepare('SELECT value FROM source_marker').all(), [{ value: 'from-wal' }]);
+      return {
+        query() { return []; },
+        externalLinks: { query() { return []; } },
+        close() { database.close(); },
+      };
+    };
+    const modules = new Map([
+      ['core.js', { openCommitmentCore }],
+      ['projection-worker.js', { processProjectionBatch() {} }],
+      ['reconcile-projection.js', { reconcileProjection() {
+        return {
+          consistent: true,
+          missing: [],
+          unexpected: [],
+          stateMismatches: [],
+          duplicateKeys: [],
+        };
+      } }],
+      ['external-task-adapter.js', { mapExternalTaskEvent() {} }],
+    ]);
+    const dependencies = await loadCommitmentProjectionDependencies({
+      env: { ZYLOS_DIR: root },
+      async importModule(specifier) {
+        const name = [...modules.keys()].find(candidate => specifier.endsWith(candidate));
+        return modules.get(name);
+      },
+    });
+
+    const report = await runTaskV2Reconciliation({
+      openCore: dependencies.openCore,
+      openReadOnlyCore: dependencies.openReadOnlyCore,
+      reconcile: dependencies.reconcile,
+      gateway: { async findTasksByCoreTaskId() { return []; } },
+      tasks: [],
+    });
+
+    assert.equal(report.consistent, true);
+    assert.equal(openedPaths.length, 1);
+    assert.notEqual(openedPaths[0], dbPath);
+    assert.deepEqual(fs.readFileSync(dbPath), beforeMain);
+    assert.deepEqual(fs.readFileSync(`${dbPath}-wal`), beforeWal);
+  } finally {
+    source?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('status repair keeps using the writable Core opener', async () => {
   const harness = fakeCore();
   let readOnlyOpens = 0;
