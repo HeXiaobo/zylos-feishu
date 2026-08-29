@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Tighten the Smart-group response hint: default to silence, always answer an
+  explicit bot mention, and answer passive traffic only when nobody else is
+  likely to provide the missing information and silence would cause wrong
+  action or pointless waiting. Smart traffic that someone already answered is
+  explicitly not supplemented.
 - Run non-repair native Task status reconciliation against a stable isolated
   SQLite snapshot, so dry-run cannot initialize, migrate, backfill, or create
   WAL sidecars in the live Core database. Explicit `--repair-status` remains

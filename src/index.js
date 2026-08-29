@@ -97,6 +97,7 @@ import {
 import { normalizeInboundMessageEvent } from './lib/inbound-message-event.js';
 import { decideGroupActivation } from './lib/group-activation-policy.js';
 import { decideGroupAccess } from './lib/group-access-policy.js';
+import { buildSmartModePrompt } from './lib/smart-mode-prompt.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -1614,14 +1615,7 @@ function formatMessage(
   }
 
   if (smartHint) {
-    parts.push(`<smart-mode>
-Decide whether to respond. Do NOT reply if: the message is unrelated to you,
-just casual chat, or doesn't need your input. Only reply when:
-1) someone asks a question you can help with,
-2) discussing technical topics you know well,
-3) someone clearly needs assistance.
-When uncertain, prefer NOT to reply. Reply with exactly [SKIP] to stay silent.
-</smart-mode>\n\n`);
+    parts.push(buildSmartModePrompt());
   }
 
   parts.push(`<current-message>\n${safeText}\n</current-message>`);
