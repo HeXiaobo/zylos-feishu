@@ -376,6 +376,8 @@ test('uses a completion fallback for empty answers and preserves failure summari
     });
     finalCard = JSON.parse(failed.calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
     assert.equal(finalCard.config.summary.content, '⚠️ 本次处理未完成，可重试');
+    assert.match(cardElement(finalCard, 'zylos_answer').content, /请重新发送/);
+    assert.doesNotMatch(cardElement(finalCard, 'zylos_answer').content, /没有可显示的回答/);
   });
 }));
 
@@ -1026,9 +1028,23 @@ test('canonical Core completion corrects an earlier local failure in plain-text 
   });
   assert.deepEqual(texts, [
     '已接收，正在处理…',
-    '⚠️ 本次处理未完成，可重试',
+    '⚠️ 本次回复未生成，请重新发送。',
     'Core 的纯文本最终答案',
   ]);
+}));
+
+test('renders an explicit retry instruction for a compatibility failure instead of an empty answer card', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+
+  await stream.fail({ requestId: 'assistant.feishu.om_1', retryable: true });
+
+  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(terminalCard.config.summary.content, '⚠️ 本次处理未完成，可重试');
+  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 本次处理未完成，可重试');
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
+  assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
 }));
 
 test('legacy compatibility completion cannot overwrite an existing terminal result', () => withState(async stateDirectory => {

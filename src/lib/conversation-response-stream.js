@@ -15,6 +15,8 @@ const DEFAULT_ANSWER_BYTES_PER_CARD = 12_000;
 const MAX_CHAT_LIST_SUMMARY_BYTES = 120;
 const SUMMARY_ELLIPSIS = '…';
 const DEFAULT_THROTTLE_MS = 250;
+const RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请重新发送。';
+const NON_RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请稍后再试。';
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 120_000;
@@ -220,6 +222,12 @@ function terminalChatListSummary(state) {
     : state.phase;
 }
 
+function failureAnswer(phase) {
+  return typeof phase === 'string' && phase.includes('可重试')
+    ? RETRYABLE_FAILURE_ANSWER
+    : NON_RETRYABLE_FAILURE_ANSWER;
+}
+
 function publicProgressText(payload) {
   const actionText = PUBLIC_ACTION_PROGRESS[payload?.action]?.[payload?.status];
   return actionText || SAFE_PROGRESS[payload?.stage] || null;
@@ -350,7 +358,9 @@ function renderCard({
         {
           tag: 'markdown',
           element_id: ANSWER_ELEMENT_ID,
-          content: `${answer || (running ? '_等待回答…_' : '_没有可显示的回答_')}${continuation}`,
+          content: `${answer || (running
+            ? '_等待回答…_'
+            : (phase?.startsWith('⚠️') ? failureAnswer(phase) : '_没有可显示的回答_'))}${continuation}`,
         },
       ],
     },
@@ -676,7 +686,7 @@ export function createConversationResponseStream({
       if (terminal && state.plainTerminalFingerprint !== terminalFingerprint) {
         const text = state.status === 'completed'
           ? (state.output || '处理完成。')
-          : state.phase;
+          : failureAnswer(state.phase);
         await sendPlain(
           client,
           state.target,
