@@ -196,6 +196,103 @@ function parseMessageContent(content, msgType) {
   }
 }
 
+// Keep the read-back contract in one place. `user_card_content` is required
+// for Schema 2.0 cards; without it Feishu may return only the client-upgrade
+// placeholder instead of the card's original body.
+export const MESSAGE_GET_PARAMS = Object.freeze({
+  user_id_type: 'open_id',
+  card_msg_content_type: 'user_card_content',
+});
+
+function normalizeMessageReadOptions(options = {}) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError('message read options must be an object');
+  }
+  return {
+    client: options.client,
+    request: options.request || axios,
+    getToken: options.getToken || getAccessToken,
+  };
+}
+
+function normalizeMessageId(messageId) {
+  if (typeof messageId !== 'string' || messageId.trim() === '') {
+    throw new TypeError('messageId must be a non-empty string');
+  }
+  return messageId.trim();
+}
+
+async function readMessage(messageId, options = {}) {
+  const id = normalizeMessageId(messageId);
+  const { client, request, getToken } = normalizeMessageReadOptions(options);
+  if (client) {
+    if (typeof client.im?.message?.get !== 'function') {
+      throw new TypeError('client.im.message.get must be a function');
+    }
+    return client.im.message.get({
+      path: { message_id: id },
+      params: MESSAGE_GET_PARAMS,
+    });
+  }
+
+  const token = await getToken();
+  const params = new URLSearchParams(MESSAGE_GET_PARAMS);
+  return request({
+    method: 'GET',
+    url: `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(id)}?${params}`,
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 30000,
+    proxy: getProxyConfig(),
+  });
+}
+
+function apiResponse(response, fromHttpRequest) {
+  return fromHttpRequest ? (response?.data ?? response) : response;
+}
+
+function parseMessageBody(raw, messageId) {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  if (typeof raw !== 'string' || raw.trim() === '') {
+    throw new Error(`message ${messageId} has no readable body content`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`message ${messageId} body content is not valid JSON`, { cause: error });
+  }
+}
+
+/**
+ * Read the original content of an interactive card.
+ *
+ * The optional request/getToken hooks are a test seam. Production passes the
+ * configured SDK client so Feishu/Lark domain selection stays centralized.
+ */
+export async function getInteractiveCardContent(messageId, options = {}) {
+  const id = normalizeMessageId(messageId);
+  const normalized = normalizeMessageReadOptions(options);
+  try {
+    const response = await readMessage(id, normalized);
+    const body = apiResponse(response, !normalized.client);
+    const item = body?.code === 0 ? body.data?.items?.[0] : null;
+    if (!item) {
+      return {
+        success: false,
+        message: `API error: ${body?.msg || 'interactive card content unavailable'}`,
+        ...(body?.code === undefined ? {} : { code: body.code }),
+      };
+    }
+    return {
+      success: true,
+      content: parseMessageBody(item.body?.content ?? item.content, id),
+      mentions: item.mentions || [],
+    };
+  } catch (error) {
+    console.error(`[feishu] getInteractiveCardContent error for ${id}: ${error.message}`);
+    return { success: false, message: error.message };
+  }
+}
+
 /**
  * Download image from Feishu message
  */

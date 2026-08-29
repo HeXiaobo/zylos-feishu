@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Re-read interactive-card messages through the public Feishu message API with
+  `card_msg_content_type=user_card_content`, so Schema 2.0 markdown is
+  available to the existing card extractor. Read failures now remain explicit
+  instead of silently treating a card as empty. Existing merge-forward depth
+  and resource-download safeguards are unchanged.
+
 ## [0.3.7-rc.9] - 2026-08-28
 
 ### Fixed
