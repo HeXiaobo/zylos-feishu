@@ -12,6 +12,7 @@ import dotenv from 'dotenv';
 import { getCredentials } from '../src/lib/config.js';
 import { auditNativeTaskConservation } from '../src/lib/native-task-conservation-gate.js';
 import { createSdkNativeTaskConservationReader } from '../src/lib/native-task-conservation-remote.js';
+import { resolveTaskV2DeploymentIdentity } from '../src/lib/task-v2-deployment-identity.js';
 
 const ERROR_SCHEMA = 'zylos.native-task-conservation-gate/error-v1';
 const SILENT_SDK_LOGGER = Object.freeze({
@@ -102,21 +103,17 @@ function readCoreInventory(parsed, stdin) {
 
 function deploymentFromEnv(env) {
   const agentId = requireText(env.ZYLOS_AGENT_ID, 'ZYLOS_AGENT_ID');
-  const appId = requireText(env.FEISHU_APP_ID, 'FEISHU_APP_ID');
   if (
     env.C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID
     && env.C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID.trim() !== agentId
   ) {
     throw new TypeError('C4 WorkIntake default assignee must equal ZYLOS_AGENT_ID');
   }
-  const agentAppIds = parseJson(
-    requireText(env.FEISHU_TASK_V2_AGENT_APP_IDS, 'FEISHU_TASK_V2_AGENT_APP_IDS'),
-    'FEISHU_TASK_V2_AGENT_APP_IDS',
-  );
-  if (!agentAppIds || typeof agentAppIds !== 'object' || Array.isArray(agentAppIds)) {
-    throw new TypeError('FEISHU_TASK_V2_AGENT_APP_IDS must be a JSON object');
-  }
-  return { agentId, appId, agentAppIds };
+  return resolveTaskV2DeploymentIdentity({
+    agentId,
+    appId: env.FEISHU_APP_ID,
+    rawAgentAppIds: env.FEISHU_TASK_V2_AGENT_APP_IDS,
+  });
 }
 
 /** Construct a gate-only SDK client without polluting the JSON stdout contract. */

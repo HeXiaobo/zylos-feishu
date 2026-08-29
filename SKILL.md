@@ -193,8 +193,10 @@ FEISHU_TASK_V2_AGENT_APP_IDS='{"agent:another-agent":"cli_other_app"}'
 ```
 
 `ZYLOS_AGENT_ID` maps the current deployment's logical Agent to
-`FEISHU_APP_ID`. `FEISHU_TASK_V2_AGENT_APP_IDS` supplies any additional App
-identities, and `ZYLOS_AGENT_LABELS` controls colleague-facing card names.
+`FEISHU_APP_ID`. When `FEISHU_TASK_V2_AGENT_APP_IDS` is absent, the runtime
+derives exactly that one mapping. An explicit mapping remains mandatory for
+additional Agent identities and must map the current Agent back to the current
+App exactly. `ZYLOS_AGENT_LABELS` controls colleague-facing card names.
 Unknown logical Agents fail closed in Task v2 projection; missing labels fall
 back to a readable generic AI-employee label.
 
