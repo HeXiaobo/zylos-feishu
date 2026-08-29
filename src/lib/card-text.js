@@ -166,3 +166,58 @@ export function extractInteractiveText(content) {
   } catch { /* unable to stringify */ }
   return '[interactive message]';
 }
+
+/**
+ * Collect image resources referenced by an interactive card.
+ *
+ * This intentionally has the same bounds as the text walker. Card content is
+ * normally JSON, but the cycle guard also keeps this public helper safe when a
+ * caller supplies an object assembled in memory. Keys are returned in first-seen
+ * order and duplicates are removed before the existing message download path
+ * uses the outer message id.
+ *
+ * @param {object} content parsed card content
+ * @returns {string[]} image keys in card traversal order
+ */
+export function extractInteractiveImageKeys(content) {
+  const imageKeys = [];
+  const seenKeys = new Set();
+  const seenObjects = new Set();
+  let nodesVisited = 0;
+
+  const walk = (value, depth) => {
+    if (!value || typeof value !== 'object' || seenObjects.has(value)) return;
+    if (depth > MAX_CARD_WALK_DEPTH || nodesVisited >= MAX_CARD_WALK_NODES) return;
+    seenObjects.add(value);
+    nodesVisited += 1;
+
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, depth + 1);
+      return;
+    }
+
+    if (value.tag === 'img') {
+      const imageKey = value.image_key
+        || value.img_key
+        || value.img?.image_key
+        || value.img?.img_key
+        || value.image?.image_key
+        || value.image?.img_key;
+      if (imageKey && !seenKeys.has(imageKey)) {
+        seenKeys.add(imageKey);
+        imageKeys.push(imageKey);
+      }
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'user_dsl' && typeof child === 'string') {
+        try { walk(JSON.parse(child), depth + 1); } catch { /* text walker handles malformed DSL */ }
+      } else {
+        walk(child, depth + 1);
+      }
+    }
+  };
+
+  walk(content, 0);
+  return imageKeys;
+}

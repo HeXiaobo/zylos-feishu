@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { extractInteractiveText } from '../src/lib/card-text.js';
+import {
+  extractInteractiveImageKeys,
+  extractInteractiveText,
+} from '../src/lib/card-text.js';
 
 // Regression: a div/field-layout card (e.g. an approval / "折扣申请" application
 // card) read back with only "[card] <title>". Its text lives in the `div`
@@ -110,4 +113,38 @@ test('a wide card with thousands of siblings is bounded by the node cap', () => 
   assert.doesNotThrow(() => { out = extractInteractiveText(card); });
   assert.equal(typeof out, 'string');
   assert.ok(out.length > 0, 'gathered the first (capped) batch of text');
+});
+
+test('interactive image keys are collected from card and user_dsl shapes, deduplicated', () => {
+  const card = {
+    user_dsl: JSON.stringify({ body: { elements: [
+      { tag: 'img', image_key: 'img_dsl' },
+      { tag: 'img', image_key: 'img_shared' },
+    ] } }),
+    body: { elements: [
+      { tag: 'img', img: { image_key: 'img_shared' } },
+      { tag: 'img', image_key: 'img_body' },
+    ] },
+  };
+
+  assert.deepEqual(extractInteractiveImageKeys(card), [
+    'img_dsl',
+    'img_shared',
+    'img_body',
+  ]);
+});
+
+test('interactive image key walk is bounded and cycle-safe', () => {
+  const root = { tag: 'column_set', columns: [] };
+  let current = root;
+  for (let i = 0; i < 200; i++) {
+    const next = { tag: 'column_set', columns: [] };
+    current.columns.push({ elements: [next] });
+    current = next;
+  }
+  current.columns.push({ elements: [{ tag: 'img', image_key: 'too_deep' }] });
+  root.self = root;
+
+  assert.doesNotThrow(() => extractInteractiveImageKeys(root));
+  assert.deepEqual(extractInteractiveImageKeys(root), []);
 });

@@ -26,11 +26,22 @@ import {
   getCredentials,
   stopWatching,
 } from './lib/config.js';
-import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages } from './lib/message.js';
+import {
+  downloadImage,
+  downloadFile,
+  sendMessage,
+  replyToMessage,
+  extractPermissionError,
+  addReaction,
+  removeReaction,
+  listMessages,
+  MESSAGE_GET_PARAMS,
+  getInteractiveCardContent,
+} from './lib/message.js';
 import { getUserInfo } from './lib/contact.js';
 import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
-import { extractInteractiveText } from './lib/card-text.js';
+import { extractInteractiveImageKeys, extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { createTaskActionContextSigner } from './lib/task-action-context.js';
 import { getClient } from './lib/client.js';
@@ -1427,21 +1438,6 @@ async function handleWorkIntakeResult(response, {
   });
 }
 
-// Params shared by every `im.message.get` call.
-//
-// user_id_type: 'open_id' — NOT 'user_id'. This app holds no user_id-class
-//   scope (`contact:user.employee_id:readonly`), which Feishu documents as the
-//   gate on the `user_id` field of this endpoint's response, so asking for
-//   user_id yields nothing to resolve a name from. It also matches the id
-//   namespace used everywhere else here: inbound events carry
-//   `sender_id.user_id = null`, and preloadGroupMembers seeds the name cache
-//   with open_ids (listChatMembers defaults to member_id_type 'open_id').
-// card_msg_content_type: request the ORIGINAL Schema 2.0 card JSON (with
-//   body.elements) for interactive/card messages; without it the API returns
-//   the transformed form whose top-level elements[] has dropped the markdown
-//   body, and a card degrades to the generic "[interactive message]".
-const MESSAGE_GET_PARAMS = { user_id_type: 'open_id', card_msg_content_type: 'user_card_content' };
-
 /**
  * Parse the msg_type/body.content of a single Feishu message item (as returned
  * by `im.message.get`) into display text, resolving mentions if present.
@@ -1708,7 +1704,7 @@ function extractPostText(paragraphs, messageId) {
 
 // Extract content from Feishu message
 // Returns imageKeys as array (all images from post messages, or single image)
-function extractMessageContent(message) {
+async function extractMessageContent(message) {
   const msgType = message.message_type;
   let content;
   try {
@@ -1739,8 +1735,34 @@ function extractMessageContent(message) {
       return { text: `[media: ${content.file_name || 'video'}, file_key: ${content.file_key || 'unknown'}, msg_id: ${message.message_id}]`, imageKeys: [], fileKey: null, fileName: null };
     case 'sticker':
       return { text: `[sticker, file_key: ${content.file_key || 'unknown'}]`, imageKeys: [], fileKey: null, fileName: null };
-    case 'interactive':
-      return { text: extractInteractiveText(content), imageKeys: [], fileKey: null, fileName: null };
+    case 'interactive': {
+      // The event body may contain only Feishu's rendered/placeholder card.
+      // Read the original card after the access gate has passed, requesting
+      // user_card_content so Schema 2.0 markdown is retained.
+      let card;
+      try {
+        // Reuse the configured SDK client so this follows the app's selected
+        // Feishu/Lark domain and proxy instead of forcing the raw HTTP default.
+        card = await getInteractiveCardContent(message.message_id, { client: getClient() });
+      } catch (error) {
+        console.error(`[feishu] interactive card read-back failed: ${error.message}`);
+        card = { success: false };
+      }
+      if (!card.success) {
+        return {
+          text: '[interactive card - content fetch failed]',
+          imageKeys: [],
+          fileKey: null,
+          fileName: null,
+        };
+      }
+      return {
+        text: extractInteractiveText(card.content),
+        imageKeys: extractInteractiveImageKeys(card.content),
+        fileKey: null,
+        fileName: null,
+      };
+    }
     case 'merge_forward':
       // Deliberately no remote fetch here. The caller resolves
       // deferredMergeForwardId via resolveMergeForwardText() only after the
@@ -1923,7 +1945,7 @@ async function handleMessage(data) {
     }
   }
 
-  const extracted = extractMessageContent(message);
+  const extracted = await extractMessageContent(message);
   let { text } = extracted;
   const { imageKeys, fileKey, fileName } = extracted;
   const explicitTaskText = resolveMentions(text, mentions, {
@@ -1934,9 +1956,6 @@ async function handleMessage(data) {
     messageType: message.message_type,
     text: explicitTaskText,
   });
-  // A pending merge_forward has no text yet (deliberately not fetched until the
-  // DM/group access gate passes below) — log a fixed marker instead of real
-  // content from a sender/chat that may end up rejected anyway.
   const messagePreview = extracted.deferredMergeForwardId
     ? '[merge_forward, pending access check]'
     : hasExplicitTaskProtocol
