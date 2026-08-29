@@ -246,6 +246,101 @@ test('phase events stay visible while running and disappear when completion supp
   assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
 }));
 
+test('recovers a queued stream after the configured timeout with an honest retry terminal', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let now = 1_000;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    clock: () => now,
+    throttleMs: 0,
+    queuedTimeoutMs: 1_000,
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunQueued')],
+  });
+
+  now = 2_001;
+  const timedOut = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [],
+  });
+
+  assert.equal(timedOut.status, 'failed');
+  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 排队超时，请重试');
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
+  assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
+}));
+
+test('does not expire queued work that starts before the timeout boundary', () => withState(async stateDirectory => {
+  const { client } = createClient();
+  let now = 1_000;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    clock: () => now,
+    throttleMs: 0,
+    queuedTimeoutMs: 1_000,
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunQueued')],
+  });
+  now = 1_999;
+  const started = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(2, 'RunStarted')],
+  });
+  assert.equal(started.status, 'started');
+
+  now = 10_000;
+  const stillRunning = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [],
+  });
+  assert.equal(stillRunning.replayed, true);
+  assert.equal(stillRunning.status, 'started');
+}));
+
+test('allows canonical completion to repair a queued-timeout compatibility terminal', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let now = 1_000;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    clock: () => now,
+    throttleMs: 0,
+    queuedTimeoutMs: 1_000,
+    logger: { warn() {} },
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunQueued')],
+  });
+  now = 2_001;
+  await stream.apply({ requestId: 'assistant.feishu.om_1', events: [] });
+  const completed = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(2, 'RunStarted'),
+      event(3, 'RunCompleted', { output: '延迟到达的真实答案' }),
+    ],
+  });
+
+  assert.equal(completed.status, 'completed');
+  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(finalCard, 'zylos_answer').content, '延迟到达的真实答案');
+  assert.doesNotMatch(JSON.stringify(finalCard), /排队超时/);
+}));
+
 test('keeps one current status collapsed above the streaming answer without numbered boilerplate', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
@@ -919,7 +1014,7 @@ test('keeps the sent placeholder and repairs CardKit conversion without sending 
   assert.equal(calls.filter(([name]) => name === 'update').length, 1);
 }));
 
-test('defers compatibility completion when placeholder repair still fails instead of sending another card', () => withState(async stateDirectory => {
+test('repairs compatibility completion through the existing placeholder when CardKit conversion fails', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   client.cardkit.v1.card.idConvert = async payload => {
     calls.push(['convert', payload]);
@@ -940,9 +1035,35 @@ test('defers compatibility completion when placeholder repair still fails instea
   });
 
   assert.equal(completed.handled, true);
-  assert.equal(completed.pending, true);
+  assert.equal(completed.pending, undefined);
   assert.equal(calls.filter(([name]) => name === 'send').length, 1);
-  assert.equal(calls.filter(([name]) => name === 'update').length, 0);
+  assert.equal(calls.filter(([name]) => name === 'patch').length, 2);
+  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '等待可靠事件投影的答案');
+}));
+
+test('projects an explicit failure notice when C4 rejects while CardKit conversion fails', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  client.cardkit.v1.card.idConvert = async payload => {
+    calls.push(['convert', payload]);
+    throw new Error('conversion transport remains unavailable');
+  };
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    logger: { warn() {} },
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  const failed = await stream.fail({ requestId: 'assistant.feishu.om_1', retryable: true });
+
+  assert.equal(failed.handled, true);
+  assert.equal(failed.pending, undefined);
+  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 本次处理未完成，可重试');
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
+  assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
 }));
 
 test('legacy full-answer completion finalizes the existing card and durable terminal replay is a no-op', () => withState(async stateDirectory => {
@@ -1045,6 +1166,39 @@ test('renders an explicit retry instruction for a compatibility failure instead 
   assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 本次处理未完成，可重试');
   assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
   assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
+}));
+
+test('retries a deferred terminal projection after both CardKit conversion and patch fail', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let patchFailures = 1;
+  client.cardkit.v1.card.idConvert = async payload => {
+    calls.push(['convert', payload]);
+    throw new Error('conversion transport remains unavailable');
+  };
+  client.im.v1.message.patch = async payload => {
+    calls.push(['patch', payload]);
+    if (patchFailures > 0) {
+      patchFailures -= 1;
+      throw new Error('patch transport remains unavailable');
+    }
+    return { code: 0 };
+  };
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    logger: { warn() {} },
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  const deferred = await stream.fail({ requestId: 'assistant.feishu.om_1', retryable: true });
+  assert.equal(deferred.pending, true);
+
+  const repaired = await stream.apply({ requestId: 'assistant.feishu.om_1', events: [] });
+  assert.equal(repaired.repaired, true);
+  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 本次处理未完成，可重试');
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
 }));
 
 test('legacy compatibility completion cannot overwrite an existing terminal result', () => withState(async stateDirectory => {

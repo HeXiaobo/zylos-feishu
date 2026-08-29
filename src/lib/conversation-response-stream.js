@@ -12,11 +12,13 @@ const MAX_PUBLIC_REASONING_BYTES = 12_000;
 const MAX_REASONING_DELTA_BYTES = 64 * 1024;
 const MAX_CARD_BYTES = 30_000;
 const DEFAULT_ANSWER_BYTES_PER_CARD = 12_000;
+const DEFAULT_QUEUED_TIMEOUT_MS = 60_000;
 const MAX_CHAT_LIST_SUMMARY_BYTES = 120;
 const SUMMARY_ELLIPSIS = '…';
 const DEFAULT_THROTTLE_MS = 250;
 const RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请重新发送。';
 const NON_RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请稍后再试。';
+const QUEUED_TIMEOUT_PHASE = '⚠️ 排队超时，请重试';
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 120_000;
@@ -223,7 +225,7 @@ function terminalChatListSummary(state) {
 }
 
 function failureAnswer(phase) {
-  return typeof phase === 'string' && phase.includes('可重试')
+  return typeof phase === 'string' && (phase.includes('可重试') || phase.includes('请重试'))
     ? RETRYABLE_FAILURE_ANSWER
     : NON_RETRYABLE_FAILURE_ANSWER;
 }
@@ -476,6 +478,7 @@ export function createConversationResponseStream({
   pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
   throttleMs = DEFAULT_THROTTLE_MS,
   answerBytesPerCard = DEFAULT_ANSWER_BYTES_PER_CARD,
+  queuedTimeoutMs = DEFAULT_QUEUED_TIMEOUT_MS,
   processDisplay = 'collapsible',
   logger = console,
 } = {}) {
@@ -486,6 +489,9 @@ export function createConversationResponseStream({
   if (!Number.isSafeInteger(throttleMs) || throttleMs < 0) throw new TypeError('throttleMs is invalid');
   if (!Number.isSafeInteger(answerBytesPerCard) || answerBytesPerCard < 256) {
     throw new TypeError('answerBytesPerCard is invalid');
+  }
+  if (!Number.isSafeInteger(queuedTimeoutMs) || queuedTimeoutMs < 1) {
+    throw new TypeError('queuedTimeoutMs is invalid');
   }
   if (!PROCESS_DISPLAYS.has(processDisplay)) throw new TypeError('processDisplay is invalid');
 
@@ -502,7 +508,14 @@ export function createConversationResponseStream({
     state.outputHash = outputHash(terminalOutput);
     state.terminalTombstone = true;
     state.terminalAt = clock();
+    if (state.status === 'failed' && terminalOutput === '') {
+      logger.warn?.('Terminal failed state with empty output', {
+        requestId: state.requestId,
+        phase: state.phase,
+      });
+    }
     clearTransientProcess(state);
+    delete state.queuedAt;
     delete state.output;
     for (const card of state.cards) delete card.rendered;
   }
@@ -569,10 +582,19 @@ export function createConversationResponseStream({
     }), 'Feishu ordinary response card patch');
   }
 
-  async function settleInitialCardMode(state) {
+  async function settleInitialCardMode(state, { fallbackOnConversionError = false } = {}) {
     if (state.mode !== 'conversion_pending') return;
     const [initial] = state.cards;
-    const cardId = await convertCard(initial.messageId);
+    let cardId = null;
+    try {
+      cardId = await convertCard(initial.messageId);
+    } catch (error) {
+      logger.warn?.('CardKit placeholder conversion failed; attempting ordinary-card patch', {
+        requestId: state.requestId,
+        error: error.message,
+      });
+      if (!fallbackOnConversionError) throw error;
+    }
     if (cardId) {
       initial.cardId = cardId;
       state.mode = 'cardkit';
@@ -743,11 +765,21 @@ export function createConversationResponseStream({
       throw error;
     }
     try {
-      await settleInitialCardMode(state);
+      await settleInitialCardMode(state, { fallbackOnConversionError: true });
     } catch (error) {
       // The Core completion event is persisted after this compatibility call.
-      // Defer projection to that reliable delivery path instead of making the
-      // caller send a second answer card and orphaning the accepted placeholder.
+      // Keep the local terminal durable without sending a second card whose
+      // relationship to the accepted placeholder is unknown. The reliable
+      // event path can still repair the same placeholder later.
+      state.output = output;
+      state.status = status;
+      state.phase = phase;
+      clearTransientProcess(state);
+      state.compatibilityTerminal = true;
+      state.durableOutput = output;
+      compactTerminalState(state);
+      state.terminalProjectionPending = true;
+      save(state);
       logger.warn?.('Response placeholder repair deferred to durable event delivery', {
         requestId,
         error: error.message,
@@ -1087,18 +1119,47 @@ export function createConversationResponseStream({
       const request = requireRecord(input, 'apply response events request');
       requireExactFields(request, ['requestId', 'events'], 'apply response events request');
       const requestId = requireText(request.requestId, 'requestId');
-      if (!Array.isArray(request.events) || request.events.length === 0) {
-        throw new TypeError('events must be a non-empty array');
+      if (!Array.isArray(request.events)) {
+        throw new TypeError('events must be an array');
       }
       const release = await acquireRequestLock(requestId);
       try {
         const state = load(requestId);
         if (!state) return { handled: false, reason: 'stream_not_found' };
         if (state.mode === 'delivery_pending') await finishOpening(state);
-        await settleInitialCardMode(state);
+        let projectionError = null;
+        try {
+          await settleInitialCardMode(state, { fallbackOnConversionError: true });
+        } catch (error) {
+          projectionError = error;
+          logger.warn?.('Response placeholder projection is unavailable', {
+            requestId,
+            error: error.message,
+          });
+        }
         const events = request.events
           .map(event => validateEvent(event, requestId))
           .sort((left, right) => left.sequence - right.sequence);
+        if (
+          !projectionError
+          && request.events.length === 0
+          && state.terminalProjectionPending
+          && ['completed', 'failed'].includes(state.status)
+        ) {
+          state.output = state.durableOutput || '';
+          delete state.durableOutput;
+          delete state.terminalProjectionPending;
+          await render(state, { terminal: true, purpose: 'terminal-repair' });
+          compactTerminalState(state);
+          save(state);
+          return {
+            handled: true,
+            replayed: false,
+            repaired: true,
+            status: state.status,
+            parts: state.cards.length || 1,
+          };
+        }
         if (state.terminalTombstone && !state.compatibilityTerminal) {
           if (events.every(event => event.sequence <= state.lastEventSequence)) {
             return { handled: true, replayed: true, status: state.status };
@@ -1184,6 +1245,66 @@ export function createConversationResponseStream({
           }
           state.lastEventSequence = event.sequence;
           changed = true;
+          if (event.type === 'RunQueued' && !Number.isSafeInteger(state.queuedAt)) {
+            state.queuedAt = clock();
+          }
+          if (event.type === 'RunStarted') delete state.queuedAt;
+        }
+        if (state.status === 'queued' && !Number.isSafeInteger(state.queuedAt)) {
+          state.queuedAt = clock();
+          changed = true;
+        }
+        const queuedElapsed = state.status === 'queued'
+          ? clock() - state.queuedAt
+          : 0;
+        const queuedTimedOut = state.status === 'queued' && queuedElapsed >= queuedTimeoutMs;
+        if (queuedTimedOut) {
+          logger.warn?.('Queued response stream timed out; projecting a retry terminal', {
+            requestId,
+            queuedElapsed,
+            queuedTimeoutMs,
+          });
+          state.output = '';
+          state.status = 'failed';
+          state.phase = QUEUED_TIMEOUT_PHASE;
+          clearTransientProcess(state);
+          state.compatibilityTerminal = true;
+          if (projectionError) {
+            compactTerminalState(state);
+            state.terminalProjectionPending = true;
+            save(state);
+            return {
+              handled: true,
+              pending: true,
+              replayed: false,
+              status: state.status,
+              reason: 'queued_timeout',
+            };
+          }
+          await render(state, { terminal: true, purpose: 'queued-timeout' });
+          compactTerminalState(state);
+          save(state);
+          return {
+            handled: true,
+            replayed: false,
+            status: state.status,
+            reason: 'queued_timeout',
+            parts: state.cards.length || 1,
+          };
+        }
+        if (projectionError) {
+          if (terminal) {
+            state.durableOutput = state.output || '';
+            compactTerminalState(state);
+            state.terminalProjectionPending = true;
+          }
+          save(state);
+          return {
+            handled: true,
+            pending: true,
+            replayed: false,
+            status: state.status,
+          };
         }
         if (!changed) return { handled: true, replayed: true, status: state.status };
 
@@ -1200,10 +1321,12 @@ export function createConversationResponseStream({
           state.compatibilityTerminal = false;
           delete state.durableOutput;
           if (sameTerminal) {
+            delete state.terminalProjectionPending;
             save(state);
             return { handled: true, replayed: false, status: state.status };
           }
           state.output = canonicalOutput;
+          delete state.terminalProjectionPending;
           state.terminalTombstone = false;
           delete state.outputHash;
           delete state.terminalAt;
