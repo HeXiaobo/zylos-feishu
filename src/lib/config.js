@@ -63,7 +63,8 @@ export const DEFAULT_CONFIG = {
   message: {
     context_messages: 10,
     useMarkdownCard: true,
-    streamProcessDisplay: 'collapsible'
+    streamProcessDisplay: 'collapsible',
+    responseStreamQueuedTimeoutMs: 60_000,
   }
 };
 
@@ -139,6 +140,13 @@ export function getStreamProcessDisplay(value = getConfig()) {
   return ['collapsible', 'answer_only'].includes(configured)
     ? configured
     : DEFAULT_CONFIG.message.streamProcessDisplay;
+}
+
+export function getResponseStreamQueuedTimeoutMs(value = getConfig()) {
+  const configured = value?.message?.responseStreamQueuedTimeoutMs;
+  return Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_CONFIG.message.responseStreamQueuedTimeoutMs;
 }
 
 /**
