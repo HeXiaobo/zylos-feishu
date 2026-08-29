@@ -85,6 +85,42 @@ test('runs the read-only gate from a Core inventory file using deployment env id
   assert.equal(captures, 2);
 });
 
+test('runs the gate with an exact derived single-Agent mapping', async (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'native-task-conservation-derived-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const inventoryPath = path.join(directory, 'core.json');
+  writeFileSync(inventoryPath, JSON.stringify({
+    schema: 'zylos.native-task-core-inventory/v1',
+    capturedAt: '2026-08-27T03:00:00.000Z',
+    snapshot: {
+      stable: true,
+      strategy: 'double-read-fingerprint',
+      fingerprint: 'b'.repeat(64),
+    },
+    identity: { agentId: AGENT_ID },
+    tasks: [],
+    externalLinks: [],
+  }));
+
+  const report = await runNativeTaskConservationGate({
+    args: ['--core-inventory-file', inventoryPath, '--timeout-ms', '5000'],
+    env: {
+      ZYLOS_AGENT_ID: AGENT_ID,
+      FEISHU_APP_ID: APP_ID,
+      C4_WORK_INTAKE_DEFAULT_ASSIGNEE_ID: AGENT_ID,
+    },
+    createReader() {
+      return {
+        async capture() {
+          return { identity: { kind: 'app', appId: APP_ID }, tasks: [] };
+        },
+      };
+    },
+  });
+
+  assert.equal(report.passed, true);
+});
+
 test('rejects ambiguous inventory sources and a default assignee identity mismatch', async () => {
   await assert.rejects(
     runNativeTaskConservationGate({

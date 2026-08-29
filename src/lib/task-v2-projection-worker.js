@@ -25,6 +25,7 @@ import {
   createTaskV2StatusReconciler,
 } from './task-v2-status-event.js';
 import { isTaskV2Enabled } from './task-v2-runtime-policy.js';
+import { resolveTaskV2DeploymentIdentity } from './task-v2-deployment-identity.js';
 
 const REGISTRATION_ACTOR = 'commitment-feishu-task-v2-projection';
 const DEFAULTS = Object.freeze({
@@ -60,16 +61,6 @@ function throwIfAborted(signal) {
 function envInteger(value, fallback, field) {
   if (value === undefined || value === '') return fallback;
   return requirePositiveInteger(Number(value), field);
-}
-
-function parseAgentAppIds(rawValue) {
-  if (rawValue === undefined || rawValue === '') return {};
-  let parsed;
-  try { parsed = JSON.parse(rawValue); } catch { throw new TypeError('FEISHU_TASK_V2_AGENT_APP_IDS must be JSON'); }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new TypeError('FEISHU_TASK_V2_AGENT_APP_IDS must be a JSON object');
-  }
-  return parsed;
 }
 
 function sleep(intervalMs, signal) {
@@ -123,15 +114,20 @@ export async function loadCommitmentProjectionDependencies({
 }
 
 export function createTaskV2ProjectionRuntime({ env = process.env, client, statusInbox } = {}) {
-  const appId = requireText(env.FEISHU_APP_ID, 'FEISHU_APP_ID');
+  const identity = resolveTaskV2DeploymentIdentity({
+    agentId: env.ZYLOS_AGENT_ID,
+    appId: env.FEISHU_APP_ID,
+    rawAgentAppIds: env.FEISHU_TASK_V2_AGENT_APP_IDS,
+  });
+  const { appId } = identity;
   const zylosDir = env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
   return Object.freeze({
     appId,
     gateway: createSdkTaskV2Gateway({ client: client ?? getClient() }),
     memberMapper: createTaskV2MemberMapper({
       appId,
-      agentId: env.ZYLOS_AGENT_ID?.trim() || null,
-      agentAppIds: parseAgentAppIds(env.FEISHU_TASK_V2_AGENT_APP_IDS),
+      agentId: identity.agentId,
+      agentAppIds: identity.agentAppIds,
       requireGatewayAppAssignee: true,
     }),
     statusInbox: statusInbox ?? createTaskV2StatusInbox({

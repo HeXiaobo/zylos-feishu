@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   available to the existing card extractor. Read failures now remain explicit
   instead of silently treating a card as empty. Existing merge-forward depth
   and resource-download safeguards are unchanged.
+- Derive the current deployment's one exact Agent-to-App mapping from
+  `ZYLOS_AGENT_ID` and `FEISHU_APP_ID` when no additional mapping object is
+  configured, while continuing to fail closed on malformed or conflicting
+  explicit mappings. Projection, conservation, and legacy-adoption gates now
+  share this identity contract.
 
 ## [0.3.7-rc.9] - 2026-08-28
 

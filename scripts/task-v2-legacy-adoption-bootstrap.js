@@ -20,6 +20,7 @@ import {
   createTaskV2LegacyAdoptionBootstrap,
   parseTaskV2LegacyAdoptionBootstrapManifest,
 } from '../src/lib/task-v2-legacy-adoption-bootstrap.js';
+import { resolveTaskV2DeploymentIdentity } from '../src/lib/task-v2-deployment-identity.js';
 
 const ERROR_SCHEMA = 'zylos.feishu-task-v2-legacy-adoption-run/error-v1';
 const SILENT_SDK_LOGGER = Object.freeze({
@@ -106,24 +107,15 @@ export function createBootstrapSdkClient() {
 }
 
 function gateDeployment(env, appId) {
-  const agentId = requireText(env.ZYLOS_AGENT_ID, 'ZYLOS_AGENT_ID');
-  const rawMappings = requireText(
-    env.FEISHU_TASK_V2_AGENT_APP_IDS,
-    'FEISHU_TASK_V2_AGENT_APP_IDS',
-  );
-  let agentAppIds;
   try {
-    agentAppIds = JSON.parse(rawMappings);
+    return resolveTaskV2DeploymentIdentity({
+      agentId: env.ZYLOS_AGENT_ID,
+      appId,
+      rawAgentAppIds: env.FEISHU_TASK_V2_AGENT_APP_IDS,
+    });
   } catch (error) {
-    throw cliError('FEISHU_TASK_V2_AGENT_APP_IDS is not valid JSON', 'GATE_INPUT_INVALID', error);
+    throw cliError(error.message, 'GATE_INPUT_INVALID', error);
   }
-  if (!agentAppIds || typeof agentAppIds !== 'object' || Array.isArray(agentAppIds)) {
-    throw cliError('FEISHU_TASK_V2_AGENT_APP_IDS must be a JSON object', 'GATE_INPUT_INVALID');
-  }
-  if (agentAppIds[agentId] !== appId) {
-    throw cliError('gate Agent/App mapping does not match the bootstrap manifest', 'GATE_INPUT_INVALID');
-  }
-  return { agentId, appId, agentAppIds };
 }
 
 async function runGate({ inventoryPath, client, appId, env }) {
