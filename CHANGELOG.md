@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.10] - 2026-08-29
+
 ### Fixed
+- Remove and authoritatively re-read native Task reminders before completing a
+  Task, failing closed on API rejection or stale readback while allowing an
+  idempotent retry after a lost response.
 - Tighten the Smart-group response hint: default to silence, always answer an
   explicit bot mention, and answer passive traffic only when nobody else is
   likely to provide the missing information and silence would cause wrong
