@@ -8,7 +8,6 @@ import { fileURLToPath } from 'node:url';
 import * as lark from '@larksuiteoapi/node-sdk';
 import dotenv from 'dotenv';
 
-import { getCredentials } from '../src/lib/config.js';
 import {
   auditNativeTaskConservation,
 } from '../src/lib/native-task-conservation-gate.js';
@@ -92,10 +91,29 @@ function defaultEnvPath(env = process.env) {
   return path.join(zylosDir, '.env');
 }
 
-export function createBootstrapSdkClient() {
-  const credentials = getCredentials();
-  const appId = requireText(credentials.app_id, 'FEISHU_APP_ID');
-  const appSecret = requireText(credentials.app_secret, 'FEISHU_APP_SECRET');
+/**
+ * Resolve the CLI's effective environment without relying on ambient globals.
+ * Explicitly supplied values win over the optional runtime .env file, just as
+ * dotenv's normal process environment precedence does.
+ */
+export function resolveTaskV2LegacyAdoptionEnvironment({
+  env = process.env,
+  envFile = null,
+} = {}) {
+  const filePath = envFile === null ? defaultEnvPath(env) : path.resolve(envFile);
+  let fileEnv = {};
+  try {
+    fileEnv = dotenv.parse(readFileSync(filePath, 'utf8'));
+  } catch {
+    // The default runtime .env is optional; callers still get the explicit
+    // environment and the later credential/identity gate remains fail-closed.
+  }
+  return Object.freeze({ ...fileEnv, ...env });
+}
+
+export function createBootstrapSdkClient({ env = process.env } = {}) {
+  const appId = requireText(env.FEISHU_APP_ID, 'FEISHU_APP_ID');
+  const appSecret = requireText(env.FEISHU_APP_SECRET, 'FEISHU_APP_SECRET');
   return new lark.Client({
     appId,
     appSecret,
@@ -134,12 +152,14 @@ export async function runTaskV2LegacyAdoptionBootstrapCli({
   const options = parseArgs(args);
   const rawManifest = readJson(options.manifest, 'adoption manifest');
   const manifest = parseTaskV2LegacyAdoptionBootstrapManifest(rawManifest);
-  if (options.envFile !== null) dotenv.config({ path: path.resolve(options.envFile) });
-  else dotenv.config({ path: defaultEnvPath(env) });
-  if (!client && process.env.FEISHU_APP_ID !== manifest.appId) {
+  const runtimeEnv = resolveTaskV2LegacyAdoptionEnvironment({
+    env,
+    envFile: options.envFile,
+  });
+  if (!client && runtimeEnv.FEISHU_APP_ID !== manifest.appId) {
     throw cliError('FEISHU_APP_ID does not match the bootstrap manifest appId', 'GATE_INPUT_INVALID');
   }
-  const sdkClient = client ?? createBootstrapSdkClient();
+  const sdkClient = client ?? createBootstrapSdkClient({ env: runtimeEnv });
   const adapter = createSdkTaskV2LegacyAdoptionAdapter({ client: sdkClient });
   const bootstrap = createTaskV2LegacyAdoptionBootstrap({
     adapter,
@@ -153,7 +173,7 @@ export async function runTaskV2LegacyAdoptionBootstrapCli({
           inventoryPath: options.gateInventory,
           client: sdkClient,
           appId: committedManifest.appId,
-          env,
+          env: runtimeEnv,
         }),
       })
     : await bootstrap.plan(manifest);
