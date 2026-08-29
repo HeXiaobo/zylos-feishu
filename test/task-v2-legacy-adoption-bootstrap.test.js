@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -7,6 +10,7 @@ import {
   parseTaskV2LegacyAdoptionBootstrapManifest,
   TASK_V2_LEGACY_ADOPTION_BOOTSTRAP_SCHEMA,
 } from '../src/lib/task-v2-legacy-adoption-bootstrap.js';
+import { runTaskV2LegacyAdoptionBootstrapCli } from '../scripts/task-v2-legacy-adoption-bootstrap.js';
 
 const APP_ID = 'cli_ss_legacy';
 const ENTRIES = [
@@ -232,4 +236,71 @@ test('conservation gate is optional and called only after a complete commit', as
   assert.deepEqual(h.calls.map(call => call.operation), [
     'get', 'get', 'get', 'get', 'get', 'get', 'get', 'get',
   ]);
+});
+
+test('CLI uses the effective env-file identity for a gated commit', async t => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'task-v2-bootstrap-cli-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const envFile = path.join(directory, 'runtime.env');
+  const manifestFile = path.join(directory, 'manifest.json');
+  const inventoryFile = path.join(directory, 'core.json');
+  writeFileSync(envFile, [
+    'FEISHU_APP_ID=cli_ss_legacy',
+    'FEISHU_APP_SECRET=test-secret',
+    'ZYLOS_AGENT_ID=agent:yueran',
+  ].join('\n'));
+  writeFileSync(manifestFile, JSON.stringify(manifest([ENTRIES[0]])));
+  writeFileSync(inventoryFile, JSON.stringify({
+    schema: 'zylos.native-task-core-inventory/v1',
+    capturedAt: '2026-08-27T03:00:00.000Z',
+    snapshot: {
+      stable: true,
+      strategy: 'double-read-fingerprint',
+      fingerprint: 'c'.repeat(64),
+    },
+    identity: { agentId: 'agent:yueran' },
+    tasks: [],
+    externalLinks: [],
+  }));
+
+  const previous = new Map(['FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'ZYLOS_AGENT_ID']
+    .map(key => [key, process.env[key]]));
+  t.after(() => {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  let remote = task('guid-one');
+  const client = {
+    task: { v2: { task: {
+      async get() {
+        return { code: 0, data: { task: structuredClone(remote) } };
+      },
+      async patch(request) {
+        remote = { ...remote, ...request.data.task };
+        return { code: 0, data: { task: structuredClone(remote) } };
+      },
+      async list() {
+        return { code: 0, data: { items: [], has_more: false } };
+      },
+    } } },
+  };
+  const output = [];
+  const report = await runTaskV2LegacyAdoptionBootstrapCli({
+    args: [
+      '--manifest', manifestFile,
+      '--env-file', envFile,
+      '--commit',
+      '--gate-core-inventory', inventoryFile,
+    ],
+    env: {},
+    client,
+    stdout: { write(value) { output.push(value); } },
+  });
+
+  assert.equal(report.status, 'PASS');
+  assert.equal(report.conservationGate.passed, true);
+  assert.equal(output.length, 1);
 });

@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured, while continuing to fail closed on malformed or conflicting
   explicit mappings. Projection, conservation, and legacy-adoption gates now
   share this identity contract.
+- Use one explicit effective environment for legacy-adoption bootstrap and its
+  optional conservation gate, so `--env-file` supplies the same identity and
+  credentials to every step without depending on ambient process state.
 
 ## [0.3.7-rc.9] - 2026-08-28
 
