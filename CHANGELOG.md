@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Run non-repair native Task status reconciliation against a stable isolated
+  SQLite snapshot, so dry-run cannot initialize, migrate, backfill, or create
+  WAL sidecars in the live Core database. Explicit `--repair-status` remains
+  the only reconciliation path that opens Core for writes.
 - Re-read interactive-card messages through the public Feishu message API with
   `card_msg_content_type=user_card_content`, so Schema 2.0 markdown is
   available to the existing card extractor. Read failures now remain explicit
