@@ -312,6 +312,71 @@ test('fails a started stream after the configured main timeout with an honest re
   assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
 }));
 
+test('sweeps a started stream into timeout without waiting for another delivery', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let now = 1_000;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    clock: () => now,
+    throttleMs: 0,
+    mainTimeoutMs: 1_000,
+    logger: { warn() {} },
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunStarted')],
+  });
+
+  now = 2_001;
+  const swept = await stream.sweepExpired();
+
+  assert.deepEqual(swept, { checked: 1, expired: 1, failed: 0 });
+  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 回复超时，请重试');
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
+}));
+
+test('removes stale partial output from every continuation card on main timeout', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let now = 1_000;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    clock: () => now,
+    throttleMs: 0,
+    answerBytesPerCard: 300,
+    mainTimeoutMs: 1_000,
+    logger: { warn() {} },
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target('group') });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'RunStarted'),
+      event(2, 'OutputDelta', { delta: 'x'.repeat(750) }),
+    ],
+  });
+  assert.equal(calls.filter(([name]) => name === 'reply').length, 3);
+
+  const updatesBeforeTimeout = calls.filter(([name]) => name === 'update').length;
+  now = 2_001;
+  await stream.sweepExpired();
+  const timeoutUpdates = calls
+    .filter(([name]) => name === 'update')
+    .slice(updatesBeforeTimeout);
+
+  assert.equal(timeoutUpdates.length, 3);
+  for (const [, payload] of timeoutUpdates) {
+    const card = JSON.parse(payload.data.card.data);
+    assert.doesNotMatch(JSON.stringify(card), /x{20}/);
+    assert.equal(cardElement(card, 'zylos_phase').content, '⚠️ 回复超时，请重试');
+  }
+}));
+
 test('starts the main timeout only after RunStarted and keeps the queued timeout separate', () => withState(async stateDirectory => {
   const { client } = createClient();
   let now = 1_000;

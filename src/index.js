@@ -867,6 +867,7 @@ function parseC4Response(stdout) {
   return null;
 }
 
+const RESPONSE_STREAM_TIMEOUT_SWEEP_INTERVAL_MS = 30_000;
 let conversationResponseStream = null;
 
 function getConversationResponseStream() {
@@ -880,6 +881,17 @@ function getConversationResponseStream() {
   }
   return conversationResponseStream;
 }
+
+const conversationResponseTimeoutSweep = setInterval(() => {
+  getConversationResponseStream().sweepExpired().then(result => {
+    if (result.expired > 0) {
+      console.warn(`[feishu] Expired ${result.expired} stalled response stream(s)`);
+    }
+  }).catch(error => {
+    console.warn(`[feishu] Response stream timeout sweep failed: ${error.message}`);
+  });
+}, RESPONSE_STREAM_TIMEOUT_SWEEP_INTERVAL_MS);
+conversationResponseTimeoutSweep.unref?.();
 
 function assistantRequestId(messageId) {
   const digest = crypto.createHash('sha256').update(String(messageId)).digest('hex').slice(0, 40);

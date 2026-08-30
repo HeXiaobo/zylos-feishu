@@ -768,6 +768,25 @@ export function createConversationResponseStream({
         await closeCard(state, cardState, `${purpose}:close`);
       }
     }
+    if (terminal && state.status === 'failed' && state.cards.length > segments.length) {
+      for (let part = segments.length; part < state.cards.length; part += 1) {
+        const cardState = state.cards[part];
+        const card = renderCard({
+          phase: state.phase,
+          answer: '',
+          summary: terminalChatListSummary(state),
+          streaming: false,
+          running: false,
+          part,
+          totalParts: state.cards.length,
+          processDisplay,
+        });
+        if (JSON.stringify(cardState.rendered) !== JSON.stringify(card)) {
+          await updateCard(state, cardState, card, `${purpose}:invalidate-extra`);
+        }
+        await closeCard(state, cardState, `${purpose}:close-extra`);
+      }
+    }
     state.lastRenderedAt = clock();
   }
 
@@ -956,7 +975,7 @@ export function createConversationResponseStream({
     }
   }
 
-  return Object.freeze({
+  const stream = Object.freeze({
     async sendCompleted(input) {
       const request = requireRecord(input, 'completed response request');
       requireExactFields(request, ['requestId', 'target', 'output'], 'completed response request');
@@ -1414,6 +1433,37 @@ export function createConversationResponseStream({
       }
     },
 
+    async sweepExpired() {
+      let entries;
+      try {
+        entries = fs.readdirSync(stateDirectory, { withFileTypes: true });
+      } catch (error) {
+        if (error?.code === 'ENOENT') return { checked: 0, expired: 0, failed: 0 };
+        throw error;
+      }
+
+      let checked = 0;
+      let expired = 0;
+      let failed = 0;
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+        const state = readState(path.join(stateDirectory, entry.name));
+        if (!state || !['queued', 'started'].includes(state.status)) continue;
+        checked += 1;
+        try {
+          const result = await stream.apply({ requestId: state.requestId, events: [] });
+          if (result?.reason === 'queued_timeout' || result?.reason === 'main_timeout') expired += 1;
+        } catch (error) {
+          failed += 1;
+          logger.warn?.('Response stream timeout sweep failed', {
+            requestId: state.requestId,
+            error: error.message,
+          });
+        }
+      }
+      return { checked, expired, failed };
+    },
+
     async completeWithFullAnswer({ requestId, output } = {}) {
       const id = requireText(requestId, 'requestId');
       const release = await acquireRequestLock(id);
@@ -1444,4 +1494,5 @@ export function createConversationResponseStream({
       }
     },
   });
+  return stream;
 }

@@ -189,6 +189,7 @@ test('patches a nested mixed card when CardKit conversion throws', async () => {
               elements: [
                 { tag: 'markdown', content: '深层文本' },
                 { tag: 'img', img_key: 'img_nested' },
+                { tag: 'file', file_key: 'file_nested', name: 'report.pdf' },
                 { tag: 'table', columns: [{ name: '状态' }], rows: [{ cells: [{ text: '完成' }] }] },
               ],
             }],
