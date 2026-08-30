@@ -811,6 +811,49 @@ test('overlong output remains deliverable when CardKit conversion is unavailable
   assert.equal(calls.some(([name]) => name === 'update' || name === 'close'), false);
 }));
 
+test('patches every continuation card when CardKit conversion becomes unavailable', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let conversionAttempts = 0;
+  client.cardkit.v1.card.idConvert = async payload => {
+    calls.push(['convert', payload]);
+    conversionAttempts += 1;
+    return conversionAttempts === 1
+      ? { code: 0, data: { card_id: 'AA_initial' } }
+      : { code: 230001, msg: 'deep card conversion unavailable' };
+  };
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    answerBytesPerCard: 300,
+    logger: { warn() {} },
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target('group') });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'RunStarted'),
+      event(2, 'RunCompleted', { output: '混合深层卡片内容'.repeat(260) }),
+    ],
+  });
+
+  const continuationReplies = calls
+    .filter(([name]) => name === 'reply')
+    .slice(1);
+  const patchedMessageIds = calls
+    .filter(([name]) => name === 'patch')
+    .map(([, payload]) => payload.path.message_id);
+  assert.equal(continuationReplies.length >= 2, true);
+  assert.equal(patchedMessageIds.length, continuationReplies.length);
+  assert.deepEqual(
+    patchedMessageIds,
+    continuationReplies.map(([, payload], index) => `om_response_${index + 2}`),
+  );
+  assert.equal(calls.filter(([name]) => name === 'update').length, 1);
+  assert.equal(conversionAttempts, continuationReplies.length + 1);
+}));
+
 test('survives process restart and resumes from persisted sequence without duplicate send', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const first = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });

@@ -156,9 +156,17 @@ export function createCardKitTaskCardDelivery(input) {
         },
       }), 'Feishu task card placeholder send');
       const messageId = requireText(sent.data?.message_id, 'Feishu task card messageId');
-      const converted = await client.cardkit.v1.card.idConvert({
-        data: { message_id: messageId },
-      });
+      let converted = null;
+      try {
+        converted = await client.cardkit.v1.card.idConvert({
+          data: { message_id: messageId },
+        });
+      } catch (error) {
+        logger.warn(
+          'Feishu CardKit conversion failed; falling back to an ordinary card',
+          { error: error.message },
+        );
+      }
       if (converted?.code !== 0 || typeof converted.data?.card_id !== 'string') {
         logger.warn(
           'Feishu CardKit conversion unavailable; falling back to an ordinary card',
@@ -230,7 +238,15 @@ export function createCardKitTaskCardDelivery(input) {
         }
       }
 
-      if (terminalError) throw terminalError;
+      if (terminalError) {
+        logger.warn('Feishu task card finalization failed; falling back to an ordinary card', terminalError);
+        try {
+          return await patchOrdinaryCard(client, messageId, card);
+        } catch (fallbackError) {
+          terminalError.cause = fallbackError;
+          throw terminalError;
+        }
+      }
       return { success: true, messageId };
     },
   });

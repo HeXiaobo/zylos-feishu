@@ -172,6 +172,77 @@ test('patches the placeholder to an ordinary card when CardKit conversion is una
   assert.match(warnings[0][0], /falling back to an ordinary card/);
 });
 
+test('patches a nested mixed card when CardKit conversion throws', async () => {
+  const patches = [];
+  const nestedCard = {
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'fill' },
+    body: {
+      elements: [{
+        tag: 'column_set',
+        columns: [{
+          tag: 'column',
+          elements: [{
+            tag: 'column_set',
+            columns: [{
+              tag: 'column',
+              elements: [
+                { tag: 'markdown', content: '深层文本' },
+                { tag: 'img', img_key: 'img_nested' },
+                { tag: 'table', columns: [{ name: '状态' }], rows: [{ cells: [{ text: '完成' }] }] },
+              ],
+            }],
+          }],
+        }],
+      }],
+    },
+  };
+  const client = {
+    im: {
+      message: {
+        async create() {
+          return { code: 0, data: { message_id: 'om_deep_conversion_failure' } };
+        },
+      },
+      v1: {
+        message: {
+          async patch(payload) {
+            patches.push(payload);
+            return { code: 0, data: {} };
+          },
+        },
+      },
+    },
+    cardkit: {
+      v1: {
+        card: {
+          async idConvert() {
+            throw new Error('nested card conversion failed');
+          },
+        },
+      },
+    },
+  };
+  const delivery = createCardKitTaskCardDelivery({
+    client,
+    pause: async () => {},
+    logger: { warn() {} },
+  });
+
+  const result = await delivery.send({
+    target: { receiveId: 'ou_acceptor', receiveIdType: 'open_id' },
+    card: nestedCard,
+    idempotencyKey: 'feishu:create:task-deep-conversion-failure',
+    taskVersion: 1,
+  });
+
+  assert.deepEqual(result, { success: true, messageId: 'om_deep_conversion_failure' });
+  assert.deepEqual(patches, [{
+    path: { message_id: 'om_deep_conversion_failure' },
+    data: { content: JSON.stringify(nestedCard) },
+  }]);
+});
+
 test('never sends a duplicate after the native card message exists, even if streaming fails', async () => {
   const sends = [];
   const finalUpdates = [];
@@ -231,15 +302,24 @@ test('never sends a duplicate after the native card message exists, even if stre
   assert.equal(warnings.length, 1);
 });
 
-test('surfaces a terminal update failure so the durable projection can repair the card', async () => {
+test('falls back to an ordinary card when a deep CardKit final update fails', async () => {
   let sends = 0;
   let finishes = 0;
+  const patches = [];
   const client = {
     im: {
       message: {
         async create() {
           sends += 1;
           return { code: 0, data: { message_id: 'om_terminal_repair' } };
+        },
+      },
+      v1: {
+        message: {
+          async patch(payload) {
+            patches.push(payload);
+            return { code: 0, data: {} };
+          },
         },
       },
     },
@@ -271,17 +351,19 @@ test('surfaces a terminal update failure so the durable projection can repair th
     logger: { warn() {} },
   });
 
-  await assert.rejects(
-    delivery.send({
-      target: { receiveId: 'ou_acceptor', receiveIdType: 'open_id' },
-      card: FINAL_CARD,
-      idempotencyKey: 'feishu:create:task-terminal-repair',
-      taskVersion: 3,
-    }),
-    /final update unavailable/,
-  );
+  const result = await delivery.send({
+    target: { receiveId: 'ou_acceptor', receiveIdType: 'open_id' },
+    card: FINAL_CARD,
+    idempotencyKey: 'feishu:create:task-terminal-repair',
+    taskVersion: 3,
+  });
+  assert.deepEqual(result, { success: true, messageId: 'om_terminal_repair' });
   assert.equal(sends, 1);
   assert.equal(finishes, 0);
+  assert.deepEqual(patches, [{
+    path: { message_id: 'om_terminal_repair' },
+    data: { content: JSON.stringify(FINAL_CARD) },
+  }]);
 });
 
 test('retries the identical placeholder and repairs the card bound to the deduplicated message', async () => {

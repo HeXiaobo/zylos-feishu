@@ -676,7 +676,16 @@ export function createConversationResponseStream({
       card,
       stableToken(state.requestId, `part:${part}`),
     );
-    const cardId = await convertCard(messageId);
+    let cardId = null;
+    try {
+      cardId = await convertCard(messageId);
+    } catch (error) {
+      logger.warn?.('CardKit conversion failed for continuation; using ordinary cards', {
+        requestId: state.requestId,
+        part,
+        error: error.message,
+      });
+    }
     const cardState = {
       part,
       messageId,
@@ -685,12 +694,15 @@ export function createConversationResponseStream({
       closed: terminal,
       rendered: card,
     };
-    if (!cardId && state.mode === 'cardkit') {
-      logger.warn?.('CardKit conversion unavailable for continuation; using ordinary cards', {
-        requestId: state.requestId,
-        part,
-      });
-      state.mode = 'ordinary_card';
+    if (!cardId) {
+      if (state.mode === 'cardkit') {
+        logger.warn?.('CardKit conversion unavailable for continuation; using ordinary cards', {
+          requestId: state.requestId,
+          part,
+        });
+        state.mode = 'ordinary_card';
+      }
+      await patchOrdinary(messageId, card);
     }
     state.cards.push(cardState);
     if (terminal) await closeCard(state, cardState, `close-terminal-part-${part}`);
