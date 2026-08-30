@@ -276,6 +276,83 @@ test('recovers a queued stream after the configured timeout with an honest retry
   assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
 }));
 
+test('fails a started stream after the configured main timeout with an honest retry terminal', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let now = 1_000;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    clock: () => now,
+    throttleMs: 0,
+    mainTimeoutMs: 1_000,
+    logger: { warn() {} },
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'RunStarted'),
+      event(2, 'OutputDelta', { delta: '部分答案' }),
+    ],
+  });
+
+  now = 2_001;
+  const timedOut = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [],
+  });
+
+  assert.equal(timedOut.status, 'failed');
+  assert.equal(timedOut.reason, 'main_timeout');
+  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 回复超时，请重试');
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
+  assert.doesNotMatch(JSON.stringify(terminalCard), /部分答案/);
+  assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
+}));
+
+test('starts the main timeout only after RunStarted and keeps the queued timeout separate', () => withState(async stateDirectory => {
+  const { client } = createClient();
+  let now = 1_000;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    clock: () => now,
+    throttleMs: 0,
+    queuedTimeoutMs: 1_000,
+    mainTimeoutMs: 2_000,
+    logger: { warn() {} },
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunQueued')],
+  });
+  now = 1_999;
+  const started = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(2, 'RunStarted')],
+  });
+  assert.equal(started.status, 'started');
+
+  now = 3_998;
+  const stillRunning = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [],
+  });
+  assert.equal(stillRunning.status, 'started');
+
+  now = 3_999;
+  const timedOut = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [],
+  });
+  assert.equal(timedOut.status, 'failed');
+  assert.equal(timedOut.reason, 'main_timeout');
+}));
+
 test('does not expire queued work that starts before the timeout boundary', () => withState(async stateDirectory => {
   const { client } = createClient();
   let now = 1_000;
@@ -339,6 +416,38 @@ test('allows canonical completion to repair a queued-timeout compatibility termi
   const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
   assert.equal(cardElement(finalCard, 'zylos_answer').content, '延迟到达的真实答案');
   assert.doesNotMatch(JSON.stringify(finalCard), /排队超时/);
+}));
+
+test('allows canonical completion to repair a main-timeout compatibility terminal', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let now = 1_000;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    clock: () => now,
+    throttleMs: 0,
+    mainTimeoutMs: 1_000,
+    logger: { warn() {} },
+  });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunStarted')],
+  });
+  now = 2_001;
+  await stream.apply({ requestId: 'assistant.feishu.om_1', events: [] });
+  const completed = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(2, 'RunCompleted', { output: '迟到但真实的答案' }),
+    ],
+  });
+
+  assert.equal(completed.status, 'completed');
+  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(finalCard, 'zylos_answer').content, '迟到但真实的答案');
+  assert.doesNotMatch(JSON.stringify(finalCard), /回复超时/);
 }));
 
 test('keeps one current status collapsed above the streaming answer without numbered boilerplate', () => withState(async stateDirectory => {

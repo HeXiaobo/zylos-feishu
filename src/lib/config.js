@@ -65,6 +65,7 @@ export const DEFAULT_CONFIG = {
     useMarkdownCard: true,
     streamProcessDisplay: 'collapsible',
     responseStreamQueuedTimeoutMs: 60_000,
+    responseStreamMainTimeoutMs: 900_000,
   }
 };
 
@@ -147,6 +148,13 @@ export function getResponseStreamQueuedTimeoutMs(value = getConfig()) {
   return Number.isSafeInteger(configured) && configured > 0
     ? configured
     : DEFAULT_CONFIG.message.responseStreamQueuedTimeoutMs;
+}
+
+export function getResponseStreamMainTimeoutMs(value = getConfig()) {
+  const configured = value?.message?.responseStreamMainTimeoutMs;
+  return Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_CONFIG.message.responseStreamMainTimeoutMs;
 }
 
 /**

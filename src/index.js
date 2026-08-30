@@ -26,6 +26,7 @@ import {
   getCredentials,
   stopWatching,
   getResponseStreamQueuedTimeoutMs,
+  getResponseStreamMainTimeoutMs,
 } from './lib/config.js';
 import {
   downloadImage,
@@ -874,6 +875,7 @@ function getConversationResponseStream() {
       client: getClient(),
       processDisplay: getStreamProcessDisplay(config),
       queuedTimeoutMs: getResponseStreamQueuedTimeoutMs(config),
+      mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
     });
   }
   return conversationResponseStream;
