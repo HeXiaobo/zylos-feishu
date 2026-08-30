@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.12] - 2026-08-30
+
+### Fixed
+- Keep shared Lark SDK initialization logs off standard output so machine-readable
+  Task reconciliation commands emit exactly one JSON document.
+
 ## [0.3.7-rc.11] - 2026-08-30
 
 ### Fixed
