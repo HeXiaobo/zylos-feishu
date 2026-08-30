@@ -19,6 +19,7 @@ dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
 import {
   getConfig,
+  getResponseStreamMainTimeoutMs,
   getStreamProcessDisplay,
   DATA_DIR,
   getCredentials,
@@ -202,6 +203,7 @@ async function sendText(endpoint, text) {
         const responseStream = createConversationResponseStream({
           client: getClient(),
           processDisplay: getStreamProcessDisplay(config),
+          mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
         });
         await responseStream.sendCompleted({
           requestId,
@@ -460,6 +462,7 @@ async function send() {
           const responseStream = createConversationResponseStream({
             client: getClient(),
             processDisplay: getStreamProcessDisplay(config),
+            mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
           });
           const result = await responseStream.completeWithFullAnswer({
             requestId: assistantRequestId,
