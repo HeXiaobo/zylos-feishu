@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.11] - 2026-08-30
+
+### Fixed
+- Fall back deep CardKit image, file, and table payloads to ordinary patches
+  when the streaming API rejects nested elements.
+- Cap main response streams at fifteen minutes, sweep persisted stalled
+  streams after restarts, and terminalize every continuation card without
+  leaving stale partial output.
+
 ## [0.3.7-rc.10] - 2026-08-29
 
 ### Fixed
