@@ -31,6 +31,7 @@ export function getClient() {
     appSecret: creds.app_secret,
     appType: lark.AppType.SelfBuild,
     domain: lark.Domain.Feishu,  // Chinese version (feishu.cn)
+    loggerLevel: lark.LoggerLevel.error,
   });
 
   return clientInstance;
