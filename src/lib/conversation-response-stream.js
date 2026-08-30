@@ -13,12 +13,14 @@ const MAX_REASONING_DELTA_BYTES = 64 * 1024;
 const MAX_CARD_BYTES = 30_000;
 const DEFAULT_ANSWER_BYTES_PER_CARD = 12_000;
 const DEFAULT_QUEUED_TIMEOUT_MS = 60_000;
+const DEFAULT_MAIN_TIMEOUT_MS = 900_000;
 const MAX_CHAT_LIST_SUMMARY_BYTES = 120;
 const SUMMARY_ELLIPSIS = '…';
 const DEFAULT_THROTTLE_MS = 250;
 const RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请重新发送。';
 const NON_RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请稍后再试。';
 const QUEUED_TIMEOUT_PHASE = '⚠️ 排队超时，请重试';
+const MAIN_TIMEOUT_PHASE = '⚠️ 回复超时，请重试';
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 120_000;
@@ -479,6 +481,7 @@ export function createConversationResponseStream({
   throttleMs = DEFAULT_THROTTLE_MS,
   answerBytesPerCard = DEFAULT_ANSWER_BYTES_PER_CARD,
   queuedTimeoutMs = DEFAULT_QUEUED_TIMEOUT_MS,
+  mainTimeoutMs = DEFAULT_MAIN_TIMEOUT_MS,
   processDisplay = 'collapsible',
   logger = console,
 } = {}) {
@@ -492,6 +495,9 @@ export function createConversationResponseStream({
   }
   if (!Number.isSafeInteger(queuedTimeoutMs) || queuedTimeoutMs < 1) {
     throw new TypeError('queuedTimeoutMs is invalid');
+  }
+  if (!Number.isSafeInteger(mainTimeoutMs) || mainTimeoutMs < 1) {
+    throw new TypeError('mainTimeoutMs is invalid');
   }
   if (!PROCESS_DISPLAYS.has(processDisplay)) throw new TypeError('processDisplay is invalid');
 
@@ -516,6 +522,7 @@ export function createConversationResponseStream({
     }
     clearTransientProcess(state);
     delete state.queuedAt;
+    delete state.mainStartedAt;
     delete state.output;
     for (const card of state.cards) delete card.rendered;
   }
@@ -676,7 +683,16 @@ export function createConversationResponseStream({
       card,
       stableToken(state.requestId, `part:${part}`),
     );
-    const cardId = await convertCard(messageId);
+    let cardId = null;
+    try {
+      cardId = await convertCard(messageId);
+    } catch (error) {
+      logger.warn?.('CardKit conversion failed for continuation; using ordinary cards', {
+        requestId: state.requestId,
+        part,
+        error: error.message,
+      });
+    }
     const cardState = {
       part,
       messageId,
@@ -685,12 +701,15 @@ export function createConversationResponseStream({
       closed: terminal,
       rendered: card,
     };
-    if (!cardId && state.mode === 'cardkit') {
-      logger.warn?.('CardKit conversion unavailable for continuation; using ordinary cards', {
-        requestId: state.requestId,
-        part,
-      });
-      state.mode = 'ordinary_card';
+    if (!cardId) {
+      if (state.mode === 'cardkit') {
+        logger.warn?.('CardKit conversion unavailable for continuation; using ordinary cards', {
+          requestId: state.requestId,
+          part,
+        });
+        state.mode = 'ordinary_card';
+      }
+      await patchOrdinary(messageId, card);
     }
     state.cards.push(cardState);
     if (terminal) await closeCard(state, cardState, `close-terminal-part-${part}`);
@@ -747,6 +766,25 @@ export function createConversationResponseStream({
       }
       if (terminal || part < segments.length - 1) {
         await closeCard(state, cardState, `${purpose}:close`);
+      }
+    }
+    if (terminal && state.status === 'failed' && state.cards.length > segments.length) {
+      for (let part = segments.length; part < state.cards.length; part += 1) {
+        const cardState = state.cards[part];
+        const card = renderCard({
+          phase: state.phase,
+          answer: '',
+          summary: terminalChatListSummary(state),
+          streaming: false,
+          running: false,
+          part,
+          totalParts: state.cards.length,
+          processDisplay,
+        });
+        if (JSON.stringify(cardState.rendered) !== JSON.stringify(card)) {
+          await updateCard(state, cardState, card, `${purpose}:invalidate-extra`);
+        }
+        await closeCard(state, cardState, `${purpose}:close-extra`);
       }
     }
     state.lastRenderedAt = clock();
@@ -937,7 +975,7 @@ export function createConversationResponseStream({
     }
   }
 
-  return Object.freeze({
+  const stream = Object.freeze({
     async sendCompleted(input) {
       const request = requireRecord(input, 'completed response request');
       requireExactFields(request, ['requestId', 'target', 'output'], 'completed response request');
@@ -1225,7 +1263,10 @@ export function createConversationResponseStream({
             if (phase) state.phase = phase;
             if (event.type === 'AssistantRequestAccepted') state.status = 'accepted';
             if (event.type === 'RunQueued') state.status = 'queued';
-            if (event.type === 'RunStarted') state.status = 'started';
+            if (event.type === 'RunStarted') {
+              state.status = 'started';
+              if (!Number.isSafeInteger(state.mainStartedAt)) state.mainStartedAt = clock();
+            }
             if (event.type === 'OutputDelta') {
               state.output += event.payload.delta;
               containsDelta = true;
@@ -1249,6 +1290,10 @@ export function createConversationResponseStream({
             state.queuedAt = clock();
           }
           if (event.type === 'RunStarted') delete state.queuedAt;
+        }
+        if (!compatibility && state.status === 'started' && !Number.isSafeInteger(state.mainStartedAt)) {
+          state.mainStartedAt = clock();
+          changed = true;
         }
         if (state.status === 'queued' && !Number.isSafeInteger(state.queuedAt)) {
           state.queuedAt = clock();
@@ -1289,6 +1334,44 @@ export function createConversationResponseStream({
             replayed: false,
             status: state.status,
             reason: 'queued_timeout',
+            parts: state.cards.length || 1,
+          };
+        }
+        const mainElapsed = state.status === 'started'
+          ? clock() - state.mainStartedAt
+          : 0;
+        const mainTimedOut = state.status === 'started' && mainElapsed >= mainTimeoutMs;
+        if (mainTimedOut) {
+          logger.warn?.('Main response stream timed out; projecting a retry terminal', {
+            requestId,
+            mainElapsed,
+            mainTimeoutMs,
+          });
+          state.output = '';
+          state.status = 'failed';
+          state.phase = MAIN_TIMEOUT_PHASE;
+          clearTransientProcess(state);
+          state.compatibilityTerminal = true;
+          if (projectionError) {
+            compactTerminalState(state);
+            state.terminalProjectionPending = true;
+            save(state);
+            return {
+              handled: true,
+              pending: true,
+              replayed: false,
+              status: state.status,
+              reason: 'main_timeout',
+            };
+          }
+          await render(state, { terminal: true, purpose: 'main-timeout' });
+          compactTerminalState(state);
+          save(state);
+          return {
+            handled: true,
+            replayed: false,
+            status: state.status,
+            reason: 'main_timeout',
             parts: state.cards.length || 1,
           };
         }
@@ -1350,6 +1433,37 @@ export function createConversationResponseStream({
       }
     },
 
+    async sweepExpired() {
+      let entries;
+      try {
+        entries = fs.readdirSync(stateDirectory, { withFileTypes: true });
+      } catch (error) {
+        if (error?.code === 'ENOENT') return { checked: 0, expired: 0, failed: 0 };
+        throw error;
+      }
+
+      let checked = 0;
+      let expired = 0;
+      let failed = 0;
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+        const state = readState(path.join(stateDirectory, entry.name));
+        if (!state || !['queued', 'started'].includes(state.status)) continue;
+        checked += 1;
+        try {
+          const result = await stream.apply({ requestId: state.requestId, events: [] });
+          if (result?.reason === 'queued_timeout' || result?.reason === 'main_timeout') expired += 1;
+        } catch (error) {
+          failed += 1;
+          logger.warn?.('Response stream timeout sweep failed', {
+            requestId: state.requestId,
+            error: error.message,
+          });
+        }
+      }
+      return { checked, expired, failed };
+    },
+
     async completeWithFullAnswer({ requestId, output } = {}) {
       const id = requireText(requestId, 'requestId');
       const release = await acquireRequestLock(id);
@@ -1380,4 +1494,5 @@ export function createConversationResponseStream({
       }
     },
   });
+  return stream;
 }

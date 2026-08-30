@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   DEFAULT_CONFIG,
+  getResponseStreamMainTimeoutMs,
   getResponseStreamQueuedTimeoutMs,
   getStreamProcessDisplay,
 } from '../src/lib/config.js';
@@ -20,6 +21,13 @@ test('queued response timeout defaults safely and rejects invalid configuration'
   assert.equal(getResponseStreamQueuedTimeoutMs({ message: {} }), 60_000);
   assert.equal(getResponseStreamQueuedTimeoutMs({ message: { responseStreamQueuedTimeoutMs: 30_000 } }), 30_000);
   assert.equal(getResponseStreamQueuedTimeoutMs({ message: { responseStreamQueuedTimeoutMs: 0 } }), 60_000);
+});
+
+test('main response timeout defaults to fifteen minutes and rejects invalid configuration', () => {
+  assert.equal(DEFAULT_CONFIG.message.responseStreamMainTimeoutMs, 900_000);
+  assert.equal(getResponseStreamMainTimeoutMs({ message: {} }), 900_000);
+  assert.equal(getResponseStreamMainTimeoutMs({ message: { responseStreamMainTimeoutMs: 120_000 } }), 120_000);
+  assert.equal(getResponseStreamMainTimeoutMs({ message: { responseStreamMainTimeoutMs: 0 } }), 900_000);
 });
 
 test('older and invalid configs resolve to the safe supported process display', () => {
