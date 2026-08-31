@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Archive the 2026-02-15 improvement plan under `docs/archive/plan-2026-02-15.md`;
+  add `ROADMAP.md` to reflect the current native Task / CardKit / Smart-mode
+  direction.
+
 ## [0.3.7-rc.12] - 2026-08-30
 
 ### Fixed
