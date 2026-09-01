@@ -4,7 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { createInMemoryCoreMessageIntake } from '../src/lib/core-message-intake-port.js';
+import {
+  createCoreMessageIntakeAdapter,
+  createInMemoryCoreMessageIntake,
+} from '../src/lib/core-message-intake-port.js';
 import { normalizeFeishuInboundMessage } from '../src/lib/feishu-inbound-normalizer.js';
 import { openInboundEventInbox } from '../src/lib/inbound-event-inbox.js';
 
@@ -51,6 +54,45 @@ test('Core intake fake applies one durable effect for logical replay and rejects
   await assert.rejects(
     core.accept(changed.message, acceptance),
     (error) => error.code === 'IDEMPOTENCY_CONFLICT',
+  );
+});
+
+test('Core intake adapter rejects trace mismatch and request identity drift across replay', async () => {
+  const normalized = normalizeFeishuInboundMessage(event({ eventId: 'evt-port-contract' }), {
+    accountRef: 'cli_app_a',
+  });
+  const acceptance = {
+    conversationLaneKey: normalized.conversationLaneKey,
+    laneSequence: 1,
+    sourceOrder: null,
+  };
+  const receipt = (requestId, traceId = normalized.message.traceId) => ({
+    schemaVersion: 1,
+    type: 'MessageAccepted',
+    requestId,
+    traceId,
+    conversationLaneKey: acceptance.conversationLaneKey,
+    laneSequence: acceptance.laneSequence,
+    orderingMode: 'acceptance',
+    sourceOrder: acceptance.sourceOrder,
+  });
+
+  const wrongTrace = createCoreMessageIntakeAdapter({
+    accept: async () => receipt('req-1', 'trace:wrong'),
+  });
+  await assert.rejects(
+    wrongTrace.accept(normalized.message, acceptance),
+    (error) => error.code === 'CORE_ACCEPTANCE_MISMATCH',
+  );
+
+  let calls = 0;
+  const driftingRequest = createCoreMessageIntakeAdapter({
+    accept: async () => receipt(`req-${++calls}`),
+  });
+  assert.equal((await driftingRequest.accept(normalized.message, acceptance)).requestId, 'req-1');
+  await assert.rejects(
+    driftingRequest.accept(normalized.message, acceptance),
+    (error) => error.code === 'CORE_ACCEPTANCE_MISMATCH',
   );
 });
 

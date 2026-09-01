@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 
+const MAX_ACCEPTANCE_REPLAY_CACHE = 10_000;
+
 function domainError(code, message) {
   const error = new Error(message);
   error.code = code;
@@ -80,14 +82,25 @@ function assertAcceptance(value) {
   });
 }
 
-function assertMessageAccepted(value, expected) {
+function logicalMessageIdentity(command) {
+  const source = command.source;
+  return [
+    source.adapterId,
+    source.accountRef,
+    source.eventType,
+    source.messageId,
+  ].join('\u0000');
+}
+
+function assertMessageAccepted(value, expected, command) {
   const receipt = requireRecord(value, 'MessageAccepted');
   if (receipt.schemaVersion !== 1 || receipt.type !== 'MessageAccepted') {
     throw new TypeError('CoreMessageIntakePort must return v1 MessageAccepted');
   }
   requireText(receipt.requestId, 'MessageAccepted.requestId');
   requireText(receipt.traceId, 'MessageAccepted.traceId');
-  if (receipt.conversationLaneKey !== expected.conversationLaneKey
+  if (receipt.traceId !== command.traceId
+    || receipt.conversationLaneKey !== expected.conversationLaneKey
     || receipt.laneSequence !== expected.laneSequence
     || receipt.orderingMode !== 'acceptance'
     || JSON.stringify(receipt.sourceOrder ?? null) !== JSON.stringify(expected.sourceOrder)) {
@@ -108,11 +121,39 @@ function assertMessageAccepted(value, expected) {
 /** Adapt a remote Core durable-accept function to the validated intake port. */
 export function createCoreMessageIntakeAdapter({ accept } = {}) {
   if (typeof accept !== 'function') throw new TypeError('Core intake accept must be a function');
+  const accepted = new Map();
   return Object.freeze({
     async accept(message, acceptance) {
       const command = assertAcceptMessage(message);
       const expected = assertAcceptance(acceptance);
-      return assertMessageAccepted(await accept(command, expected), expected);
+      const receipt = assertMessageAccepted(
+        await accept(command, expected),
+        expected,
+        command,
+      );
+      const logicalKey = logicalMessageIdentity(command);
+      const prior = accepted.get(logicalKey);
+      if (prior) {
+        if (prior.payloadHash !== command.source.payloadHash) {
+          throw domainError('IDEMPOTENCY_CONFLICT', 'Core intake replay changed payload hash');
+        }
+        if (prior.receipt.requestId !== receipt.requestId
+          || prior.receipt.traceId !== receipt.traceId
+          || prior.receipt.conversationLaneKey !== receipt.conversationLaneKey
+          || prior.receipt.laneSequence !== receipt.laneSequence
+          || JSON.stringify(prior.receipt.sourceOrder) !== JSON.stringify(receipt.sourceOrder)) {
+          throw domainError('CORE_ACCEPTANCE_MISMATCH', 'Core intake replay changed request identity');
+        }
+      } else {
+        accepted.set(logicalKey, Object.freeze({
+          payloadHash: command.source.payloadHash,
+          receipt,
+        }));
+        if (accepted.size > MAX_ACCEPTANCE_REPLAY_CACHE) {
+          accepted.delete(accepted.keys().next().value);
+        }
+      }
+      return receipt;
     },
   });
 }
@@ -125,12 +166,7 @@ export function createInMemoryCoreMessageIntake() {
       const command = assertAcceptMessage(message);
       const expected = assertAcceptance(acceptance);
       const source = command.source;
-      const logicalKey = [
-        source.adapterId,
-        source.accountRef,
-        source.eventType,
-        source.messageId,
-      ].join('\u0000');
+      const logicalKey = logicalMessageIdentity(command);
       const existing = effects.get(logicalKey);
       if (existing) {
         if (existing.payloadHash !== source.payloadHash

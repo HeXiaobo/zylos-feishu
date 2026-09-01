@@ -80,6 +80,29 @@ function fingerprint(serialized) {
   return createHash('sha256').update(serialized).digest('hex');
 }
 
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]),
+  );
+}
+
+function legacySemanticFingerprint(serialized) {
+  let payload;
+  try {
+    payload = JSON.parse(serialized);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+    || !payload.message || !payload.sender) return null;
+  return fingerprint(JSON.stringify(canonicalize({
+    message: payload.message,
+    sender: payload.sender,
+  })));
+}
+
 function normalizeInbound(input) {
   const request = requireRecord(input, 'inbound event');
   const keys = Object.keys(request);
@@ -93,6 +116,7 @@ function normalizeInbound(input) {
     'messageId',
     'payload',
     'payloadHash',
+    'legacyPayload',
     'conversationLaneKey',
     'sourceOrder',
   ]);
@@ -106,6 +130,12 @@ function normalizeInbound(input) {
   if (!eventId && !messageId) throw new TypeError('inbound event requires eventId or messageId');
   const payloadJson = serializeJson(requireRecord(request.payload, 'inbound event.payload'), 'inbound event.payload');
   const computedFingerprint = fingerprint(payloadJson);
+  const legacyPayloadJson = request.legacyPayload === undefined
+    ? null
+    : serializeJson(
+      requireRecord(request.legacyPayload, 'inbound event.legacyPayload'),
+      'inbound event.legacyPayload',
+    );
   const payloadHash = request.payloadHash === undefined
     ? `sha256:${computedFingerprint}`
     : requireText(request.payloadHash, 'inbound event.payloadHash');
@@ -121,6 +151,11 @@ function normalizeInbound(input) {
     messageId,
     payloadJson,
     payloadHash,
+    legacyPayloadJson,
+    legacyRequestFingerprint: legacyPayloadJson === null ? null : fingerprint(legacyPayloadJson),
+    legacySemanticFingerprint: legacyPayloadJson === null
+      ? null
+      : legacySemanticFingerprint(legacyPayloadJson),
     requestFingerprint: computedFingerprint,
     conversationLaneKey: legacy
       ? null
@@ -178,6 +213,7 @@ function initializeSchema(database) {
       conversation_lane_key TEXT,
       lane_sequence INTEGER,
       source_order_json TEXT,
+      normalized_payload_json TEXT,
       CHECK (event_id IS NOT NULL OR message_id IS NOT NULL)
     );
 
@@ -204,6 +240,7 @@ function initializeSchema(database) {
     ['conversation_lane_key', 'TEXT'],
     ['lane_sequence', 'INTEGER'],
     ['source_order_json', 'TEXT'],
+    ['normalized_payload_json', 'TEXT'],
   ];
   for (const [name, type] of additiveColumns) {
     if (!columns.has(name)) {
@@ -246,7 +283,7 @@ function toView(row) {
     conversationLaneKey: row.conversation_lane_key,
     laneSequence: row.lane_sequence,
     sourceOrder: row.source_order_json === null ? null : JSON.parse(row.source_order_json),
-    payload: JSON.parse(row.payload_json),
+    payload: JSON.parse(row.normalized_payload_json ?? row.payload_json),
     status: row.status,
     attempt: row.attempt,
     version: row.version,
@@ -315,6 +352,9 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
       adapter_id, account_ref, event_type, kind, value, inbox_id
     ) VALUES (?, ?, ?, ?, ?, ?)
   `);
+  const selectLegacyIdentitiesForInbox = database.prepare(`
+    SELECT kind, value FROM feishu_inbound_identities WHERE inbox_id = ?
+  `);
 
   function rowsForIdentities(pairs, namespace = null) {
     const rows = pairs.map(({ kind, value }) => (
@@ -329,6 +369,29 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
         : selectIdentity.get(kind, value)
     )).filter(Boolean);
     return [...new Map(rows.map((row) => [row.id, row])).values()];
+  }
+
+  function ensureSourceIdentity(namespace, pair, inboxId) {
+    const existing = selectSourceIdentity.get(
+      namespace.adapterId,
+      namespace.accountRef,
+      namespace.eventType,
+      pair.kind,
+      pair.value,
+    );
+    if (existing && existing.id !== inboxId) {
+      throw domainError('IDENTITY_CONFLICT', 'namespaced inbound identity belongs to another inbox entry');
+    }
+    if (!existing) {
+      insertSourceIdentity.run(
+        namespace.adapterId,
+        namespace.accountRef,
+        namespace.eventType,
+        pair.kind,
+        pair.value,
+        inboxId,
+      );
+    }
   }
 
   function allocateLaneSequence(conversationLaneKey) {
@@ -353,12 +416,76 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
     const normalized = normalizeInbound(input);
     const pairs = identityPairs(normalized);
     const namespace = normalized.legacy ? null : normalized;
-    const existingRows = rowsForIdentities(pairs, namespace);
+    let existingRows = rowsForIdentities(pairs, namespace);
+    let bridgeLegacyIdentities = false;
+    if (existingRows.length === 0 && !normalized.legacy
+      && normalized.legacyRequestFingerprint !== null) {
+      const legacyRows = rowsForIdentities(pairs).filter((row) => (
+        row.adapter_id === null
+        || (row.adapter_id === normalized.adapterId
+          && row.account_ref === normalized.accountRef
+          && row.event_type === normalized.eventType)
+      ));
+      if (legacyRows.length > 1) {
+        throw domainError('IDENTITY_CONFLICT', 'legacy eventId and messageId belong to different inbox entries');
+      }
+      if (legacyRows.length === 1) {
+        existingRows = legacyRows;
+        bridgeLegacyIdentities = true;
+      }
+    }
     if (existingRows.length > 1) {
       throw domainError('IDENTITY_CONFLICT', 'eventId and messageId belong to different inbox entries');
     }
     if (existingRows.length === 1) {
       const existing = existingRows[0];
+      if (bridgeLegacyIdentities) {
+        const legacyPayloadIntegrity = fingerprint(existing.payload_json)
+          === existing.request_fingerprint;
+        const existingSemanticFingerprint = legacySemanticFingerprint(existing.payload_json);
+        const legacyFingerprintMatches = existing.payload_hash === null
+          && legacyPayloadIntegrity
+          && (existing.request_fingerprint === normalized.legacyRequestFingerprint
+            || (existingSemanticFingerprint !== null
+              && normalized.legacySemanticFingerprint !== null
+              && existingSemanticFingerprint === normalized.legacySemanticFingerprint));
+        const namespacedHashMatches = existing.payload_hash === normalized.payloadHash;
+        if ((!legacyFingerprintMatches && !namespacedHashMatches)
+          || (existing.conversation_lane_key !== null
+            && existing.conversation_lane_key !== normalized.conversationLaneKey)) {
+          throw domainError('IDEMPOTENCY_CONFLICT', 'legacy inbound identity belongs to different payload');
+        }
+        const laneSequence = existing.lane_sequence
+          ?? allocateLaneSequence(normalized.conversationLaneKey);
+        const now = requireNow(clock);
+        database.prepare(`
+          UPDATE feishu_inbound_inbox
+          SET adapter_id = ?, account_ref = ?, event_type = ?, payload_hash = ?,
+              conversation_lane_key = ?, lane_sequence = ?, source_order_json = ?,
+              normalized_payload_json = ?, version = version + 1, updated_at = ?
+          WHERE id = ?
+        `).run(
+          normalized.adapterId,
+          normalized.accountRef,
+          normalized.eventType,
+          normalized.payloadHash,
+          normalized.conversationLaneKey,
+          laneSequence,
+          normalized.sourceOrderJson,
+          normalized.payloadJson,
+          now,
+          existing.id,
+        );
+        const bridgedPairs = [
+          ...selectLegacyIdentitiesForInbox.all(existing.id),
+          ...pairs,
+        ];
+        const uniquePairs = [...new Map(
+          bridgedPairs.map((pair) => [`${pair.kind}\u0000${pair.value}`, pair]),
+        ).values()];
+        for (const pair of uniquePairs) ensureSourceIdentity(normalized, pair, existing.id);
+        return { created: false, entry: toView(selectById.get(existing.id)) };
+      }
       const existingPayloadHash = existing.payload_hash ?? `sha256:${existing.request_fingerprint}`;
       const eventBinding = normalized.legacy || !normalized.eventId ? null : selectSourceIdentity.get(
         normalized.adapterId,
@@ -385,22 +512,7 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
           if (!selectIdentity.get(pair.kind, pair.value)) {
             insertIdentity.run(pair.kind, pair.value, existing.id);
           }
-        } else if (!selectSourceIdentity.get(
-          normalized.adapterId,
-          normalized.accountRef,
-          normalized.eventType,
-          pair.kind,
-          pair.value,
-        )) {
-          insertSourceIdentity.run(
-            normalized.adapterId,
-            normalized.accountRef,
-            normalized.eventType,
-            pair.kind,
-            pair.value,
-            existing.id,
-          );
-        }
+        } else ensureSourceIdentity(normalized, pair, existing.id);
       }
       return { created: false, entry: toView(existing) };
     }
@@ -435,16 +547,7 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
     const id = Number(inserted.lastInsertRowid);
     for (const pair of pairs) {
       if (normalized.legacy) insertIdentity.run(pair.kind, pair.value, id);
-      else {
-        insertSourceIdentity.run(
-          normalized.adapterId,
-          normalized.accountRef,
-          normalized.eventType,
-          pair.kind,
-          pair.value,
-          id,
-        );
-      }
+      else ensureSourceIdentity(normalized, pair, id);
     }
     return { created: true, entry: toView(selectById.get(id)) };
   });
@@ -476,7 +579,7 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
           FROM feishu_inbound_inbox predecessor
           WHERE predecessor.conversation_lane_key = candidate.conversation_lane_key
             AND predecessor.lane_sequence < candidate.lane_sequence
-            AND predecessor.status <> 'committed'
+            AND predecessor.status NOT IN ('committed', 'dead_letter')
         )
       )
       ORDER BY candidate.available_at, candidate.id

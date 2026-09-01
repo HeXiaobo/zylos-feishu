@@ -11,6 +11,8 @@ import {
   openInboundEventInbox,
   processInboundEventInboxOnce,
 } from '../src/lib/inbound-event-inbox.js';
+import { normalizeFeishuInboundMessage } from '../src/lib/feishu-inbound-normalizer.js';
+import { normalizeInboundMessageEvent } from '../src/lib/inbound-message-event.js';
 
 function inbound(overrides = {}) {
   return {
@@ -222,6 +224,156 @@ test('opening a legacy inbox migrates additively and preserves replay across res
   }
 });
 
+test('legacy identities bridge to one namespaced row and reject payload drift in the same database', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-legacy-bridge-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const raw = {
+    event_id: 'evt_legacy_ws',
+    create_time: '1787900000000',
+    message: {
+      message_id: 'om_legacy_message',
+      chat_id: 'oc_legacy_chat',
+      chat_type: 'group',
+      message_type: 'text',
+      content: JSON.stringify({ text: 'legacy hello' }),
+    },
+    sender: {
+      sender_id: { open_id: 'ou_legacy_sender' },
+      sender_type: 'user',
+      tenant_key: 'tenant_legacy',
+    },
+  };
+  try {
+    const legacyEnvelope = normalizeInboundMessageEvent(raw);
+    const legacyPayloadJson = JSON.stringify(legacyEnvelope.payload);
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE feishu_inbound_inbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT,
+        message_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL DEFAULT 1,
+        available_at INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_until INTEGER,
+        last_error TEXT,
+        result_json TEXT,
+        received_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        committed_at INTEGER,
+        dead_lettered_at INTEGER
+      );
+      CREATE TABLE feishu_inbound_identities (
+        kind TEXT NOT NULL,
+        value TEXT NOT NULL,
+        inbox_id INTEGER NOT NULL,
+        PRIMARY KEY (kind, value)
+      );
+    `);
+    legacy.prepare(`
+      INSERT INTO feishu_inbound_inbox (
+        event_id, message_id, request_fingerprint, payload_json, status,
+        available_at, received_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'received', ?, ?, ?)
+    `).run(
+      legacyEnvelope.eventId,
+      legacyEnvelope.messageId,
+      createHash('sha256').update(legacyPayloadJson).digest('hex'),
+      legacyPayloadJson,
+      1,
+      1,
+      1,
+    );
+    legacy.prepare(`
+      INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, 1)
+    `).run('event', legacyEnvelope.eventId);
+    legacy.prepare(`
+      INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, 1)
+    `).run('message', legacyEnvelope.messageId);
+    legacy.close();
+
+    const migrated = openInboundEventInbox({ dbPath, clock: () => 2, maxAttempts: 3 });
+    const bridgeRaw = {
+      header: { event_id: 'evt_legacy_webhook', create_time: '1787900000999' },
+      message: raw.message,
+      sender: raw.sender,
+    };
+    const normalized = normalizeFeishuInboundMessage(bridgeRaw, { accountRef: 'cli_app_a' });
+    const bridged = migrated.receive({
+      adapterId: normalized.adapterId,
+      accountRef: normalized.accountRef,
+      eventType: normalized.eventType,
+      eventId: normalized.eventId,
+      messageId: normalized.messageId,
+      payload: normalized.message,
+      payloadHash: normalized.payloadHash,
+      legacyPayload: normalizeInboundMessageEvent(bridgeRaw).payload,
+      conversationLaneKey: normalized.conversationLaneKey,
+      sourceOrder: normalized.sourceOrder,
+    });
+    assert.equal(bridged.created, false);
+    assert.equal(bridged.entry.id, 1);
+    assert.equal(bridged.entry.laneSequence, 1);
+    assert.deepEqual(bridged.entry.payload, normalized.message);
+    assert.equal(migrated.query({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      messageId: 'om_legacy_message',
+    }).id, 1);
+    migrated.close();
+
+    const reopened = openInboundEventInbox({ dbPath, clock: () => 3, maxAttempts: 3 });
+    const websocket = normalizeFeishuInboundMessage(raw, { accountRef: 'cli_app_a' });
+    const replay = reopened.receive({
+      adapterId: websocket.adapterId,
+      accountRef: websocket.accountRef,
+      eventType: websocket.eventType,
+      eventId: websocket.eventId,
+      messageId: websocket.messageId,
+      payload: websocket.message,
+      payloadHash: websocket.payloadHash,
+      legacyPayload: legacyEnvelope.payload,
+      conversationLaneKey: websocket.conversationLaneKey,
+      sourceOrder: websocket.sourceOrder,
+    });
+    assert.equal(replay.created, false);
+    assert.equal(replay.entry.id, 1);
+    assert.equal(replay.entry.laneSequence, 1);
+
+    const changedRaw = {
+      ...bridgeRaw,
+      message: {
+        ...raw.message,
+        content: JSON.stringify({ text: 'tampered replay' }),
+      },
+    };
+    const changed = normalizeFeishuInboundMessage(changedRaw, { accountRef: 'cli_app_a' });
+    assert.throws(
+      () => reopened.receive({
+        adapterId: changed.adapterId,
+        accountRef: changed.accountRef,
+        eventType: changed.eventType,
+        eventId: changed.eventId,
+        messageId: changed.messageId,
+        payload: changed.message,
+        payloadHash: changed.payloadHash,
+        legacyPayload: normalizeInboundMessageEvent(changedRaw).payload,
+        conversationLaneKey: changed.conversationLaneKey,
+        sourceOrder: changed.sourceOrder,
+      }),
+      (error) => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('worker leases a received event and commits it with a fenced receipt', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-lease-'));
   const dbPath = path.join(directory, 'inbound.db');
@@ -311,6 +463,57 @@ test('failed handling waits before retry and dead-letters at the configured atte
     assert.match(dead.lastError, /still unavailable/);
     assert.deepEqual(inbox.claim({ workerId: 'worker-c', leaseMs: 5_000 }), []);
     inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a dead-lettered lane head remains auditable and the next sequence advances after restart', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-dead-lane-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const lane = 'feishu:cli_app_a:group:oc_dead_lane:chat';
+  const receive = (inbox, suffix) => inbox.receive({
+    adapterId: 'feishu',
+    accountRef: 'cli_app_a',
+    eventType: 'im.message.receive_v1',
+    eventId: `evt_dead_lane_${suffix}`,
+    messageId: `om_dead_lane_${suffix}`,
+    payload: { normalized: `message ${suffix}` },
+    conversationLaneKey: lane,
+    sourceOrder: null,
+  });
+  try {
+    const inbox = openInboundEventInbox({
+      dbPath,
+      clock: () => 1_787_900_000_000,
+      maxAttempts: 3,
+    });
+    assert.equal(receive(inbox, 1).entry.laneSequence, 1);
+    assert.equal(receive(inbox, 2).entry.laneSequence, 2);
+    const [first] = inbox.claim({ workerId: 'worker-a', leaseMs: 5_000, limit: 10 });
+    const dead = inbox.fail({
+      receipt: first.receipt,
+      error: Object.assign(new Error('permanent poison message'), { retryable: false }),
+      retryAfterMs: 1_000,
+    });
+    assert.equal(dead.status, 'dead_letter');
+    inbox.close();
+
+    const reopened = openInboundEventInbox({
+      dbPath,
+      clock: () => 1_787_900_001_000,
+      maxAttempts: 3,
+    });
+    const [next] = reopened.claim({ workerId: 'worker-b', leaseMs: 5_000, limit: 10 });
+    assert.equal(next.messageId, 'om_dead_lane_2');
+    assert.equal(next.laneSequence, 2);
+    assert.equal(reopened.query({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      messageId: 'om_dead_lane_1',
+    }).status, 'dead_letter');
+    reopened.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

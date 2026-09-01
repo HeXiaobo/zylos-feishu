@@ -4,6 +4,7 @@ import {
   processInboundEventInboxOnce,
 } from './inbound-event-inbox.js';
 import { normalizeFeishuInboundMessage } from './feishu-inbound-normalizer.js';
+import { normalizeInboundMessageEvent } from './inbound-message-event.js';
 
 function requireText(value, field, maximum = 4_096) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -142,6 +143,7 @@ export function createFeishuConversationGateway({
         messageId: normalized.messageId,
         payload: normalized.message,
         payloadHash: normalized.payloadHash,
+        legacyPayload: normalizeInboundMessageEvent(rawEvent, normalized.eventId).payload,
         conversationLaneKey: normalized.conversationLaneKey,
         sourceOrder: normalized.sourceOrder,
       });
