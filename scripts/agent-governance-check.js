@@ -9,6 +9,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FULL_SHA = /^[0-9a-f]{40}$/;
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const RELEASE_MANIFEST_V1 = 'zylos.release-manifest/v1';
+const RELEASE_MANIFEST_V2 = 'zylos.release-manifest/v2';
 const MODES = new Set(['check', 'inspect', 'release', 'deploy']);
 const VERSION_KEYS = Object.freeze([
   'package',
@@ -20,6 +22,10 @@ const VERSION_KEYS = Object.freeze([
 
 function nonEmptyString(value) {
   return typeof value === 'string' && value.trim() !== '';
+}
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function normalizeRepository(value) {
@@ -329,6 +335,7 @@ export function validateReleaseManifest({
   packageName = 'zylos-feishu',
   packageVersion,
   expectedRepository,
+  mode = 'release',
 } = {}) {
   const failures = [];
   const resolvedPath = resolveManifestPath(manifestPath, env);
@@ -350,21 +357,111 @@ export function validateReleaseManifest({
     failures.push('release manifest must be a JSON object');
     return { failures, manifestPath: resolvedPath, manifest: null, component: null, sha: null };
   }
-  if (manifest.schema !== 'zylos.release-manifest/v1') {
-    failures.push('release manifest schema must be zylos.release-manifest/v1');
+  const isV1 = manifest.schema === RELEASE_MANIFEST_V1;
+  const isV2 = manifest.schema === RELEASE_MANIFEST_V2;
+  if (!isV1 && !isV2) {
+    failures.push(
+      `release manifest schema must be ${RELEASE_MANIFEST_V1} or ${RELEASE_MANIFEST_V2}`,
+    );
   }
   if (!nonEmptyString(manifest.releaseId)) failures.push('release manifest releaseId is required');
-  if (manifest.status !== 'READY') {
-    failures.push(`release manifest status must be READY (found ${manifest.status ?? 'missing'})`);
+  if (isV2) {
+    if (typeof manifest.deploymentAllowed !== 'boolean') {
+      failures.push('v2 release manifest deploymentAllowed must be boolean');
+    }
+    if (mode === 'release') {
+      if (manifest.publicationAllowed !== true) {
+        failures.push('v2 release manifest publicationAllowed must be true');
+      }
+      if (!['HOLD', 'READY'].includes(manifest.status)) {
+        failures.push(`v2 release manifest status must be HOLD or READY (found ${manifest.status ?? 'missing'})`);
+      }
+      if (manifest.deploymentAllowed === true && manifest.status !== 'READY') {
+        failures.push('v2 release manifest deploymentAllowed=true requires status=READY');
+      }
+    } else {
+      if (manifest.status !== 'READY') {
+        failures.push(`release manifest status must be READY (found ${manifest.status ?? 'missing'})`);
+      }
+      if (manifest.deploymentAllowed !== true) {
+        failures.push('release manifest deploymentAllowed must be true');
+      }
+    }
+  } else {
+    if (manifest.status !== 'READY') {
+      failures.push(`release manifest status must be READY (found ${manifest.status ?? 'missing'})`);
+    }
+    if (manifest.deploymentAllowed !== true) {
+      failures.push('release manifest deploymentAllowed must be true');
+    }
   }
-  if (manifest.deploymentAllowed !== true) {
-    failures.push('release manifest deploymentAllowed must be true');
+
+  if (isV2) {
+    const contract = manifest.deploymentContract;
+    if (!isObject(contract)) {
+      failures.push('v2 release manifest deploymentContract is required');
+    } else if (contract.targetMode !== 'global') {
+      failures.push('v2 release manifest deploymentContract.targetMode must be global');
+    }
+    if (manifest.target !== undefined) {
+      failures.push('v2 global release manifest must not contain a per-agent target');
+    }
+    if (contract?.pairComponents !== undefined &&
+      (!Array.isArray(contract.pairComponents) ||
+        contract.pairComponents.length !== 2 ||
+        contract.pairComponents[0] !== 'core' ||
+        contract.pairComponents[1] !== 'feishu')) {
+      failures.push("v2 release manifest deploymentContract.pairComponents must be exactly ['core','feishu']");
+    }
+    if (contract?.hxaRequired !== undefined && contract.hxaRequired !== true) {
+      failures.push('v2 release manifest deploymentContract.hxaRequired must be true');
+    }
   }
 
   const component = componentEntry(manifest, packageName);
   if (!component) {
     failures.push(`release manifest has no ${packageName} component entry`);
     return { failures, manifestPath: resolvedPath, manifest, component: null, sha: null };
+  }
+
+  if (isV2 && mode === 'release') {
+    const authorization = manifest.evidence?.ownerAuthorization;
+    if (!isObject(authorization)) {
+      failures.push('v2 release manifest evidence.ownerAuthorization is required');
+    } else {
+      if (authorization.status !== 'PASS') {
+        failures.push(`v2 release manifest evidence.ownerAuthorization.status must be PASS (found ${authorization.status ?? 'missing'})`);
+      }
+      if (authorization.identity !== 'user') {
+        failures.push('v2 release manifest evidence.ownerAuthorization.identity must be user');
+      }
+      if (authorization.publicationAuthorized !== undefined && authorization.publicationAuthorized !== true) {
+        failures.push('v2 release manifest evidence.ownerAuthorization.publicationAuthorized must be true');
+      }
+      if (!isObject(authorization.bundle)) {
+        failures.push('v2 release manifest evidence.ownerAuthorization.bundle is required');
+      } else if (typeof authorization.bundle.feishuSha === 'string') {
+        const authorizedSha = authorization.bundle.feishuSha;
+        const candidateSha = componentSha(component);
+        if (authorizedSha !== candidateSha) {
+          failures.push('v2 release manifest evidence.ownerAuthorization.bundle.feishuSha does not match candidate');
+        }
+      } else {
+        failures.push('v2 release manifest evidence.ownerAuthorization.bundle.feishuSha is required');
+      }
+    }
+  }
+  if (isV2) {
+    const componentBranch = component.branch;
+    if (!nonEmptyString(componentBranch)) {
+      failures.push(`release manifest ${packageName} branch is required`);
+    } else if (nonEmptyString(manifest.sourcePolicy?.deployableBranch)) {
+      const expectedBranch = manifest.sourcePolicy.deployableBranch.replace(/^refs\/heads\//, '').trim();
+      const actualBranch = componentBranch.replace(/^refs\/heads\//, '').trim();
+      if (actualBranch !== expectedBranch) {
+        failures.push(`release manifest branch ${componentBranch} does not match deployable branch ${manifest.sourcePolicy.deployableBranch}`);
+      }
+    }
   }
   const repo = component.repo ?? component.repository;
   const repoPath = normalizeRepository(repo);
@@ -398,23 +495,48 @@ export function validateReleaseManifest({
     }
   }
 
-  return { failures, manifestPath: resolvedPath, manifest, component, sha: sha || null };
+  return {
+    failures,
+    manifestPath: resolvedPath,
+    manifest,
+    component,
+    sha: sha || null,
+    schema: manifest.schema,
+    global: isV2,
+  };
 }
 
-export function validateDeploymentReadiness(manifest) {
+export function validateDeploymentReadiness(manifest, { requireTarget = true } = {}) {
   const failures = [];
-  if (!nonEmptyString(manifest?.evidence?.pairReport)) {
+  const isV2 = manifest?.schema === RELEASE_MANIFEST_V2;
+  const targetRequired = requireTarget;
+  const pairReport = manifest?.evidence?.pairReport;
+  if (isV2) {
+    if (!isObject(pairReport) || pairReport.status !== 'PASS') {
+      failures.push(`deploy mode requires evidence.pairReport.status=PASS (found ${pairReport?.status ?? 'missing'})`);
+    }
+  } else if (!nonEmptyString(pairReport)) {
     failures.push('deploy mode requires evidence.pairReport');
   }
   if (manifest?.evidence?.canary !== 'PASS') {
     failures.push(`deploy mode requires evidence.canary=PASS (found ${manifest?.evidence?.canary ?? 'missing'})`);
   }
-  if (manifest?.evidence?.hxaProvenance !== 'PASS') {
+  if (isV2) {
+    if (!isObject(manifest?.evidence?.hxa) || manifest.evidence.hxa.status !== 'PASS') {
+      failures.push(`deploy mode requires evidence.hxa.status=PASS (found ${manifest?.evidence?.hxa?.status ?? 'missing'})`);
+    }
+  } else if (manifest?.evidence?.hxaProvenance !== 'PASS') {
     failures.push(`deploy mode requires evidence.hxaProvenance=PASS (found ${manifest?.evidence?.hxaProvenance ?? 'missing'})`);
   }
-  if (!nonEmptyString(manifest?.target?.agent)) failures.push('deploy mode requires target.agent');
-  if (!nonEmptyString(manifest?.target?.profileId)) failures.push('deploy mode requires target.profileId');
-  if (!nonEmptyString(manifest?.target?.hostname)) failures.push('deploy mode requires target.hostname');
+  if (targetRequired && !nonEmptyString(manifest?.target?.agent)) {
+    failures.push('deploy mode requires target.agent');
+  }
+  if (targetRequired && !nonEmptyString(manifest?.target?.profileId)) {
+    failures.push('deploy mode requires target.profileId');
+  }
+  if (targetRequired && !nonEmptyString(manifest?.target?.hostname)) {
+    failures.push('deploy mode requires target.hostname');
+  }
   return failures;
 }
 
@@ -471,6 +593,7 @@ export function runGovernance({
       packageName: metadata.packageName || 'zylos-feishu',
       packageVersion: metadata.packageVersion,
       expectedRepository: git(root, ['remote', 'get-url', 'origin'], true) || metadata.repository,
+      mode: normalizedMode,
     });
     failures.push(...manifestResult.failures);
     if (normalizedMode === 'deploy' && manifestResult.manifest) {
