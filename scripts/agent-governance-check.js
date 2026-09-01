@@ -11,6 +11,7 @@ const FULL_SHA = /^[0-9a-f]{40}$/;
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const RELEASE_MANIFEST_V1 = 'zylos.release-manifest/v1';
 const RELEASE_MANIFEST_V2 = 'zylos.release-manifest/v2';
+const V2_REPOSITORY = 'HeXiaobo/zylos-feishu';
 const MODES = new Set(['check', 'inspect', 'release', 'deploy']);
 const VERSION_KEYS = Object.freeze([
   'package',
@@ -41,6 +42,40 @@ function normalizeRepository(value) {
     .replace(/^\/+|\/+$/g, '');
   const parts = normalized.split('/').filter(Boolean);
   return parts.length >= 2 ? parts.slice(-2).join('/') : normalized;
+}
+
+/**
+ * Parse a repository identity without trusting path suffixes from arbitrary
+ * hosts.  The v2 release contract names the GitHub fork explicitly, while
+ * v1 keeps the historical permissive normalizer for compatibility.
+ */
+function githubRepository(value) {
+  const raw = typeof value === 'string' ? value : value?.url;
+  if (!nonEmptyString(raw)) return '';
+  let text = raw.trim().replace(/^git\+/, '').replace(/\/+$/, '');
+
+  if (/^[^/\\\s:]+\/[^/\\\s:]+(?:\.git)?$/i.test(text)) {
+    return text.replace(/\.git$/i, '');
+  }
+
+  const scp = /^git@github\.com:([^/\\\s]+\/[^/\\\s]+)$/i.exec(text);
+  if (scp) return scp[1].replace(/\.git$/i, '');
+
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    return '';
+  }
+  if (!['https:', 'ssh:'].includes(parsed.protocol) || parsed.hostname.toLowerCase() !== 'github.com') {
+    return '';
+  }
+  if (parsed.search || parsed.hash) return '';
+  if (parsed.protocol === 'https:' && (parsed.username || parsed.password)) return '';
+  if (parsed.protocol === 'ssh:' && parsed.username && parsed.username !== 'git') return '';
+  const parts = parsed.pathname.split('/').filter(Boolean);
+  if (parts.length !== 2) return '';
+  return `${parts[0]}/${parts[1].replace(/\.git$/i, '')}`;
 }
 
 function readText(filename) {
@@ -279,7 +314,15 @@ function pathInside(root, candidate) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function componentEntry(manifest, packageName) {
+function componentEntry(manifest, packageName, schema) {
+  if (schema === RELEASE_MANIFEST_V2) {
+    // Global v2 has one canonical component location.  Do not fall back to
+    // stable, target, or legacy top-level shapes: those can silently select a
+    // different immutable source than the owner authorized.
+    return manifest?.candidate?.feishu && isObject(manifest.candidate.feishu)
+      ? manifest.candidate.feishu
+      : undefined;
+  }
   const candidates = [
     manifest?.candidate?.[packageName],
     manifest?.candidate?.feishu,
@@ -316,11 +359,49 @@ function componentSha(component) {
   return undefined;
 }
 
+function candidateSha(component, schema) {
+  if (schema === RELEASE_MANIFEST_V2) {
+    return typeof component?.sha === 'string' ? component.sha : undefined;
+  }
+  return componentSha(component);
+}
+
 function componentVersion(component) {
   for (const key of ['version', 'packageVersion', 'release']) {
     if (typeof component?.[key] === 'string') return component[key];
   }
   return undefined;
+}
+
+function validateGlobalPreflightEvidence(manifest, failures) {
+  const label = 'deploy mode requires evidence.globalPreflight';
+  const receipt = manifest?.evidence?.globalPreflight;
+  if (!isObject(receipt)) {
+    failures.push(`${label}.status=PASS (global identity is owned by workspace preflight)`);
+    return;
+  }
+  if (receipt.schema !== 'zylos.agent-preflight/v1') {
+    failures.push(`${label}.schema must be zylos.agent-preflight/v1`);
+  }
+  if (receipt.mode !== 'deploy') {
+    failures.push(`${label}.mode must be deploy`);
+  }
+  if (receipt.status !== 'PASS') {
+    failures.push(`${label}.status=PASS (found ${receipt.status ?? 'missing'})`);
+  }
+  if (receipt.releaseId !== manifest?.releaseId) {
+    failures.push(`${label}.releaseId must match releaseId`);
+  }
+  const runtimeTarget = receipt.runtimeTarget;
+  if (!isObject(runtimeTarget)) {
+    failures.push(`${label}.runtimeTarget is required`);
+    return;
+  }
+  for (const field of ['agent', 'profileId', 'hostname']) {
+    if (!nonEmptyString(runtimeTarget[field])) {
+      failures.push(`${label}.runtimeTarget.${field} is required`);
+    }
+  }
 }
 
 /**
@@ -369,6 +450,14 @@ export function validateReleaseManifest({
     if (typeof manifest.deploymentAllowed !== 'boolean') {
       failures.push('v2 release manifest deploymentAllowed must be boolean');
     }
+    if (manifest.publicationAllowed !== undefined && typeof manifest.publicationAllowed !== 'boolean') {
+      failures.push('v2 release manifest publicationAllowed must be boolean');
+    }
+    if (!Array.isArray(manifest.holdReasons)) {
+      failures.push('v2 release manifest holdReasons must be an array');
+    } else if (manifest.status === 'READY' && manifest.holdReasons.length > 0) {
+      failures.push('v2 release manifest READY must not contain holdReasons');
+    }
     if (mode === 'release') {
       if (manifest.publicationAllowed !== true) {
         failures.push('v2 release manifest publicationAllowed must be true');
@@ -400,31 +489,34 @@ export function validateReleaseManifest({
     const contract = manifest.deploymentContract;
     if (!isObject(contract)) {
       failures.push('v2 release manifest deploymentContract is required');
-    } else if (contract.targetMode !== 'global') {
-      failures.push('v2 release manifest deploymentContract.targetMode must be global');
+    } else {
+      if (contract.targetMode !== 'global') {
+        failures.push('v2 release manifest deploymentContract.targetMode must be global');
+      }
+      if (
+        !Array.isArray(contract.pairComponents) ||
+        contract.pairComponents.length !== 2 ||
+        contract.pairComponents[0] !== 'core' ||
+        contract.pairComponents[1] !== 'feishu'
+      ) {
+        failures.push("v2 release manifest deploymentContract.pairComponents must be exactly ['core','feishu']");
+      }
+      if (contract.hxaRequired !== true) {
+        failures.push('v2 release manifest deploymentContract.hxaRequired must be true');
+      }
     }
     if (manifest.target !== undefined) {
       failures.push('v2 global release manifest must not contain a per-agent target');
     }
-    if (contract?.pairComponents !== undefined &&
-      (!Array.isArray(contract.pairComponents) ||
-        contract.pairComponents.length !== 2 ||
-        contract.pairComponents[0] !== 'core' ||
-        contract.pairComponents[1] !== 'feishu')) {
-      failures.push("v2 release manifest deploymentContract.pairComponents must be exactly ['core','feishu']");
-    }
-    if (contract?.hxaRequired !== undefined && contract.hxaRequired !== true) {
-      failures.push('v2 release manifest deploymentContract.hxaRequired must be true');
-    }
   }
 
-  const component = componentEntry(manifest, packageName);
+  const component = componentEntry(manifest, packageName, manifest.schema);
   if (!component) {
     failures.push(`release manifest has no ${packageName} component entry`);
     return { failures, manifestPath: resolvedPath, manifest, component: null, sha: null };
   }
 
-  if (isV2 && mode === 'release') {
+  if (isV2 && (mode === 'release' || mode === 'deploy')) {
     const authorization = manifest.evidence?.ownerAuthorization;
     if (!isObject(authorization)) {
       failures.push('v2 release manifest evidence.ownerAuthorization is required');
@@ -435,19 +527,31 @@ export function validateReleaseManifest({
       if (authorization.identity !== 'user') {
         failures.push('v2 release manifest evidence.ownerAuthorization.identity must be user');
       }
-      if (authorization.publicationAuthorized !== undefined && authorization.publicationAuthorized !== true) {
-        failures.push('v2 release manifest evidence.ownerAuthorization.publicationAuthorized must be true');
+      if (authorization.publicationAuthorized !== true && authorization.releaseAuthorized !== true) {
+        failures.push('v2 release manifest evidence.ownerAuthorization.publicationAuthorized (or releaseAuthorized) must be true');
+      }
+      if (!nonEmptyString(authorization.scope) || !authorization.scope.includes('GLOBAL_BUNDLE')) {
+        failures.push('v2 release manifest evidence.ownerAuthorization.scope must authorize the global bundle');
+      }
+      if (mode === 'deploy' && authorization.deploymentAuthorized !== true) {
+        failures.push('v2 deploy manifest evidence.ownerAuthorization.deploymentAuthorized must be true');
       }
       if (!isObject(authorization.bundle)) {
         failures.push('v2 release manifest evidence.ownerAuthorization.bundle is required');
-      } else if (typeof authorization.bundle.feishuSha === 'string') {
-        const authorizedSha = authorization.bundle.feishuSha;
-        const candidateSha = componentSha(component);
-        if (authorizedSha !== candidateSha) {
-          failures.push('v2 release manifest evidence.ownerAuthorization.bundle.feishuSha does not match candidate');
-        }
       } else {
-        failures.push('v2 release manifest evidence.ownerAuthorization.bundle.feishuSha is required');
+        const expectedBundle = {
+          coreSha: candidateSha(manifest.candidate?.core, manifest.schema),
+          feishuSha: candidateSha(manifest.candidate?.feishu, manifest.schema),
+          hxaSha: candidateSha(manifest.candidate?.hxa, manifest.schema),
+        };
+        for (const [field, candidateSha] of Object.entries(expectedBundle)) {
+          const authorizedSha = authorization.bundle[field];
+          if (!FULL_SHA.test(authorizedSha || '')) {
+            failures.push(`v2 release manifest evidence.ownerAuthorization.bundle.${field} must be a complete 40-character SHA`);
+          } else if (authorizedSha !== candidateSha) {
+            failures.push(`v2 release manifest evidence.ownerAuthorization.bundle.${field} does not match candidate`);
+          }
+        }
       }
     }
   }
@@ -455,24 +559,42 @@ export function validateReleaseManifest({
     const componentBranch = component.branch;
     if (!nonEmptyString(componentBranch)) {
       failures.push(`release manifest ${packageName} branch is required`);
-    } else if (nonEmptyString(manifest.sourcePolicy?.deployableBranch)) {
-      const expectedBranch = manifest.sourcePolicy.deployableBranch.replace(/^refs\/heads\//, '').trim();
-      const actualBranch = componentBranch.replace(/^refs\/heads\//, '').trim();
-      if (actualBranch !== expectedBranch) {
-        failures.push(`release manifest branch ${componentBranch} does not match deployable branch ${manifest.sourcePolicy.deployableBranch}`);
-      }
+    }
+    if (!isObject(manifest.sourcePolicy) || !nonEmptyString(manifest.sourcePolicy.deployableBranch)) {
+      failures.push('v2 release manifest sourcePolicy.deployableBranch is required');
+    } else if (manifest.sourcePolicy.deployableBranch !== 'main') {
+      failures.push('v2 release manifest sourcePolicy.deployableBranch must be main');
+    } else if (componentBranch !== manifest.sourcePolicy.deployableBranch) {
+      failures.push(`release manifest branch ${componentBranch} does not match deployable branch ${manifest.sourcePolicy.deployableBranch}`);
     }
   }
   const repo = component.repo ?? component.repository;
-  const repoPath = normalizeRepository(repo);
+  const repoPath = isV2 ? githubRepository(repo) : normalizeRepository(repo);
   const repoName = repoPath.split('/').at(-1);
-  if (!nonEmptyString(repo) || repoName !== packageName) {
+  if (isV2) {
+    if (repoPath !== V2_REPOSITORY) {
+      failures.push(`release manifest repository must identify GitHub repository ${V2_REPOSITORY}`);
+    }
+  } else if (!nonEmptyString(repo) || repoName !== packageName) {
     failures.push(`release manifest repository must identify ${packageName}`);
   }
-  const requiredRepo = normalizeRepository(expectedRepository)
-    || normalizeRepository(git(root, ['remote', 'get-url', 'origin'], true))
-    || normalizeRepository(parseJson(readText(path.join(root, 'package.json')))?.repository);
-  if (requiredRepo && repoPath !== requiredRepo) {
+  const originRepository = git(root, ['remote', 'get-url', 'origin'], true);
+  const packageRepository = parseJson(readText(path.join(root, 'package.json')))?.repository;
+  const configuredRepository = expectedRepository || originRepository || packageRepository;
+  const requiredRepo = isV2 ? githubRepository(configuredRepository) : normalizeRepository(configuredRepository);
+  if (isV2) {
+    if (originRepository && githubRepository(originRepository) !== V2_REPOSITORY) {
+      failures.push(`repository origin must identify GitHub repository ${V2_REPOSITORY} (found ${githubRepository(originRepository) || 'invalid'})`);
+    }
+    if (!configuredRepository) {
+      failures.push(`repository origin must identify GitHub repository ${V2_REPOSITORY}`);
+    } else if (requiredRepo !== V2_REPOSITORY) {
+      failures.push(`repository origin must identify GitHub repository ${V2_REPOSITORY} (found ${requiredRepo || 'invalid'})`);
+    }
+    if (requiredRepo && repoPath !== requiredRepo) {
+      failures.push(`release manifest repository must equal ${requiredRepo} (found ${repoPath || 'missing'})`);
+    }
+  } else if (requiredRepo && repoPath !== requiredRepo) {
     failures.push(`release manifest repository must equal ${requiredRepo} (found ${repoPath || 'missing'})`);
   }
   const version = componentVersion(component);
@@ -481,7 +603,7 @@ export function validateReleaseManifest({
   } else if (packageVersion !== undefined && version !== packageVersion) {
     failures.push(`release manifest version ${version} does not match package.json ${packageVersion}`);
   }
-  const sha = componentSha(component);
+  const sha = candidateSha(component, manifest.schema);
   if (!FULL_SHA.test(sha || '')) {
     failures.push(`release manifest ${packageName} SHA must be a complete 40-character SHA`);
   } else {
@@ -509,7 +631,6 @@ export function validateReleaseManifest({
 export function validateDeploymentReadiness(manifest, { requireTarget = true } = {}) {
   const failures = [];
   const isV2 = manifest?.schema === RELEASE_MANIFEST_V2;
-  const targetRequired = requireTarget;
   const pairReport = manifest?.evidence?.pairReport;
   if (isV2) {
     if (!isObject(pairReport) || pairReport.status !== 'PASS') {
@@ -528,14 +649,21 @@ export function validateDeploymentReadiness(manifest, { requireTarget = true } =
   } else if (manifest?.evidence?.hxaProvenance !== 'PASS') {
     failures.push(`deploy mode requires evidence.hxaProvenance=PASS (found ${manifest?.evidence?.hxaProvenance ?? 'missing'})`);
   }
-  if (targetRequired && !nonEmptyString(manifest?.target?.agent)) {
-    failures.push('deploy mode requires target.agent');
-  }
-  if (targetRequired && !nonEmptyString(manifest?.target?.profileId)) {
-    failures.push('deploy mode requires target.profileId');
-  }
-  if (targetRequired && !nonEmptyString(manifest?.target?.hostname)) {
-    failures.push('deploy mode requires target.hostname');
+  if (isV2) {
+    // A global manifest intentionally has no target.  The workspace preflight
+    // owns the fresh host/profile probe; this component gate only accepts its
+    // release-bound receipt and never invents a per-agent target.
+    if (requireTarget) validateGlobalPreflightEvidence(manifest, failures);
+  } else {
+    if (requireTarget && !nonEmptyString(manifest?.target?.agent)) {
+      failures.push('deploy mode requires target.agent');
+    }
+    if (requireTarget && !nonEmptyString(manifest?.target?.profileId)) {
+      failures.push('deploy mode requires target.profileId');
+    }
+    if (requireTarget && !nonEmptyString(manifest?.target?.hostname)) {
+      failures.push('deploy mode requires target.hostname');
+    }
   }
   return failures;
 }
