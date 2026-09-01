@@ -1,0 +1,1012 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+
+import { openFeishuReplyPresentation } from '../src/lib/feishu-reply-presentation.js';
+
+function acceptedMessage(overrides = {}) {
+  return {
+    ingressId: overrides.ingressId ?? 'inbox:41',
+    requestId: overrides.requestId ?? 'req-41',
+    sourceMessageId: overrides.sourceMessageId ?? 'om-source-41',
+    route: overrides.route ?? { adapterId: 'feishu', targetRef: 'opaque:reply:41' },
+    presentationId: overrides.presentationId ?? 'presentation:req-41',
+    presenceId: overrides.presenceId ?? 'presence:req-41',
+  };
+}
+
+function createReactionPort(calls) {
+  return {
+    async add(effect) {
+      calls.push({ operation: 'add', effect: structuredClone(effect) });
+      return { outcome: 'platform_accepted', reactionId: 'reaction-41' };
+    },
+    async remove(effect) {
+      calls.push({ operation: 'remove', effect: structuredClone(effect) });
+      return { outcome: 'platform_accepted' };
+    },
+    async reconcile(effect) {
+      calls.push({ operation: 'reconcile', effect: structuredClone(effect) });
+      return { outcome: 'unknown' };
+    },
+  };
+}
+
+function createCardPort() {
+  return {
+    async apply() {
+      return { outcome: 'platform_accepted', cardId: 'card-41' };
+    },
+    async reconcile() {
+      return { outcome: 'unknown' };
+    },
+  };
+}
+
+async function acceptAndBegin(presentation, input = acceptedMessage()) {
+  const accepted = await presentation.accept(input);
+  await presentation.reconcile();
+  return {
+    ...accepted,
+    presence: presentation.inspect(accepted.handle.requestId).presence,
+  };
+}
+
+test('durable acceptance binds one reply handle and begins one recoverable presence', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presentation-'));
+  const dbPath = path.join(directory, 'presentation.db');
+  const calls = [];
+  try {
+    const first = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: createReactionPort(calls),
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_000_000,
+      workerId: 'worker-a',
+    });
+
+    const created = await first.accept(acceptedMessage());
+    assert.equal(created.created, true);
+    assert.equal(created.handle.requestId, 'req-41');
+    assert.deepEqual(created.handle.route, {
+      adapterId: 'feishu',
+      targetRef: 'opaque:reply:41',
+    });
+    assert.equal(created.presence.status, 'adding');
+    assert.equal(created.presence.operationStatus, 'pending');
+    assert.equal(calls.length, 0, 'durable accept must not wait for Feishu reaction I/O');
+
+    await first.reconcile();
+    assert.equal(first.inspect('req-41').presence.status, 'active');
+    assert.equal(first.inspect('req-41').presence.reactionId, 'reaction-41');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].operation, 'add');
+    assert.equal(calls[0].effect.effectKey, 'presence:add:req-41');
+
+    const replay = await first.accept(acceptedMessage());
+    assert.equal(replay.created, false);
+    assert.equal(replay.presence.status, 'active');
+    assert.equal(calls.length, 1, 'idempotent replay must not add a second reaction');
+    first.close();
+
+    const reopened = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: createReactionPort(calls),
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_001_000,
+      workerId: 'worker-b',
+    });
+    const snapshot = reopened.inspect('req-41');
+    assert.equal(snapshot.handle.ingressId, 'inbox:41');
+    assert.equal(snapshot.presence.status, 'active');
+    assert.equal(snapshot.presence.reactionId, 'reaction-41');
+    assert.equal(calls.length, 1, 'restart must not replay a completed add effect');
+    reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('reply handle and settlement identity conflicts fail closed', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presentation-conflict-'));
+  const calls = [];
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort(calls),
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_000_000,
+      workerId: 'worker-a',
+    });
+    await acceptAndBegin(presentation);
+    await assert.rejects(
+      presentation.accept(acceptedMessage({
+        route: { adapterId: 'feishu', targetRef: 'opaque:different-target' },
+      })),
+      (error) => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    await assert.rejects(
+      presentation.accept(acceptedMessage({
+        route: {
+          adapterId: 'feishu',
+          targetRef: 'opaque:reply:41',
+          unsupported: undefined,
+        },
+      })),
+      TypeError,
+    );
+    await assert.rejects(
+      presentation.accept(acceptedMessage({
+        route: { adapterId: 'hxa-connect', targetRef: 'opaque:reply:41' },
+      })),
+      TypeError,
+    );
+    const hiddenArrayProperty = [];
+    Object.defineProperty(hiddenArrayProperty, 'unsupported', { value: undefined });
+    await assert.rejects(
+      presentation.accept(acceptedMessage({
+        route: {
+          adapterId: 'feishu',
+          targetRef: 'opaque:reply:41',
+          metadata: hiddenArrayProperty,
+        },
+      })),
+      TypeError,
+    );
+    await assert.rejects(
+      presentation.settlePresence({
+        requestId: 'req-41',
+        signal: { type: 'run_completed' },
+      }),
+      (error) => error.code === 'UNAUTHORIZED_PRESENCE_SETTLEMENT',
+    );
+    await assert.rejects(
+      presentation.settlePresence({
+        requestId: 'req-41',
+        signal: {
+          type: 'delivery_settlement',
+          requestId: 'req-different',
+          adapterId: 'feishu',
+          state: 'accepted',
+          basis: 'platform_accepted',
+          presented: true,
+        },
+      }),
+      (error) => error.code === 'IDENTITY_CONFLICT',
+    );
+    assert.equal(presentation.inspect('req-41').presence.status, 'active');
+    assert.equal(calls.filter((call) => call.operation === 'remove').length, 0);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('card activity and elapsed time never finish Reply Presence', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-active-'));
+  const calls = [];
+  let now = 1_788_000_000_000;
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort(calls),
+      cardPort: createCardPort(),
+      clock: () => now,
+      workerId: 'worker-a',
+    });
+    await acceptAndBegin(presentation);
+
+    for (const kind of [
+      'queued',
+      'run_started',
+      'card_opened',
+      'progress',
+      'output_delta',
+      'fallback',
+    ]) {
+      const observed = presentation.observePresence({ requestId: 'req-41', kind });
+      assert.equal(observed.status, 'active');
+    }
+
+    now += 121_000;
+    const overdue = presentation.observePresence({
+      requestId: 'req-41',
+      kind: 'elapsed_over_120_seconds',
+    });
+    assert.equal(overdue.status, 'active');
+    assert.equal(overdue.staleObservedAt, now);
+    assert.equal(calls.filter((call) => call.operation === 'remove').length, 0);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('only explicit terminal presentation settlements finish Reply Presence', async () => {
+  const scenarios = [
+    {
+      name: 'explicit silent',
+      signal: { type: 'reply_outcome', kind: 'silent', explicit: true },
+      reason: 'explicit_silent',
+    },
+    {
+      name: 'confirmed cancellation',
+      signal: { type: 'run_cancelled', confirmed: true },
+      reason: 'cancelled_confirmed',
+    },
+    {
+      name: 'platform accepted settlement',
+      signal: {
+        type: 'delivery_settlement',
+        state: 'accepted',
+        basis: 'platform_accepted',
+        presented: true,
+      },
+      reason: 'delivery_platform_accepted',
+    },
+    {
+      name: 'reconciled settlement',
+      signal: {
+        type: 'delivery_settlement',
+        state: 'accepted',
+        basis: 'reconciled',
+        presented: true,
+      },
+      reason: 'delivery_reconciled',
+    },
+    {
+      name: 'unpresentable settlement',
+      signal: {
+        type: 'delivery_settlement',
+        state: 'unpresentable',
+        basis: 'retry_exhausted',
+        presented: false,
+      },
+      reason: 'delivery_unpresentable',
+    },
+  ];
+
+  for (const [index, scenario] of scenarios.entries()) {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-finish-'));
+    const calls = [];
+    try {
+      const requestId = `req-finish-${index}`;
+      const presentation = openFeishuReplyPresentation({
+        dbPath: path.join(directory, 'presentation.db'),
+        reactionPort: createReactionPort(calls),
+        cardPort: createCardPort(),
+        clock: () => 1_788_000_000_000 + index,
+        workerId: 'worker-a',
+      });
+      await acceptAndBegin(presentation, acceptedMessage({
+        ingressId: `inbox:finish:${index}`,
+        requestId,
+        sourceMessageId: `om-finish-${index}`,
+        presentationId: `presentation:${requestId}`,
+        presenceId: `presence:${requestId}`,
+      }));
+
+      const finished = await presentation.settlePresence({ requestId, signal: scenario.signal });
+      assert.equal(finished.status, 'finished', scenario.name);
+      assert.equal(finished.finishReason, scenario.reason, scenario.name);
+      assert.equal(calls.filter((call) => call.operation === 'remove').length, 1, scenario.name);
+
+      const replay = await presentation.settlePresence({ requestId, signal: scenario.signal });
+      assert.equal(replay.status, 'finished', scenario.name);
+      assert.equal(
+        calls.filter((call) => call.operation === 'remove').length,
+        1,
+        `${scenario.name} replay must not remove twice`,
+      );
+      presentation.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('DeliveryReceipt outcomes do not finish presence before DeliverySettlement', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-receipt-'));
+  const calls = [];
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort(calls),
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_000_000,
+      workerId: 'worker-a',
+    });
+    await acceptAndBegin(presentation);
+    const presenceVersion = presentation.inspect('req-41').presence.version;
+
+    for (const outcome of ['platform_accepted', 'unknown', 'reconciled', 'rejected']) {
+      const observed = presentation.observeDeliveryReceipt({
+        schemaVersion: 1,
+        type: 'DeliveryReceipt',
+        receiptId: `receipt:${outcome}`,
+        intentId: 'reply:req-41:route-a',
+        deliveryId: 'delivery:req-41:route-a',
+        requestId: 'req-41',
+        attemptId: `attempt:${outcome}`,
+        traceId: 'trace:req-41',
+        adapterId: 'feishu',
+        outcome,
+        externalRef: outcome === 'platform_accepted' || outcome === 'reconciled'
+          ? 'opaque:message-41'
+          : null,
+        observedAt: '2026-09-01T00:00:00.000Z',
+      });
+      assert.equal(observed.status, 'active', outcome);
+      assert.equal(observed.lastDeliveryOutcome, outcome);
+      assert.equal(observed.deliveryReconcileRequired, outcome === 'unknown');
+    }
+    const stored = presentation.inspect('req-41').presence;
+    assert.equal(stored.version, presenceVersion, 'attempt receipts are owned by WT02-C');
+    assert.equal(Object.hasOwn(stored, 'lastDeliveryOutcome'), false);
+    assert.equal(calls.filter((call) => call.operation === 'remove').length, 0);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('failed reaction removal is recovered after restart without a final-reply side effect', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-orphan-'));
+  const dbPath = path.join(directory, 'presentation.db');
+  const calls = [];
+  let now = 1_788_000_000_000;
+  try {
+    const failingPort = createReactionPort(calls);
+    failingPort.remove = async (effect) => {
+      calls.push({ operation: 'remove', effect: structuredClone(effect) });
+      return { outcome: 'rejected', retryable: true, retryAfterMs: 1_000 };
+    };
+    const first = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: failingPort,
+      cardPort: createCardPort(),
+      clock: () => now,
+      workerId: 'worker-a',
+      retryDelayMs: 1_000,
+    });
+    await acceptAndBegin(first);
+    const orphaned = await first.settlePresence({
+      requestId: 'req-41',
+      signal: {
+        type: 'delivery_settlement',
+        state: 'accepted',
+        basis: 'platform_accepted',
+        presented: true,
+      },
+    });
+    assert.equal(orphaned.status, 'orphaned');
+    assert.equal(orphaned.operation, 'remove');
+    assert.equal(orphaned.operationStatus, 'pending');
+    first.close();
+
+    now += 1_000;
+    const recoveredPort = createReactionPort(calls);
+    const reopened = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: recoveredPort,
+      cardPort: createCardPort(),
+      clock: () => now,
+      workerId: 'worker-b',
+      retryDelayMs: 1_000,
+    });
+    const recovery = await reopened.reconcile();
+    assert.deepEqual(recovery.presence, { attempted: 1, finished: 1, pending: 0 });
+    const finished = reopened.inspect('req-41').presence;
+    assert.equal(finished.status, 'finished');
+    const removals = calls.filter((call) => call.operation === 'remove');
+    assert.equal(removals.length, 2);
+    assert.equal(removals[0].effect.effectKey, 'presence:remove:req-41');
+    assert.equal(removals[1].effect.effectKey, removals[0].effect.effectKey);
+    assert.equal(removals[1].effect.reactionId, 'reaction-41');
+    assert.deepEqual(new Set(calls.map((call) => call.operation)), new Set(['add', 'remove']));
+    reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a reaction transport exception reconciles before retrying and never creates a duplicate reaction', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-ambiguous-'));
+  const dbPath = path.join(directory, 'presentation.db');
+  const calls = [];
+  let now = 1_788_000_000_000;
+  try {
+    const ambiguousPort = createReactionPort(calls);
+    ambiguousPort.add = async (effect) => {
+      calls.push({ operation: 'add', effect: structuredClone(effect) });
+      throw new Error('socket timeout after request write');
+    };
+    const first = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: ambiguousPort,
+      cardPort: createCardPort(),
+      clock: () => now,
+      workerId: 'worker-a',
+      retryDelayMs: 1_000,
+    });
+    const accepted = await first.accept(acceptedMessage());
+    assert.equal(accepted.presence.status, 'adding');
+    assert.equal(accepted.presence.operationStatus, 'pending');
+    await first.reconcile();
+    assert.equal(first.inspect('req-41').presence.operationStatus, 'unknown');
+    first.close();
+
+    now += 1_000;
+    const reconciledPort = createReactionPort(calls);
+    reconciledPort.reconcile = async (effect) => {
+      calls.push({ operation: 'reconcile', effect: structuredClone(effect) });
+      return { outcome: 'reconciled', reactionId: 'reaction-41' };
+    };
+    const reopened = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: reconciledPort,
+      cardPort: createCardPort(),
+      clock: () => now,
+      workerId: 'worker-b',
+      retryDelayMs: 1_000,
+    });
+    await reopened.reconcile();
+    assert.equal(reopened.inspect('req-41').presence.status, 'active');
+    assert.deepEqual(calls.map((call) => call.operation), ['add', 'reconcile']);
+    assert.equal(calls[0].effect.effectKey, calls[1].effect.effectKey);
+    reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a malformed reaction result remains unknown and reconciles before retrying', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-malformed-'));
+  const calls = [];
+  let now = 1_788_000_000_000;
+  try {
+    const reactionPort = createReactionPort(calls);
+    reactionPort.add = async (effect) => {
+      calls.push({ operation: 'add', effect: structuredClone(effect) });
+      return {};
+    };
+    reactionPort.reconcile = async (effect) => {
+      calls.push({ operation: 'reconcile', effect: structuredClone(effect) });
+      return { outcome: 'reconciled', reactionId: 'reaction-41' };
+    };
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort,
+      cardPort: createCardPort(),
+      clock: () => now,
+      workerId: 'worker-a',
+      retryDelayMs: 1_000,
+    });
+    await presentation.accept(acceptedMessage());
+    await presentation.reconcile();
+    assert.equal(presentation.inspect('req-41').presence.operationStatus, 'unknown');
+
+    now += 1_000;
+    await presentation.reconcile();
+    assert.equal(presentation.inspect('req-41').presence.status, 'active');
+    assert.deepEqual(calls.map((call) => call.operation), ['add', 'reconcile']);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a settlement racing an in-flight reaction add is serialized into one eventual remove', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-race-'));
+  const calls = [];
+  let releaseAdd;
+  const addResult = new Promise((resolve) => {
+    releaseAdd = resolve;
+  });
+  try {
+    const reactionPort = createReactionPort(calls);
+    reactionPort.add = async (effect) => {
+      calls.push({ operation: 'add', effect: structuredClone(effect) });
+      return addResult;
+    };
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort,
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_000_000,
+      workerId: 'worker-a',
+    });
+
+    await presentation.accept(acceptedMessage());
+    const accepting = presentation.reconcile();
+    while (calls.length === 0) await new Promise((resolve) => setImmediate(resolve));
+    const settling = presentation.settlePresence({
+      requestId: 'req-41',
+      signal: {
+        type: 'delivery_settlement',
+        state: 'accepted',
+        basis: 'platform_accepted',
+        presented: true,
+      },
+    });
+    assert.equal((await settling).status, 'finishing');
+
+    releaseAdd({ outcome: 'platform_accepted', reactionId: 'reaction-41' });
+    await accepting;
+    assert.equal(presentation.inspect('req-41').presence.status, 'finishing');
+    await presentation.reconcile();
+    assert.equal(presentation.inspect('req-41').presence.status, 'finished');
+    assert.deepEqual(calls.map((call) => call.operation), ['add', 'remove']);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an unknown add reconciled as absent after settlement finishes without creating a late reaction', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-absent-'));
+  const calls = [];
+  let now = 1_788_000_000_000;
+  try {
+    const reactionPort = createReactionPort(calls);
+    reactionPort.add = async (effect) => {
+      calls.push({ operation: 'add', effect: structuredClone(effect) });
+      return { outcome: 'unknown' };
+    };
+    reactionPort.reconcile = async (effect) => {
+      calls.push({ operation: 'reconcile', effect: structuredClone(effect) });
+      return { outcome: 'not_found' };
+    };
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort,
+      cardPort: createCardPort(),
+      clock: () => now,
+      workerId: 'worker-a',
+      retryDelayMs: 1_000,
+    });
+    assert.equal((await presentation.accept(acceptedMessage())).presence.status, 'adding');
+    await presentation.reconcile();
+    assert.equal(presentation.inspect('req-41').presence.operationStatus, 'unknown');
+    assert.equal((await presentation.settlePresence({
+      requestId: 'req-41',
+      signal: {
+        type: 'delivery_settlement',
+        state: 'accepted',
+        basis: 'platform_accepted',
+        presented: true,
+      },
+    })).status, 'finishing');
+
+    now += 1_000;
+    await presentation.reconcile();
+    assert.equal(presentation.inspect('req-41').presence.status, 'finished');
+    assert.deepEqual(calls.map((call) => call.operation), ['add', 'reconcile']);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('progress is durably coalesced with contiguous watermarks and an immediate terminal barrier', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-coalesce-'));
+  const cardCalls = [];
+  let now = 1_788_000_000_000;
+  const cardPort = {
+    async apply(operation) {
+      cardCalls.push({ operation: 'apply', input: structuredClone(operation) });
+      return {
+        outcome: 'platform_accepted',
+        cardId: operation.cardId ?? 'card-41',
+      };
+    },
+    async reconcile(operation) {
+      cardCalls.push({ operation: 'reconcile', input: structuredClone(operation) });
+      return { outcome: 'unknown' };
+    },
+  };
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort([]),
+      cardPort,
+      clock: () => now,
+      workerId: 'worker-a',
+      coalesceMs: 500,
+    });
+    await acceptAndBegin(presentation);
+
+    for (const [sequence, text] of [[1, 'A'], [2, 'B'], [3, 'C']]) {
+      presentation.recordProgress({
+        requestId: 'req-41',
+        presentationId: 'presentation:req-41',
+        sequence,
+        type: 'OutputDelta',
+        payload: { text },
+        terminal: false,
+      });
+    }
+    assert.equal(presentation.inspect('req-41').projection.highWatermark, 3);
+    assert.equal((await presentation.flushDue()).projection.attempted, 0);
+    assert.equal(cardCalls.length, 0);
+
+    now += 500;
+    const firstFlush = await presentation.flushDue();
+    assert.deepEqual(firstFlush.projection, { attempted: 1, applied: 1, pending: 0 });
+    assert.equal(cardCalls.length, 1);
+    assert.equal(cardCalls[0].input.kind, 'open');
+    assert.equal(cardCalls[0].input.cardKitSequence, 1);
+    assert.deepEqual(cardCalls[0].input.events.map((event) => event.sequence), [1, 2, 3]);
+    assert.equal(presentation.inspect('req-41').projection.lastAppliedSequence, 3);
+
+    const gap = presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 5,
+      type: 'ProgressUpdated',
+      payload: { stage: 'five' },
+      terminal: false,
+    });
+    assert.equal(gap.projection.highWatermark, 3, 'sequence 5 must wait for sequence 4');
+    presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 4,
+      type: 'ProgressUpdated',
+      payload: { stage: 'four' },
+      terminal: false,
+    });
+    assert.equal(presentation.inspect('req-41').projection.highWatermark, 5);
+
+    const terminal = presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 6,
+      type: 'ProjectionTerminal',
+      payload: { stage: 'complete' },
+      terminal: true,
+    });
+    assert.equal(terminal.flushDue, true);
+    assert.equal(cardCalls.length, 1, 'recording terminal must not block on CardKit');
+
+    const terminalFlush = await presentation.flushDue();
+    assert.deepEqual(terminalFlush.projection, { attempted: 1, applied: 1, pending: 0 });
+    assert.equal(cardCalls[1].input.kind, 'finalize');
+    assert.equal(cardCalls[1].input.cardKitSequence, 2);
+    assert.deepEqual(cardCalls[1].input.events.map((event) => event.sequence), [4, 5, 6]);
+    const snapshot = presentation.inspect('req-41').projection;
+    assert.equal(snapshot.status, 'terminal');
+    assert.equal(snapshot.highWatermark, 6);
+    assert.equal(snapshot.lastAppliedSequence, 6);
+    assert.equal(snapshot.cardKitSequence, 2);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a late terminal barrier fails closed when higher sequences were already observed', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-terminal-'));
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort([]),
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_000_000,
+      workerId: 'worker-a',
+      coalesceMs: 500,
+    });
+    await acceptAndBegin(presentation);
+    for (const sequence of [4, 5]) {
+      presentation.recordProgress({
+        requestId: 'req-41',
+        presentationId: 'presentation:req-41',
+        sequence,
+        type: 'ProgressUpdated',
+        payload: { stage: `stage-${sequence}` },
+        terminal: false,
+      });
+    }
+    assert.throws(
+      () => presentation.recordProgress({
+        requestId: 'req-41',
+        presentationId: 'presentation:req-41',
+        sequence: 3,
+        type: 'ProjectionTerminal',
+        payload: { stage: 'complete' },
+        terminal: true,
+      }),
+      (error) => error.code === 'TERMINAL_CONFLICT',
+    );
+    const checkpoint = presentation.inspect('req-41').projection;
+    assert.equal(checkpoint.terminalSequence, null);
+    assert.equal(checkpoint.highWatermark, 0);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a CardKit transport exception reconciles after restart with the same operation and sequence', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-ambiguous-'));
+  const dbPath = path.join(directory, 'presentation.db');
+  const calls = [];
+  let now = 1_788_000_000_000;
+  const event = {
+    requestId: 'req-41',
+    presentationId: 'presentation:req-41',
+    sequence: 1,
+    type: 'ProgressUpdated',
+    payload: { stage: 'working' },
+    terminal: false,
+  };
+  try {
+    const first = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: createReactionPort([]),
+      cardPort: {
+        async apply(operation) {
+          calls.push({ operation: 'apply', input: structuredClone(operation) });
+          throw new Error('socket timeout after card request write');
+        },
+        async reconcile(operation) {
+          calls.push({ operation: 'unexpected-reconcile', input: structuredClone(operation) });
+          return { outcome: 'unknown' };
+        },
+      },
+      clock: () => now,
+      workerId: 'worker-a',
+      coalesceMs: 500,
+      retryDelayMs: 1_000,
+    });
+    await acceptAndBegin(first);
+    first.recordProgress(event);
+    now += 500;
+    await first.flushDue();
+    const ambiguous = first.inspect('req-41').projection;
+    assert.equal(ambiguous.status, 'degraded');
+    assert.equal(ambiguous.lastAppliedSequence, 0);
+    assert.equal(ambiguous.cardKitSequence, 1);
+    assert.equal(ambiguous.operationStatus, 'unknown');
+    first.close();
+
+    now += 1_000;
+    const reopened = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: createReactionPort([]),
+      cardPort: {
+        async apply(operation) {
+          calls.push({ operation: 'unexpected-apply', input: structuredClone(operation) });
+          return { outcome: 'platform_accepted', cardId: 'card-duplicate' };
+        },
+        async reconcile(operation) {
+          calls.push({ operation: 'reconcile', input: structuredClone(operation) });
+          return { outcome: 'reconciled', cardId: 'card-41' };
+        },
+      },
+      clock: () => now,
+      workerId: 'worker-b',
+      coalesceMs: 500,
+      retryDelayMs: 1_000,
+    });
+    await reopened.reconcile();
+    const recovered = reopened.inspect('req-41').projection;
+    assert.equal(recovered.status, 'active');
+    assert.equal(recovered.lastAppliedSequence, 1);
+    assert.equal(recovered.cardKitSequence, 1);
+    assert.equal(recovered.cardId, 'card-41');
+    assert.deepEqual(calls.map((call) => call.operation), ['apply', 'reconcile']);
+    assert.equal(calls[0].input.operationId, calls[1].input.operationId);
+    assert.equal(calls[0].input.cardKitSequence, calls[1].input.cardKitSequence);
+
+    const replay = reopened.recordProgress(event);
+    assert.equal(replay.replayed, true);
+    assert.equal((await reopened.flushDue()).projection.attempted, 0);
+    assert.equal(calls.length, 2);
+    assert.throws(
+      () => reopened.recordProgress({ ...event, payload: { stage: 'different' } }),
+      (error) => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an accepted card create without a valid identity remains unknown until reconciliation binds it', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-identity-'));
+  const calls = [];
+  let now = 1_788_000_000_000;
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort([]),
+      cardPort: {
+        async apply(operation) {
+          calls.push({ operation: 'apply', input: structuredClone(operation) });
+          return { outcome: 'platform_accepted', cardId: '' };
+        },
+        async reconcile(operation) {
+          calls.push({ operation: 'reconcile', input: structuredClone(operation) });
+          return { outcome: 'reconciled', cardId: 'card-41' };
+        },
+      },
+      clock: () => now,
+      workerId: 'worker-a',
+      coalesceMs: 500,
+      retryDelayMs: 1_000,
+    });
+    await acceptAndBegin(presentation);
+    presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 1,
+      type: 'ProgressUpdated',
+      payload: { stage: 'working' },
+      terminal: false,
+    });
+    now += 500;
+    const unresolved = await presentation.flushDue();
+    assert.deepEqual(unresolved.projection, { attempted: 1, applied: 0, pending: 1 });
+    assert.equal(presentation.inspect('req-41').projection.operationStatus, 'unknown');
+    assert.equal(presentation.inspect('req-41').projection.lastAppliedSequence, 0);
+
+    now += 1_000;
+    await presentation.reconcile();
+    const bound = presentation.inspect('req-41').projection;
+    assert.equal(bound.cardId, 'card-41');
+    assert.equal(bound.lastAppliedSequence, 1);
+    assert.deepEqual(calls.map((call) => call.operation), ['apply', 'reconcile']);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('CardKit rate limits degrade only projection and never block final settlement', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-isolation-'));
+  const reactionCalls = [];
+  const cardCalls = [];
+  let now = 1_788_000_000_000;
+  let rateLimited = true;
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort(reactionCalls),
+      cardPort: {
+        async apply(operation) {
+          cardCalls.push(structuredClone(operation));
+          if (rateLimited) {
+            return {
+              outcome: 'rejected',
+              errorCode: 'RATE_LIMITED',
+              retryable: true,
+              retryAfterMs: 1_000,
+            };
+          }
+          return { outcome: 'platform_accepted', cardId: 'card-41' };
+        },
+        async reconcile() {
+          return { outcome: 'unknown' };
+        },
+      },
+      clock: () => now,
+      workerId: 'worker-a',
+      coalesceMs: 500,
+      retryDelayMs: 1_000,
+    });
+    await acceptAndBegin(presentation);
+    presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 1,
+      type: 'OutputDelta',
+      payload: { text: 'working' },
+      terminal: false,
+    });
+    now += 500;
+    const failedFlush = await presentation.flushDue();
+    assert.deepEqual(failedFlush.projection, { attempted: 1, applied: 0, pending: 1 });
+    const degraded = presentation.inspect('req-41');
+    assert.equal(degraded.projection.status, 'degraded');
+    assert.equal(degraded.projection.operationStatus, 'pending');
+    assert.equal(degraded.projection.lastAppliedSequence, 0);
+    assert.equal(degraded.presence.status, 'active');
+    assert.equal(Object.hasOwn(degraded, 'executionStatus'), false);
+    assert.equal(Object.hasOwn(degraded, 'deliveryStatus'), false);
+
+    const finished = await presentation.settlePresence({
+      requestId: 'req-41',
+      signal: {
+        type: 'delivery_settlement',
+        state: 'accepted',
+        basis: 'platform_accepted',
+        presented: true,
+      },
+    });
+    assert.equal(finished.status, 'finished');
+    assert.equal(presentation.inspect('req-41').projection.status, 'degraded');
+    assert.equal(cardCalls.length, 1, 'presence settlement must not drive CardKit');
+
+    rateLimited = false;
+    now += 1_000;
+    const retried = await presentation.flushDue();
+    assert.deepEqual(retried.projection, { attempted: 1, applied: 1, pending: 0 });
+    assert.equal(presentation.inspect('req-41').projection.status, 'active');
+    assert.equal(presentation.inspect('req-41').presence.status, 'finished');
+    assert.equal(cardCalls.length, 2);
+    assert.equal(cardCalls[0].operationId, cardCalls[1].operationId);
+    assert.equal(cardCalls[0].cardKitSequence, cardCalls[1].cardKitSequence);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('progress arriving during an in-flight CardKit update is retained for the next flush', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-race-'));
+  const calls = [];
+  let now = 1_788_000_000_000;
+  let releaseFirst;
+  const firstResult = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort([]),
+      cardPort: {
+        async apply(operation) {
+          calls.push(structuredClone(operation));
+          if (calls.length === 1) return firstResult;
+          return { outcome: 'platform_accepted', cardId: 'card-41' };
+        },
+        async reconcile() {
+          return { outcome: 'unknown' };
+        },
+      },
+      clock: () => now,
+      workerId: 'worker-a',
+      coalesceMs: 500,
+    });
+    await acceptAndBegin(presentation);
+    presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 1,
+      type: 'OutputDelta',
+      payload: { text: 'first' },
+      terminal: false,
+    });
+    now += 500;
+    const firstFlush = presentation.flushDue();
+    while (calls.length === 0) await new Promise((resolve) => setImmediate(resolve));
+
+    presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 2,
+      type: 'OutputDelta',
+      payload: { text: 'second' },
+      terminal: false,
+    });
+    releaseFirst({ outcome: 'platform_accepted', cardId: 'card-41' });
+    await firstFlush;
+    let checkpoint = presentation.inspect('req-41').projection;
+    assert.equal(checkpoint.highWatermark, 2);
+    assert.equal(checkpoint.lastAppliedSequence, 1);
+    assert.equal(checkpoint.cardKitSequence, 1);
+
+    now += 500;
+    await presentation.flushDue();
+    checkpoint = presentation.inspect('req-41').projection;
+    assert.equal(checkpoint.lastAppliedSequence, 2);
+    assert.equal(checkpoint.cardKitSequence, 2);
+    assert.deepEqual(calls[1].events.map((event) => event.sequence), [2]);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
