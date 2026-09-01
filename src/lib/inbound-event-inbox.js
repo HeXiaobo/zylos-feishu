@@ -4,6 +4,8 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import { createConversationLaneCoordinator } from './conversation-lane-coordinator.js';
+
 const MAX_ID_LENGTH = 512;
 const MAX_PAYLOAD_BYTES = 1024 * 1024;
 const MAX_ERROR_LENGTH = 4_096;
@@ -81,14 +83,50 @@ function fingerprint(serialized) {
 function normalizeInbound(input) {
   const request = requireRecord(input, 'inbound event');
   const keys = Object.keys(request);
-  if (keys.length !== 3 || !['eventId', 'messageId', 'payload'].every((key) => keys.includes(key))) {
+  const legacy = keys.length === 3
+    && ['eventId', 'messageId', 'payload'].every((key) => keys.includes(key));
+  const allowed = new Set([
+    'adapterId',
+    'accountRef',
+    'eventType',
+    'eventId',
+    'messageId',
+    'payload',
+    'payloadHash',
+    'conversationLaneKey',
+    'sourceOrder',
+  ]);
+  const required = ['adapterId', 'accountRef', 'eventType', 'eventId', 'messageId', 'payload', 'conversationLaneKey'];
+  if (!legacy && (keys.some((key) => !allowed.has(key))
+    || required.some((key) => !keys.includes(key)))) {
     throw new TypeError('inbound event contains unsupported or missing fields');
   }
   const eventId = optionalText(request.eventId, 'inbound event.eventId');
   const messageId = optionalText(request.messageId, 'inbound event.messageId');
   if (!eventId && !messageId) throw new TypeError('inbound event requires eventId or messageId');
   const payloadJson = serializeJson(requireRecord(request.payload, 'inbound event.payload'), 'inbound event.payload');
-  return { eventId, messageId, payloadJson, requestFingerprint: fingerprint(payloadJson) };
+  const computedFingerprint = fingerprint(payloadJson);
+  const payloadHash = request.payloadHash === undefined
+    ? `sha256:${computedFingerprint}`
+    : requireText(request.payloadHash, 'inbound event.payloadHash');
+  if (!/^sha256:[a-f0-9]{64}$/.test(payloadHash)) {
+    throw new TypeError('inbound event.payloadHash must be a sha256 digest');
+  }
+  return {
+    legacy,
+    adapterId: legacy ? null : requireText(request.adapterId, 'inbound event.adapterId'),
+    accountRef: legacy ? null : requireText(request.accountRef, 'inbound event.accountRef'),
+    eventType: legacy ? null : requireText(request.eventType, 'inbound event.eventType'),
+    eventId,
+    messageId,
+    payloadJson,
+    payloadHash,
+    requestFingerprint: computedFingerprint,
+    conversationLaneKey: legacy
+      ? null
+      : requireText(request.conversationLaneKey, 'inbound event.conversationLaneKey', 2_048),
+    sourceOrderJson: serializeJson(request.sourceOrder ?? null, 'inbound event.sourceOrder', 16_384),
+  };
 }
 
 function identityPairs({ eventId, messageId }) {
@@ -133,6 +171,13 @@ function initializeSchema(database) {
       updated_at INTEGER NOT NULL,
       committed_at INTEGER,
       dead_lettered_at INTEGER,
+      adapter_id TEXT,
+      account_ref TEXT,
+      event_type TEXT,
+      payload_hash TEXT,
+      conversation_lane_key TEXT,
+      lane_sequence INTEGER,
+      source_order_json TEXT,
       CHECK (event_id IS NOT NULL OR message_id IS NOT NULL)
     );
 
@@ -147,6 +192,45 @@ function initializeSchema(database) {
     CREATE INDEX IF NOT EXISTS idx_feishu_inbound_claim
       ON feishu_inbound_inbox(status, available_at, lease_until, id);
   `);
+
+  const columns = new Set(database.prepare(
+    'PRAGMA table_info(feishu_inbound_inbox)',
+  ).all().map((column) => column.name));
+  const additiveColumns = [
+    ['adapter_id', 'TEXT'],
+    ['account_ref', 'TEXT'],
+    ['event_type', 'TEXT'],
+    ['payload_hash', 'TEXT'],
+    ['conversation_lane_key', 'TEXT'],
+    ['lane_sequence', 'INTEGER'],
+    ['source_order_json', 'TEXT'],
+  ];
+  for (const [name, type] of additiveColumns) {
+    if (!columns.has(name)) {
+      database.exec(`ALTER TABLE feishu_inbound_inbox ADD COLUMN ${name} ${type}`);
+    }
+  }
+
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS feishu_inbound_source_identities (
+      adapter_id TEXT NOT NULL,
+      account_ref TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('event', 'message')),
+      value TEXT NOT NULL,
+      inbox_id INTEGER NOT NULL,
+      PRIMARY KEY (adapter_id, account_ref, event_type, kind, value),
+      FOREIGN KEY (inbox_id) REFERENCES feishu_inbound_inbox(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS feishu_conversation_lanes (
+      conversation_lane_key TEXT PRIMARY KEY,
+      last_sequence INTEGER NOT NULL CHECK (last_sequence > 0)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_feishu_inbound_lane_claim
+      ON feishu_inbound_inbox(conversation_lane_key, lane_sequence, status);
+  `);
 }
 
 function toView(row) {
@@ -155,6 +239,13 @@ function toView(row) {
     id: row.id,
     eventId: row.event_id,
     messageId: row.message_id,
+    adapterId: row.adapter_id,
+    accountRef: row.account_ref,
+    eventType: row.event_type,
+    payloadHash: row.payload_hash ?? `sha256:${row.request_fingerprint}`,
+    conversationLaneKey: row.conversation_lane_key,
+    laneSequence: row.lane_sequence,
+    sourceOrder: row.source_order_json === null ? null : JSON.parse(row.source_order_json),
     payload: JSON.parse(row.payload_json),
     status: row.status,
     attempt: row.attempt,
@@ -200,7 +291,7 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
   database.pragma('journal_mode = WAL');
   database.pragma('synchronous = FULL');
   database.pragma('foreign_keys = ON');
-  initializeSchema(database);
+  database.transaction(() => initializeSchema(database)).immediate();
 
   const selectById = database.prepare('SELECT * FROM feishu_inbound_inbox WHERE id = ?');
   const selectIdentity = database.prepare(`
@@ -212,38 +303,119 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
   const insertIdentity = database.prepare(`
     INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, ?)
   `);
+  const selectSourceIdentity = database.prepare(`
+    SELECT i.*
+    FROM feishu_inbound_source_identities x
+    JOIN feishu_inbound_inbox i ON i.id = x.inbox_id
+    WHERE x.adapter_id = ? AND x.account_ref = ? AND x.event_type = ?
+      AND x.kind = ? AND x.value = ?
+  `);
+  const insertSourceIdentity = database.prepare(`
+    INSERT INTO feishu_inbound_source_identities (
+      adapter_id, account_ref, event_type, kind, value, inbox_id
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `);
 
-  function rowsForIdentities(pairs) {
-    const rows = pairs.map(({ kind, value }) => selectIdentity.get(kind, value)).filter(Boolean);
+  function rowsForIdentities(pairs, namespace = null) {
+    const rows = pairs.map(({ kind, value }) => (
+      namespace
+        ? selectSourceIdentity.get(
+          namespace.adapterId,
+          namespace.accountRef,
+          namespace.eventType,
+          kind,
+          value,
+        )
+        : selectIdentity.get(kind, value)
+    )).filter(Boolean);
     return [...new Map(rows.map((row) => [row.id, row])).values()];
+  }
+
+  function allocateLaneSequence(conversationLaneKey) {
+    const current = database.prepare(`
+      SELECT last_sequence FROM feishu_conversation_lanes WHERE conversation_lane_key = ?
+    `).get(conversationLaneKey);
+    if (!current) {
+      database.prepare(`
+        INSERT INTO feishu_conversation_lanes (conversation_lane_key, last_sequence)
+        VALUES (?, 1)
+      `).run(conversationLaneKey);
+      return 1;
+    }
+    const next = current.last_sequence + 1;
+    database.prepare(`
+      UPDATE feishu_conversation_lanes SET last_sequence = ? WHERE conversation_lane_key = ?
+    `).run(next, conversationLaneKey);
+    return next;
   }
 
   const receiveTransaction = database.transaction((input) => {
     const normalized = normalizeInbound(input);
     const pairs = identityPairs(normalized);
-    const existingRows = rowsForIdentities(pairs);
+    const namespace = normalized.legacy ? null : normalized;
+    const existingRows = rowsForIdentities(pairs, namespace);
     if (existingRows.length > 1) {
       throw domainError('IDENTITY_CONFLICT', 'eventId and messageId belong to different inbox entries');
     }
     if (existingRows.length === 1) {
       const existing = existingRows[0];
-      if (existing.request_fingerprint !== normalized.requestFingerprint) {
+      const existingPayloadHash = existing.payload_hash ?? `sha256:${existing.request_fingerprint}`;
+      const eventBinding = normalized.legacy || !normalized.eventId ? null : selectSourceIdentity.get(
+        normalized.adapterId,
+        normalized.accountRef,
+        normalized.eventType,
+        'event',
+        normalized.eventId,
+      );
+      const messageBinding = normalized.legacy || !normalized.messageId ? null : selectSourceIdentity.get(
+        normalized.adapterId,
+        normalized.accountRef,
+        normalized.eventType,
+        'message',
+        normalized.messageId,
+      );
+      if (existingPayloadHash !== normalized.payloadHash
+        || (normalized.conversationLaneKey !== null
+          && existing.conversation_lane_key !== normalized.conversationLaneKey)
+        || (eventBinding && !messageBinding)) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'inbound identity belongs to different payload');
       }
       for (const pair of pairs) {
-        if (!selectIdentity.get(pair.kind, pair.value)) {
-          insertIdentity.run(pair.kind, pair.value, existing.id);
+        if (normalized.legacy) {
+          if (!selectIdentity.get(pair.kind, pair.value)) {
+            insertIdentity.run(pair.kind, pair.value, existing.id);
+          }
+        } else if (!selectSourceIdentity.get(
+          normalized.adapterId,
+          normalized.accountRef,
+          normalized.eventType,
+          pair.kind,
+          pair.value,
+        )) {
+          insertSourceIdentity.run(
+            normalized.adapterId,
+            normalized.accountRef,
+            normalized.eventType,
+            pair.kind,
+            pair.value,
+            existing.id,
+          );
         }
       }
       return { created: false, entry: toView(existing) };
     }
 
     const now = requireNow(clock);
+    const laneSequence = normalized.conversationLaneKey === null
+      ? null
+      : allocateLaneSequence(normalized.conversationLaneKey);
     const inserted = database.prepare(`
       INSERT INTO feishu_inbound_inbox (
         event_id, message_id, request_fingerprint, payload_json, status,
-        available_at, received_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'received', ?, ?, ?)
+        available_at, received_at, updated_at,
+        adapter_id, account_ref, event_type, payload_hash,
+        conversation_lane_key, lane_sequence, source_order_json
+      ) VALUES (?, ?, ?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       normalized.eventId,
       normalized.messageId,
@@ -252,9 +424,28 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
       now,
       now,
       now,
+      normalized.adapterId,
+      normalized.accountRef,
+      normalized.eventType,
+      normalized.payloadHash,
+      normalized.conversationLaneKey,
+      laneSequence,
+      normalized.sourceOrderJson,
     );
     const id = Number(inserted.lastInsertRowid);
-    for (const pair of pairs) insertIdentity.run(pair.kind, pair.value, id);
+    for (const pair of pairs) {
+      if (normalized.legacy) insertIdentity.run(pair.kind, pair.value, id);
+      else {
+        insertSourceIdentity.run(
+          normalized.adapterId,
+          normalized.accountRef,
+          normalized.eventType,
+          pair.kind,
+          pair.value,
+          id,
+        );
+      }
+    }
     return { created: true, entry: toView(selectById.get(id)) };
   });
 
@@ -273,13 +464,22 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
       WHERE status = 'processing' AND lease_until <= ? AND attempt >= ?
     `).run(now, now, now, maxAttempts);
     const candidates = database.prepare(`
-      SELECT id, version
-      FROM feishu_inbound_inbox
-      WHERE attempt < ? AND (
-        (status IN ('received', 'failed') AND available_at <= ?)
-        OR (status = 'processing' AND lease_until <= ?)
+      SELECT candidate.id, candidate.version
+      FROM feishu_inbound_inbox candidate
+      WHERE candidate.attempt < ? AND (
+        (candidate.status IN ('received', 'failed') AND candidate.available_at <= ?)
+        OR (candidate.status = 'processing' AND candidate.lease_until <= ?)
+      ) AND (
+        candidate.conversation_lane_key IS NULL
+        OR NOT EXISTS (
+          SELECT 1
+          FROM feishu_inbound_inbox predecessor
+          WHERE predecessor.conversation_lane_key = candidate.conversation_lane_key
+            AND predecessor.lane_sequence < candidate.lane_sequence
+            AND predecessor.status <> 'committed'
+        )
       )
-      ORDER BY available_at, id
+      ORDER BY candidate.available_at, candidate.id
       LIMIT ?
     `).all(maxAttempts, now, now, limit);
     const update = database.prepare(`
@@ -376,7 +576,17 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
       const request = requireRecord(identity, 'inbound identity');
       const eventId = optionalText(request.eventId, 'inbound identity.eventId');
       const messageId = optionalText(request.messageId, 'inbound identity.messageId');
-      const rows = rowsForIdentities(identityPairs({ eventId, messageId }));
+      const namespaceFields = ['adapterId', 'accountRef', 'eventType'];
+      const hasNamespace = namespaceFields.some((field) => request[field] !== undefined);
+      if (hasNamespace && namespaceFields.some((field) => request[field] === undefined)) {
+        throw new TypeError('inbound identity namespace must include adapterId, accountRef, and eventType');
+      }
+      const namespace = hasNamespace ? {
+        adapterId: requireText(request.adapterId, 'inbound identity.adapterId'),
+        accountRef: requireText(request.accountRef, 'inbound identity.accountRef'),
+        eventType: requireText(request.eventType, 'inbound identity.eventType'),
+      } : null;
+      const rows = rowsForIdentities(identityPairs({ eventId, messageId }), namespace);
       if (rows.length > 1) throw domainError('IDENTITY_CONFLICT', 'identities belong to different inbox entries');
       return toView(rows[0]);
     },
@@ -403,6 +613,8 @@ export async function processInboundEventInboxOnce({
   inbox,
   handleMessage,
   workerId,
+  coordinator = null,
+  concurrency = 1,
   leaseMs = 30_000,
   limit = 25,
   baseRetryDelayMs = 1_000,
@@ -416,6 +628,7 @@ export async function processInboundEventInboxOnce({
   if (typeof handleMessage !== 'function') throw new TypeError('handleMessage must be a function');
   requirePositiveInteger(leaseMs, 'inbound leaseMs', 24 * 60 * 60_000);
   requirePositiveInteger(limit, 'inbound claim limit', 100);
+  requirePositiveInteger(concurrency, 'inbound concurrency', 100);
   requirePositiveInteger(baseRetryDelayMs, 'baseRetryDelayMs', 24 * 60 * 60_000);
   requirePositiveInteger(maxRetryDelayMs, 'maxRetryDelayMs', 24 * 60 * 60_000);
   if (maxRetryDelayMs < baseRetryDelayMs) {
@@ -424,15 +637,34 @@ export async function processInboundEventInboxOnce({
 
   const claimed = inbox.claim({ workerId: worker, leaseMs, limit });
   const summary = { claimed: claimed.length, committed: 0, failed: 0, deadLettered: 0 };
-  for (const entry of claimed) {
+  const laneCoordinator = coordinator ?? createConversationLaneCoordinator({ concurrency });
+  if (!laneCoordinator || typeof laneCoordinator.submit !== 'function') {
+    throw new TypeError('coordinator must provide a submit function');
+  }
+  await Promise.all(claimed.map((entry) => laneCoordinator.submit({
+    conversationLaneKey: entry.conversationLaneKey ?? `legacy-inbox:${entry.id}`,
+    laneSequence: entry.laneSequence ?? 1,
+  }, async () => {
     let result;
     try {
-      result = await handleMessage(entry.payload, Object.freeze({
+      const metadata = {
         inboxId: entry.id,
         eventId: entry.eventId,
         messageId: entry.messageId,
         attempt: entry.attempt,
-      }));
+      };
+      if (entry.conversationLaneKey !== null) {
+        Object.assign(metadata, {
+          adapterId: entry.adapterId,
+          accountRef: entry.accountRef,
+          eventType: entry.eventType,
+          payloadHash: entry.payloadHash,
+          conversationLaneKey: entry.conversationLaneKey,
+          laneSequence: entry.laneSequence,
+          sourceOrder: entry.sourceOrder,
+        });
+      }
+      result = await handleMessage(entry.payload, Object.freeze(metadata));
     } catch (error) {
       const retryAfterMs = Math.min(
         maxRetryDelayMs,
@@ -441,10 +673,10 @@ export async function processInboundEventInboxOnce({
       const settled = inbox.fail({ receipt: entry.receipt, error, retryAfterMs });
       if (settled.status === 'dead_letter') summary.deadLettered += 1;
       else summary.failed += 1;
-      continue;
+      return;
     }
     inbox.commit({ receipt: entry.receipt, result });
     summary.committed += 1;
-  }
+  })));
   return Object.freeze(summary);
 }

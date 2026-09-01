@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+
+import Database from 'better-sqlite3';
 
 import {
   openInboundEventInbox,
@@ -45,6 +48,174 @@ test('inbound inbox durably deduplicates event and message identities across reo
     assert.equal(replayByMessage.entry.messageId, 'om_message_1');
     assert.equal(reopened.query({ eventId: 'evt_message_1' }).status, 'received');
     assert.equal(reopened.query({ eventId: 'evt_message_retry' }).status, 'received');
+    reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('namespaced dual identities allocate one monotonic lane sequence after dedupe', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-lanes-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  try {
+    const inbox = openInboundEventInbox({
+      dbPath,
+      clock: () => 1_787_900_000_000,
+      maxAttempts: 3,
+    });
+    const first = inbox.receive({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      eventId: 'evt_ws_1',
+      messageId: 'om_1',
+      payload: { normalized: 'same message' },
+      conversationLaneKey: 'feishu:cli_app_a:group:oc_1:chat',
+      sourceOrder: null,
+    });
+    const webhookReplay = inbox.receive({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      eventId: 'evt_webhook_1',
+      messageId: 'om_1',
+      payload: { normalized: 'same message' },
+      conversationLaneKey: 'feishu:cli_app_a:group:oc_1:chat',
+      sourceOrder: null,
+    });
+    const second = inbox.receive({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      eventId: 'evt_ws_2',
+      messageId: 'om_2',
+      payload: { normalized: 'second message' },
+      conversationLaneKey: 'feishu:cli_app_a:group:oc_1:chat',
+      sourceOrder: 'offset:2',
+    });
+    const otherAccount = inbox.receive({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_b',
+      eventType: 'im.message.receive_v1',
+      eventId: 'evt_ws_1',
+      messageId: 'om_1',
+      payload: { normalized: 'same message' },
+      conversationLaneKey: 'feishu:cli_app_b:group:oc_1:chat',
+      sourceOrder: null,
+    });
+
+    assert.equal(first.created, true);
+    assert.equal(first.entry.laneSequence, 1);
+    assert.equal(webhookReplay.created, false);
+    assert.equal(webhookReplay.entry.id, first.entry.id);
+    assert.equal(webhookReplay.entry.laneSequence, 1);
+    assert.equal(second.entry.laneSequence, 2);
+    assert.equal(second.entry.sourceOrder, 'offset:2');
+    assert.equal(otherAccount.created, true);
+    assert.equal(otherAccount.entry.laneSequence, 1);
+    assert.throws(
+      () => inbox.receive({
+        adapterId: 'feishu',
+        accountRef: 'cli_app_a',
+        eventType: 'im.message.receive_v1',
+        eventId: 'evt_ws_1',
+        messageId: 'om_alias',
+        payload: { normalized: 'same message' },
+        conversationLaneKey: 'feishu:cli_app_a:group:oc_1:chat',
+        sourceOrder: null,
+      }),
+      (error) => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    assert.throws(
+      () => inbox.receive({
+        adapterId: 'feishu',
+        accountRef: 'cli_app_a',
+        eventType: 'im.message.receive_v1',
+        eventId: 'evt_ws_1',
+        messageId: 'om_1',
+        payload: { normalized: 'changed payload' },
+        conversationLaneKey: 'feishu:cli_app_a:group:oc_1:chat',
+        sourceOrder: null,
+      }),
+      (error) => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('opening a legacy inbox migrates additively and preserves replay across restart', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-migration-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  try {
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE feishu_inbound_inbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT,
+        message_id TEXT,
+        request_fingerprint TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL DEFAULT 1,
+        available_at INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_until INTEGER,
+        last_error TEXT,
+        result_json TEXT,
+        received_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        committed_at INTEGER,
+        dead_lettered_at INTEGER
+      );
+      CREATE TABLE feishu_inbound_identities (
+        kind TEXT NOT NULL,
+        value TEXT NOT NULL,
+        inbox_id INTEGER NOT NULL,
+        PRIMARY KEY (kind, value)
+      );
+    `);
+    const payload = JSON.stringify(inbound().payload);
+    const hash = createHash('sha256').update(payload).digest('hex');
+    legacy.prepare(`
+      INSERT INTO feishu_inbound_inbox (
+        event_id, message_id, request_fingerprint, payload_json, status,
+        available_at, received_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'received', ?, ?, ?)
+    `).run('evt_message_1', 'om_message_1', hash, payload, 1, 1, 1);
+    legacy.prepare(`
+      INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, 1)
+    `).run('event', 'evt_message_1');
+    legacy.prepare(`
+      INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, 1)
+    `).run('message', 'om_message_1');
+    legacy.close();
+
+    const migrated = openInboundEventInbox({ dbPath, clock: () => 2, maxAttempts: 3 });
+    assert.equal(migrated.receive(inbound()).created, false);
+    const created = migrated.receive({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      eventId: 'evt_new',
+      messageId: 'om_new',
+      payload: { normalized: 'new' },
+      conversationLaneKey: 'feishu:cli_app_a:p2p:oc_new:chat',
+      sourceOrder: null,
+    });
+    assert.equal(created.entry.laneSequence, 1);
+    migrated.close();
+
+    const reopened = openInboundEventInbox({ dbPath, clock: () => 3, maxAttempts: 3 });
+    assert.equal(reopened.query({ eventId: 'evt_message_1' }).id, 1);
+    assert.equal(reopened.query({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      messageId: 'om_new',
+    }).laneSequence, 1);
     reopened.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });

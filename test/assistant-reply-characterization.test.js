@@ -122,15 +122,17 @@ test('current queue/main timeout copy is projection evidence, not Runtime eviden
   assert.equal(observation.target, 'projection timeout never generates RunFailed');
 });
 
-test('current durable inbox has useful replay assets but lacks target namespacing and lane sequence', () => {
+test('durable inbox retains replay assets and adds namespaced identities plus lane sequence', () => {
   const source = fs.readFileSync(path.join(REPO_ROOT, 'src/lib/inbound-event-inbox.js'), 'utf8');
   assert.match(source, /request_fingerprint TEXT NOT NULL/);
   assert.match(source, /kind TEXT NOT NULL CHECK \(kind IN \('event', 'message'\)\)/);
-  assert.equal(source.includes('account_ref'), false);
-  assert.equal(source.includes('event_type'), false);
-  assert.equal(source.includes('lane_sequence'), false);
+  assert.match(source, /feishu_inbound_source_identities/);
+  assert.match(source, /account_ref TEXT/);
+  assert.match(source, /event_type TEXT/);
+  assert.match(source, /lane_sequence INTEGER/);
+  assert.match(source, /feishu_conversation_lanes/);
   const observation = loadContractFixture('current-behavior.json').observations
     .find((entry) => entry.name === 'durable-inbound-dedupe');
   assert.match(observation.current, /deduplicate durably/);
-  assert.match(observation.gap, /namespaced/);
+  assert.match(observation.target, /namespaced dual identity/);
 });
