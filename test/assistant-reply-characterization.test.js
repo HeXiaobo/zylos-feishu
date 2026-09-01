@@ -82,7 +82,7 @@ test('current parent/root reply target changes presentation target, not the targ
     chooseReplyTarget({ type: 'p2p', root: 'om_root', parent: 'om_parent', msg: 'om_message' }),
     null,
   );
-  const intake = loadContractFixture('feishu-intake.json');
+  const intake = loadContractFixture('accept-message.json');
   const replies = intake.conversationLanes.filter((vector) => vector.name.startsWith('group-reply-tree'));
   assert.equal(replies[0].laneKey, replies[1].laneKey);
   assert.notEqual(replies[0].replyTargetRef, replies[1].replyTargetRef);

@@ -1,193 +1,40 @@
 {
   "schemaVersion": 1,
-  "contract": "RuntimeEvents",
-  "vectors": [
+  "contract": "FeishuProgressAdapter",
+  "commonContractRef": {
+    "file": "common-contract-vectors.json",
+    "pointer": "runtimeEventStreams"
+  },
+  "projection": {
+    "consumes": [
+      "ProgressUpdated",
+      "OutputDelta"
+    ],
+    "ignoresExecutionTerminal": true,
+    "terminalFlush": true,
+    "finalIntentIndependent": true
+  },
+  "streamBindings": [
     {
       "name": "answer",
-      "events": [
-        {
-          "schemaVersion": 1,
-          "type": "RunAccepted",
-          "eventId": "event:req-answer:1",
-          "idempotencyKey": "run:req-answer:1",
-          "requestId": "req:answer",
-          "turnId": "turn:req-answer:1",
-          "generation": 1,
-          "sequence": 1,
-          "traceId": "trace:req-answer",
-          "causationId": "cmd:req-answer",
-          "producer": "core.message-intake",
-          "payload": { "laneSequence": 7 }
-        },
-        {
-          "schemaVersion": 1,
-          "type": "RunQueued",
-          "eventId": "event:req-answer:2",
-          "idempotencyKey": "run:req-answer:2",
-          "requestId": "req:answer",
-          "turnId": "turn:req-answer:1",
-          "generation": 1,
-          "sequence": 2,
-          "traceId": "trace:req-answer",
-          "causationId": "event:req-answer:1",
-          "producer": "core.runtime-pending-queue",
-          "payload": { "runtimeLane": "runtime:shared", "capacity": 1 }
-        },
-        {
-          "schemaVersion": 1,
-          "type": "RunStarted",
-          "eventId": "event:req-answer:3",
-          "idempotencyKey": "run:req-answer:3",
-          "requestId": "req:answer",
-          "turnId": "turn:req-answer:1",
-          "generation": 1,
-          "sequence": 3,
-          "traceId": "trace:req-answer",
-          "causationId": "event:req-answer:2",
-          "producer": "core.runtime-turns",
-          "payload": {
-            "runtimeLane": "runtime:shared",
-            "contextSnapshotId": "ctx:req-answer:1",
-            "contextSnapshotHash": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
-          }
-        },
-        {
-          "schemaVersion": 1,
-          "type": "ProgressUpdated",
-          "eventId": "event:req-answer:4",
-          "idempotencyKey": "run:req-answer:4",
-          "requestId": "req:answer",
-          "turnId": "turn:req-answer:1",
-          "generation": 1,
-          "sequence": 4,
-          "traceId": "trace:req-answer",
-          "causationId": "event:req-answer:3",
-          "producer": "core.runtime-observer",
-          "payload": { "stage": "working" }
-        },
-        {
-          "schemaVersion": 1,
-          "type": "RunCompleted",
-          "eventId": "event:req-answer:5",
-          "idempotencyKey": "run:req-answer:5",
-          "requestId": "req:answer",
-          "turnId": "turn:req-answer:1",
-          "generation": 1,
-          "sequence": 5,
-          "traceId": "trace:req-answer",
-          "causationId": "event:req-answer:4",
-          "producer": "core.runtime-turns",
-          "payload": { "outcome": { "kind": "answer", "text": "The decision is approved." } }
-        }
-      ]
+      "commonStream": "answer-completed",
+      "presentation": "card"
     },
     {
       "name": "failure",
-      "events": [
-        {
-          "schemaVersion": 1,
-          "type": "RunAccepted",
-          "eventId": "event:req-failure:1",
-          "idempotencyKey": "run:req-failure:1",
-          "requestId": "req:failure",
-          "turnId": "turn:req-failure:1",
-          "generation": 1,
-          "sequence": 1,
-          "traceId": "trace:req-failure",
-          "causationId": "cmd:req-failure",
-          "producer": "core.message-intake",
-          "payload": { "laneSequence": 8 }
-        },
-        {
-          "schemaVersion": 1,
-          "type": "RunQueued",
-          "eventId": "event:req-failure:2",
-          "idempotencyKey": "run:req-failure:2",
-          "requestId": "req:failure",
-          "turnId": "turn:req-failure:1",
-          "generation": 1,
-          "sequence": 2,
-          "traceId": "trace:req-failure",
-          "causationId": "event:req-failure:1",
-          "producer": "core.runtime-pending-queue",
-          "payload": { "runtimeLane": "runtime:shared", "capacity": 1 }
-        },
-        {
-          "schemaVersion": 1,
-          "type": "RunStarted",
-          "eventId": "event:req-failure:3",
-          "idempotencyKey": "run:req-failure:3",
-          "requestId": "req:failure",
-          "turnId": "turn:req-failure:1",
-          "generation": 1,
-          "sequence": 3,
-          "traceId": "trace:req-failure",
-          "causationId": "event:req-failure:2",
-          "producer": "core.runtime-turns",
-          "payload": { "runtimeLane": "runtime:shared" }
-        },
-        {
-          "schemaVersion": 1,
-          "type": "RunFailed",
-          "eventId": "event:req-failure:4",
-          "idempotencyKey": "run:req-failure:4",
-          "requestId": "req:failure",
-          "turnId": "turn:req-failure:1",
-          "generation": 1,
-          "sequence": 4,
-          "traceId": "trace:req-failure",
-          "causationId": "event:req-failure:3",
-          "producer": "core.runtime-turns",
-          "payload": { "outcome": { "kind": "failure", "code": "RUNTIME_ERROR", "retryable": true } }
-        }
-      ]
+      "commonStream": "run-failed",
+      "presentation": "failure_notice"
     },
     {
       "name": "cancelled",
-      "events": [
-        {
-          "schemaVersion": 1,
-          "type": "RunAccepted",
-          "eventId": "event:req-cancelled:1",
-          "idempotencyKey": "run:req-cancelled:1",
-          "requestId": "req:cancelled",
-          "turnId": "turn:req-cancelled:1",
-          "generation": 1,
-          "sequence": 1,
-          "traceId": "trace:req-cancelled",
-          "causationId": "cmd:req-cancelled",
-          "producer": "core.message-intake",
-          "payload": { "laneSequence": 9 }
-        },
-        {
-          "schemaVersion": 1,
-          "type": "RunQueued",
-          "eventId": "event:req-cancelled:2",
-          "idempotencyKey": "run:req-cancelled:2",
-          "requestId": "req:cancelled",
-          "turnId": "turn:req-cancelled:1",
-          "generation": 1,
-          "sequence": 2,
-          "traceId": "trace:req-cancelled",
-          "causationId": "event:req-cancelled:1",
-          "producer": "core.runtime-pending-queue",
-          "payload": { "runtimeLane": "runtime:shared", "capacity": 1 }
-        },
-        {
-          "schemaVersion": 1,
-          "type": "RunCancelled",
-          "eventId": "event:req-cancelled:3",
-          "idempotencyKey": "run:req-cancelled:3",
-          "requestId": "req:cancelled",
-          "turnId": "turn:req-cancelled:1",
-          "generation": 1,
-          "sequence": 3,
-          "traceId": "trace:req-cancelled",
-          "causationId": "cancel:req-cancelled",
-          "producer": "core.runtime-turns",
-          "payload": { "outcome": { "kind": "cancelled", "mode": "cooperative", "confirmed": true } }
-        }
-      ]
+      "commonStream": "run-cancelled",
+      "presentation": "execution_only",
+      "presenceSettlement": "cancelled_confirmed"
+    },
+    {
+      "name": "silent",
+      "commonStream": "silent-completed",
+      "presentation": "presence_only"
     }
   ]
 }

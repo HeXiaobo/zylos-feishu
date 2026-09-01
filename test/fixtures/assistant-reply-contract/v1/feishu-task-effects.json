@@ -1,48 +1,68 @@
 {
   "schemaVersion": 1,
   "contract": "FeishuTaskEffects",
+  "commonTaskRef": {
+    "file": "common-contract-vectors.json",
+    "pointer": "taskCommand"
+  },
+  "commonReceiptIntentRef": {
+    "file": "common-contract-vectors.json",
+    "pointer": "replyIntents.taskReceipt",
+    "cause": "task_effect"
+  },
   "routes": [
-    { "name": "chat_only", "axis": "assistant_request", "terminalOwner": "core-run-ledger" },
-    { "name": "create_task", "axis": "task_effect", "terminalOwner": "task-core" },
-    { "name": "confirmation", "axis": "task_effect", "terminalOwner": "task-core" },
-    { "name": "task_action", "axis": "task_effect", "terminalOwner": "task-core" },
-    { "name": "task_receipt", "axis": "delivery", "cause": "task_effect" }
-  ],
-  "command": {
-    "type": "TaskCommand",
-    "requestId": "req:task-command",
-    "turnId": "turn:req-task-command:1",
-    "sourceKey": "feishu/cli_app_a/im.message.receive_v1/om_task_command",
-    "actor": {
-      "provider": "feishu",
-      "tenantRef": "tenant_a",
-      "externalId": "ou_actor_a",
-      "verified": true
+    {
+      "name": "chat_only",
+      "axis": "assistant_request",
+      "terminalOwner": "core-run-ledger"
     },
-    "capability": "task.submit_for_review",
-    "taskId": "task:17",
-    "command": "SubmitForReview",
-    "expectedVersion": 4,
-    "origin": "feishu-native-task:external-task-17",
-    "idempotencyKey": "task-command:feishu:external-task-17:version-4"
+    {
+      "name": "create_task",
+      "axis": "task_effect",
+      "terminalOwner": "task-core"
+    },
+    {
+      "name": "confirmation",
+      "axis": "task_effect",
+      "terminalOwner": "task-core"
+    },
+    {
+      "name": "task_action",
+      "axis": "task_effect",
+      "terminalOwner": "task-core"
+    },
+    {
+      "name": "task_receipt",
+      "axis": "delivery",
+      "cause": "task_effect"
+    }
+  ],
+  "nativeTask": {
+    "sourceOfTruth": false,
+    "supportedUserChangeFirstDurableStep": "task-status-event-inbox",
+    "unsupportedOrUnauthorizedDrift": [
+      "reject",
+      "reproject"
+    ],
+    "completionMapsTo": "SubmitForReview",
+    "directDoneAllowed": false,
+    "loopFence": [
+      "effectId",
+      "externalTaskId",
+      "coreVersion",
+      "origin"
+    ]
   },
   "authorization": {
     "owner": "task-core",
     "assistantMayConstructActor": false,
     "assistantMayWriteDatabase": false,
-    "required": ["actor", "sourceKey", "capability", "expectedVersion", "origin"],
+    "required": [
+      "actor",
+      "source",
+      "capability",
+      "expectedVersion"
+    ],
     "hiddenButtonIsSecurityBoundary": false
-  },
-  "nativeTask": {
-    "sourceOfTruth": false,
-    "supportedUserChangeFirstDurableStep": "task-status-event-inbox",
-    "unsupportedOrUnauthorizedDrift": ["reject", "reproject"],
-    "completionMapsTo": "SubmitForReview",
-    "directDoneAllowed": false,
-    "loopFence": ["effectId", "externalTaskId", "coreVersion", "origin"]
-  },
-  "receiptIntent": {
-    "cause": "task_effect",
-    "manufacturesAssistantRunTerminal": false
   }
 }

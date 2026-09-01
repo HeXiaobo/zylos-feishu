@@ -3,12 +3,29 @@
 These fixtures characterize the Feishu adapter at the Wave 0 seam. They are
 test evidence only and do not change production behavior.
 
-## Cross-repository contract names
+## Common contract and adapter projections
 
-The files `accept-message.json`, `run-events.json`, `reply-intents.json`, and
-`delivery-receipts.json` use the Core v1 names and meanings. Feishu route and
-`targetRef` values are deliberately opaque strings to Core. Execution,
-delivery, projection, presence, and task effects remain separate state axes.
+`common-contract-vectors.json` is the byte-identical copy of the frozen
+cross-repository v1 contract. Its SHA-256 is fixed in `fixture-manifest.json`.
+The split Feishu fixtures contain adapter-owned bindings and references to
+that common file; they do not redefine Core fields or state semantics.
+
+- `accept-message.json`: Feishu transport identity, dedupe, lane, and context
+  bindings for the common `AcceptMessage` contract.
+- `run-events.json`: best-effort CardKit projection bindings for progress and
+  output deltas; execution terminal events and final intent remain independent.
+- `reply-intents.json`: Feishu presentation bindings for answer, failure, and
+task receipts; explicit silent completion creates no ReplyIntent.
+- `delivery-receipts.json`: adapter receipt/settlement bindings. A receipt
+records `outcome` and `externalRef`; retry exhaustion is an independent
+DeliverySettlement and platform acceptance is not user-read evidence.
+- `feishu-presentation.json`: reaction/presence, card projection, and final
+adapter lifecycle owned by Feishu.
+- `feishu-task-effects.json`: native-task projection and authorization seam.
+
+`feishu-intake.json` is retained as a legacy fixture name for characterization
+tests and only points at `accept-message.json`; the old duplicate public
+schema is intentionally not maintained.
 
 ## Official control and fork attribution
 
@@ -34,5 +51,5 @@ by passing fixture assertions plus `test.todo` cases. In particular, the local
 strings `排队超时` and `本次回复未生成` are projection/observation output;
 they are not evidence that the shared Runtime emitted `RunFailed`.
 
-The common fixture file hashes are written to `fixture-manifest.json` so the
-parent integration task can compare names and bytes across repositories.
+The common fixture hash is written to `fixture-manifest.json` so the parent
+integration task can compare names and bytes across repositories.

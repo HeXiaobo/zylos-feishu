@@ -1,6 +1,16 @@
 {
   "schemaVersion": 1,
   "contract": "FeishuPresentation",
+  "commonContractRefs": [
+    {
+      "file": "common-contract-vectors.json",
+      "pointer": "replyOutcomes"
+    },
+    {
+      "file": "common-contract-vectors.json",
+      "pointer": "deliverySettlements"
+    }
+  ],
   "presenceLifecycle": {
     "beginAfter": "durable_acceptance",
     "keepActiveDuring": [
@@ -12,27 +22,86 @@
       "delivery_unknown"
     ],
     "settlements": [
-      { "intent": "answer", "on": ["platform_accepted", "reconciled"], "presence": "finished" },
-      { "intent": "failure_notice", "on": ["platform_accepted", "reconciled"], "presence": "finished" },
-      { "intent": "task_receipt", "on": ["platform_accepted", "reconciled"], "presence": "finished" },
-      { "intent": "silent", "on": ["suppressed"], "presence": "finished" },
-      { "intent": "any", "on": ["unknown"], "presence": "active", "next": "reconcile" },
+      {
+        "intent": "answer",
+        "on": [
+          "platform_accepted",
+          "reconciled"
+        ],
+        "presence": "finished"
+      },
+      {
+        "intent": "failure_notice",
+        "on": [
+          "platform_accepted",
+          "reconciled"
+        ],
+        "presence": "finished"
+      },
+      {
+        "intent": "task_receipt",
+        "on": [
+          "platform_accepted",
+          "reconciled"
+        ],
+        "presence": "finished"
+      },
+      {
+        "intent": "silent",
+        "on": [
+          "suppressed"
+        ],
+        "presence": "finished"
+      },
+      {
+        "intent": "cancelled",
+        "on": [
+          "cancelled_confirmed"
+        ],
+        "presence": "finished"
+      },
       {
         "intent": "any",
-        "on": ["delivery_exhausted"],
+        "on": [
+          "unknown"
+        ],
+        "presence": "active",
+        "next": "reconcile"
+      },
+      {
+        "intent": "any",
+        "on": [
+          "delivery_exhausted"
+        ],
         "presence": "finished_unpresentable",
         "alert": true,
         "delivered": false
       }
     ],
-    "orphanRecovery": { "retryPresenceRemoval": true, "resendFinalReply": false }
+    "orphanRecovery": {
+      "retryPresenceRemoval": true,
+      "resendFinalReply": false
+    }
   },
   "projection": {
     "owner": "feishu",
-    "coalesceKey": ["requestId", "presentationId"],
-    "rateLimitWindowMs": { "minimum": 250, "maximum": 1000 },
-    "persisted": ["highWatermark", "lastAppliedSequence", "cardKitSequence"],
-    "terminalBarrier": { "trailingFlush": true, "blocksFinalIntent": false },
+    "coalesceKey": [
+      "requestId",
+      "presentationId"
+    ],
+    "rateLimitWindowMs": {
+      "minimum": 250,
+      "maximum": 1000
+    },
+    "persisted": [
+      "highWatermark",
+      "lastAppliedSequence",
+      "cardKitSequence"
+    ],
+    "terminalBarrier": {
+      "trailingFlush": true,
+      "blocksFinalIntent": false
+    },
     "projectionFailureCreatesRunFailed": false,
     "duplicateCreatesCard": false,
     "duplicateCreatesReaction": false,
@@ -42,9 +111,19 @@
   "finalAdapter": {
     "physicalStore": "feishu-local",
     "sharedPhysicalOutboxWithHxa": false,
-    "operations": ["attempt", "receipt", "reconcile", "retry", "dead_letter", "redrive"],
+    "operations": [
+      "attempt",
+      "receipt",
+      "reconcile",
+      "retry",
+      "dead_letter",
+      "redrive"
+    ],
     "unknownBeforeRetry": "reconcile",
-    "redriveReuses": ["intentId", "deliveryId"],
+    "redriveReuses": [
+      "intentId",
+      "deliveryId"
+    ],
     "platformAcceptedMeansUserRead": false,
     "deliveryExhaustionChangesRunOutcome": false
   }
