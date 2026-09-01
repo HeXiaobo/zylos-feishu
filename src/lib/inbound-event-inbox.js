@@ -381,6 +381,22 @@ function initializeSchema(database) {
       );
     }
   }
+  const splitIdentity = database.prepare(`
+    SELECT source.kind, source.value,
+           source.inbox_id AS source_inbox_id,
+           legacy.inbox_id AS legacy_inbox_id
+    FROM feishu_inbound_source_identities source
+    JOIN feishu_inbound_identities legacy
+      ON legacy.kind = source.kind AND legacy.value = source.value
+    WHERE source.inbox_id <> legacy.inbox_id
+    LIMIT 1
+  `).get();
+  if (splitIdentity) {
+    throw domainError(
+      'IDENTITY_CONFLICT',
+      'legacy and namespaced identities split the same source identity across inbox rows',
+    );
+  }
 }
 
 function toView(row) {
@@ -451,7 +467,12 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
   database.pragma('journal_mode = WAL');
   database.pragma('synchronous = FULL');
   database.pragma('foreign_keys = ON');
-  database.transaction(() => initializeSchema(database)).immediate();
+  try {
+    database.transaction(() => initializeSchema(database)).immediate();
+  } catch (error) {
+    database.close();
+    throw error;
+  }
 
   const selectById = database.prepare('SELECT * FROM feishu_inbound_inbox WHERE id = ?');
   const selectIdentity = database.prepare(`

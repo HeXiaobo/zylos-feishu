@@ -895,3 +895,59 @@ test('schema migration rebuilds missing namespaced identities without duplicatin
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('schema migration fails closed when legacy and namespaced identities split across rows', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-split-identity-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const eventId = 'evt_split_identity';
+  const messageId = 'om_split_identity';
+  try {
+    const inbox = openInboundEventInbox({ dbPath, clock: () => 7, maxAttempts: 3 });
+    inbox.receive({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      eventId,
+      messageId,
+      payload: { canonical: 'namespaced row' },
+      conversationLaneKey: 'feishu:cli_app_a:group:oc_split:chat',
+      sourceOrder: null,
+    });
+    inbox.close();
+
+    const legacyPayload = JSON.stringify({
+      message: { message_id: messageId, content: JSON.stringify({ text: 'legacy row' }) },
+      sender: { sender_id: { open_id: 'ou_split' } },
+      _timestamp: '1787900000000',
+    });
+    const damaged = new Database(dbPath);
+    const inserted = damaged.prepare(`
+      INSERT INTO feishu_inbound_inbox (
+        event_id, message_id, request_fingerprint, payload_json, status,
+        available_at, received_at, updated_at, writer_provenance, legacy_payload_json
+      ) VALUES (?, ?, ?, ?, 'received', 7, 7, 7, 'legacy-v0', ?)
+    `).run(
+      eventId,
+      messageId,
+      createHash('sha256').update(legacyPayload).digest('hex'),
+      legacyPayload,
+      legacyPayload,
+    );
+    const legacyId = Number(inserted.lastInsertRowid);
+    damaged.prepare(`
+      INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, ?)
+    `).run('event', eventId, legacyId);
+    damaged.prepare(`
+      INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, ?)
+    `).run('message', messageId, legacyId);
+    damaged.close();
+
+    assert.throws(
+      () => openInboundEventInbox({ dbPath, clock: () => 8, maxAttempts: 3 }),
+      (error) => error.code === 'IDENTITY_CONFLICT'
+        && /legacy and namespaced/i.test(error.message),
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
