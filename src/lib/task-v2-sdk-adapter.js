@@ -1,5 +1,6 @@
 import {
   parseCanonicalTaskV2Marker,
+  snapshotCanonicalDataRecord,
   TASK_V2_MARKER_SCHEMA,
   taskV2MarkerRecord,
 } from './task-v2-marker.js';
@@ -44,16 +45,23 @@ function optionalNonNegativeInteger(value, field) {
 
 function normalizeEffectIdentity(value, task) {
   if (value === undefined || value === null) return null;
-  const identity = requireRecord(value, 'effectIdentity');
+  const identity = snapshotCanonicalDataRecord(value, 'effectIdentity');
   const allowed = new Set([
     'tenantRef', 'accountRef', 'effectId', 'payloadHash', 'coreTaskId', 'coreTaskVersion',
   ]);
-  const unknown = Object.keys(identity).find(key => !allowed.has(key));
-  if (unknown || Object.keys(identity).length !== allowed.size) {
-    throw new TypeError('effectIdentity contains unsupported or missing fields');
+  const keys = Reflect.ownKeys(identity);
+  const unknown = keys.find(key => !allowed.has(key));
+  if (unknown || keys.length !== allowed.size) {
+    const error = new TypeError('effectIdentity contains unsupported or missing fields');
+    error.code = 'EXTERNAL_IDENTITY_CONFLICT';
+    error.retryable = false;
+    throw error;
   }
   if (identity.coreTaskId !== task.id || identity.coreTaskVersion !== task.version) {
-    throw new TypeError('effectIdentity does not match task identity/version');
+    const error = new TypeError('effectIdentity does not match task identity/version');
+    error.code = 'EXTERNAL_IDENTITY_CONFLICT';
+    error.retryable = false;
+    throw error;
   }
   const marker = parseCanonicalTaskV2Marker({
     schema: TASK_V2_MARKER_SCHEMA,
@@ -216,6 +224,13 @@ function taskFromResponse(response, operation) {
 
 function wrapSdkFailure(operation, error) {
   if (error instanceof FeishuTaskV2Error) throw error;
+  if (error?.code === 'EXTERNAL_IDENTITY_CONFLICT' && error?.retryable === false) {
+    throw new FeishuTaskV2Error('Task v2 marker is not canonical', {
+      code: 'EXTERNAL_IDENTITY_CONFLICT',
+      retryable: false,
+      cause: error,
+    });
+  }
   const status = error?.response?.status;
   const retryable = status === undefined || status === 429 || status >= 500;
   throw new FeishuTaskV2Error(error?.message || `Feishu Task v2 ${operation} failed`, {

@@ -6,6 +6,7 @@ import {
 } from './task-effect-settlement.js';
 import {
   parseCanonicalTaskV2Marker,
+  snapshotCanonicalDataRecord,
   TASK_V2_MARKER_SCHEMA,
 } from './task-v2-marker.js';
 
@@ -127,11 +128,11 @@ function effectIdentity(effect, identity) {
 }
 
 function normalizeRemote(value) {
-  const remote = requireRecord(value, 'native Task projection');
-  return {
+  const remote = snapshotCanonicalDataRecord(value, 'native Task projection');
+  return Object.freeze({
     ...remote,
     guid: requireText(remote.guid, 'native Task guid'),
-  };
+  });
 }
 
 function receipt(outcome, claim, remote) {

@@ -101,3 +101,96 @@ test('canonical Task v2 marker parser admits only exact legacy or complete state
     );
   }
 });
+
+test('canonical Task v2 marker parser rejects hidden keys and non-data descriptors', () => {
+  const hiddenUnknown = completeMarker();
+  Object.defineProperty(hiddenUnknown, 'evil', { value: true });
+
+  const hiddenIdentity = {
+    schema: TASK_V2_MARKER_SCHEMA,
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+  };
+  Object.defineProperty(hiddenIdentity, 'tenantRef', { value: 'tenant-1' });
+
+  const symbolUnknown = completeMarker();
+  symbolUnknown[Symbol('evil')] = true;
+
+  const symbolIdentity = {
+    schema: TASK_V2_MARKER_SCHEMA,
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+    [Symbol('tenantRef')]: 'tenant-1',
+  };
+
+  const getterMarker = completeMarker();
+  Object.defineProperty(getterMarker, 'coreTaskVersion', {
+    enumerable: true,
+    configurable: true,
+    get: () => 3,
+  });
+
+  const throwingGetter = completeMarker();
+  Object.defineProperty(throwingGetter, 'coreTaskId', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      throw new Error('secret getter failure');
+    },
+  });
+
+  const readonlyField = completeMarker();
+  Object.defineProperty(readonlyField, 'effectId', {
+    value: 'effect-task-1-v3',
+    enumerable: true,
+    configurable: true,
+    writable: false,
+  });
+
+  const fixedField = completeMarker();
+  Object.defineProperty(fixedField, 'effectId', {
+    value: 'effect-task-1-v3',
+    enumerable: true,
+    configurable: false,
+    writable: true,
+  });
+
+  const proxyTrap = new Proxy(completeMarker(), {
+    ownKeys() {
+      throw new Error('secret proxy failure');
+    },
+  });
+
+  for (const [name, marker] of [
+    ['hidden unknown', hiddenUnknown],
+    ['hidden identity', hiddenIdentity],
+    ['symbol unknown', symbolUnknown],
+    ['symbol identity', symbolIdentity],
+    ['getter', getterMarker],
+    ['throwing getter', throwingGetter],
+    ['readonly field', readonlyField],
+    ['non-configurable field', fixedField],
+    ['proxy trap', proxyTrap],
+  ]) {
+    assert.throws(
+      () => parseCanonicalTaskV2Marker(marker),
+      error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+        && error?.retryable === false
+        && !error.message.includes('secret'),
+      name,
+    );
+  }
+});
+
+test('canonical Task v2 marker parser snapshots data before later mutation', () => {
+  const marker = completeMarker();
+  const parsed = parseCanonicalTaskV2Marker(marker);
+  marker.coreTaskId = 'task-mutated';
+  marker.coreTaskVersion = 99;
+  marker.effectId = 'effect-mutated';
+
+  assert.equal(parsed.coreTaskId, 'task-1');
+  assert.equal(parsed.coreTaskVersion, 3);
+  assert.equal(parsed.effectId, 'effect-task-1-v3');
+  assert.equal(Object.isFrozen(parsed), true);
+});

@@ -210,6 +210,67 @@ test('malformed projection markers reject before actor verification or Core comm
   }
 });
 
+test('non-data projection objects reject without getter, actor, or Core command side effects', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-native-task-object-'));
+  let actorChecks = 0;
+  let submits = 0;
+  let getterReads = 0;
+  try {
+    const inbox = createTaskV2StatusInbox({ directory, clock: () => 1_788_000_000_000 });
+    let currentProjection;
+    const backflow = createFeishuNativeTaskBackflow({
+      inbox,
+      identity: { appId: 'cli-app', tenantRef: 'tenant-1', accountRef: 'acct-1' },
+      resolveProjection: async () => currentProjection,
+      verifyActor: async () => {
+        actorChecks += 1;
+        return {
+          actor: {
+            provider: 'feishu', tenantRef: 'tenant-1', externalId: 'user-1',
+            provenance: 'verified_channel_actor',
+          },
+          assertion: Object.freeze({ trusted: true }),
+        };
+      },
+      taskCommandPort: {
+        submit() { submits += 1; return { accepted: true }; },
+      },
+    });
+    backflow.ingest(nativeEvent({ eventId: 'evt-non-data-projection' }));
+    const [event] = inbox.pending({ limit: 1 });
+    const hidden = projection();
+    Object.defineProperty(hidden, 'evil', { value: true });
+    const symbol = projection();
+    symbol[Symbol('evil')] = true;
+    const getter = projection();
+    Object.defineProperty(getter, 'coreVersion', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterReads += 1;
+        return 7;
+      },
+    });
+    const proxy = new Proxy(projection(), {
+      ownKeys() { throw new Error('secret proxy failure'); },
+    });
+
+    for (currentProjection of [hidden, symbol, getter, proxy]) {
+      assert.deepEqual(await backflow.handle(event), {
+        status: 'rejected',
+        code: 'PROJECTION_IDENTITY_DRIFT',
+        repair: 'reproject',
+      });
+    }
+    assert.equal(getterReads, 0);
+    assert.equal(actorChecks, 0);
+    assert.equal(submits, 0);
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('supported start/submit/reject/accept/update backflow commands preserve capability and loop suppression', async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-native-task-actions-'));
   const submitted = [];

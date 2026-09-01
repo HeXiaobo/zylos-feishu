@@ -16,15 +16,39 @@ function invalid(field, detail) {
   return error;
 }
 
-function requirePlainRecord(value, field) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || utilTypes.isProxy(value)) {
-    throw invalid(field, 'expected a non-proxy plain object');
+export function snapshotCanonicalDataRecord(value, field = 'canonical data record') {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || utilTypes.isProxy(value)) {
+      throw new TypeError('invalid record');
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError('invalid prototype');
+    }
+    const keys = Reflect.ownKeys(value);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const snapshot = Object.create(null);
+    for (const key of keys) {
+      if (typeof key !== 'string') throw new TypeError('symbol key');
+      const descriptor = descriptors[key];
+      if (!descriptor
+          || !Object.hasOwn(descriptor, 'value')
+          || descriptor.enumerable !== true
+          || descriptor.configurable !== true
+          || descriptor.writable !== true) {
+        throw new TypeError('invalid property descriptor');
+      }
+      Object.defineProperty(snapshot, key, {
+        value: descriptor.value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return Object.freeze(snapshot);
+  } catch {
+    throw invalid(field, 'expected a canonical non-proxy plain data object');
   }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw invalid(field, 'expected a plain object');
-  }
-  return value;
 }
 
 function requireCanonicalId(value, field) {
@@ -44,8 +68,8 @@ function requireCanonicalVersion(value, field) {
 }
 
 export function parseCanonicalTaskV2Marker(value, field = 'Task v2 marker') {
-  const marker = requirePlainRecord(value, field);
-  const keys = Object.keys(marker);
+  const marker = snapshotCanonicalDataRecord(value, field);
+  const keys = Reflect.ownKeys(marker);
   const unknown = keys.find(key => !ALLOWED_FIELDS.has(key));
   if (unknown) throw invalid(field, `unsupported field: ${unknown}`);
   for (const required of BASE_FIELDS) {

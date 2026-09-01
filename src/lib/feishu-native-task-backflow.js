@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { parseCanonicalSha256 } from './canonical-sha256.js';
 import {
   parseCanonicalTaskV2Marker,
+  snapshotCanonicalDataRecord,
   TASK_V2_MARKER_SCHEMA,
 } from './task-v2-marker.js';
 
@@ -220,7 +221,15 @@ export function createFeishuNativeTaskBackflow({
       }
       const mapping = ACTIONS[payload.action];
       if (!mapping) return reject('UNSUPPORTED_CHANGE');
-      const projection = await resolveProjection(payload.externalTaskId);
+      let projection;
+      try {
+        projection = snapshotCanonicalDataRecord(
+          await resolveProjection(payload.externalTaskId),
+          'native Task backflow projection',
+        );
+      } catch {
+        return reject('PROJECTION_IDENTITY_DRIFT');
+      }
       const marker = parseProjectionMarker(projection);
       if (!marker || !exactProjectionMatches(marker, projection, payload)) {
         return reject('PROJECTION_IDENTITY_DRIFT');

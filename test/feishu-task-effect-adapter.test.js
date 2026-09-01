@@ -236,6 +236,64 @@ test('malformed legacy-style markers are external conflicts, never adoption cand
   }
 });
 
+test('non-data native Task readback rejects without getter or update side effects', async () => {
+  const targetEffect = effect(2);
+  const baseRemote = () => ({
+    guid: 'guid-task-1',
+    url: 'https://example.invalid/task-1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 2,
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    effectId: targetEffect.effectId,
+    payloadHash: taskEffectPayloadHash(targetEffect),
+  });
+  let getterReads = 0;
+  const hidden = baseRemote();
+  Object.defineProperty(hidden, 'evil', { value: true });
+  const symbol = baseRemote();
+  symbol[Symbol('evil')] = true;
+  const getter = baseRemote();
+  Object.defineProperty(getter, 'coreTaskVersion', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterReads += 1;
+      return 2;
+    },
+  });
+  const proxy = new Proxy(baseRemote(), {
+    ownKeys() { throw new Error('secret proxy failure'); },
+  });
+
+  for (const remote of [hidden, symbol, getter, proxy]) {
+    let updates = 0;
+    const adapter = createFeishuTaskEffectAdapter({
+      gateway: {
+        async findTasksByCoreTaskId() { return [remote]; },
+        async createTask() { throw new Error('not used'); },
+        async updateTask() { updates += 1; throw new Error('must not update'); },
+      },
+      memberMapper: { map: () => [] },
+      identity: { tenantRef: 'tenant-1', accountRef: 'acct-1' },
+    });
+    await assert.rejects(
+      () => adapter.apply({
+        effect: targetEffect,
+        attempt: 1,
+        leaseEpoch: 1,
+        workerId: 'worker-a',
+        generation: 0,
+      }),
+      error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+        && error?.retryable === false
+        && !error.message.includes('secret'),
+    );
+    assert.equal(updates, 0);
+  }
+  assert.equal(getterReads, 0);
+});
+
 test('legacy Task marker cannot be adopted concurrently through the TaskEffect adapter', async () => {
   const state = harness();
   state.remote = {
