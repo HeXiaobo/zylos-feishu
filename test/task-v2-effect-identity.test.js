@@ -273,3 +273,383 @@ test('Task v2 SDK rejects non-data effect identity before native create I/O', as
   assert.equal(getterReads, 0);
   assert.equal(creates, 0);
 });
+
+test('Task v2 SDK update rejects a readback extra getter without invoking it or patching', async () => {
+  let getterReads = 0;
+  let patches = 0;
+  const task = nativeTask(JSON.stringify({
+    schema: 'zylos.task-v2-projection/v1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    effectId: 'effect-task-1-v3',
+    payloadHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  }));
+  Object.defineProperty(task, 'extra', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterReads += 1;
+      throw new Error('secret extra getter failure');
+    },
+  });
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { patches += 1; throw new Error('must not patch'); },
+    async get() { return { code: 0, data: { task } }; },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return { code: 0, data: { items: [], has_more: false } }; },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+
+  await assert.rejects(
+    () => gateway.updateTask({
+      taskGuid: 'guid-effect-1',
+      task: {
+        id: 'task-1', version: 3, title: 'Effect identity', state: 'in_progress',
+        updatedAt: '2026-09-01T00:00:00.000Z',
+      },
+      members: [],
+      clientToken: 'zte_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      effectIdentity: {
+        tenantRef: 'tenant-1',
+        accountRef: 'acct-1',
+        effectId: 'effect-task-1-v3',
+        payloadHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        coreTaskId: 'task-1',
+        coreTaskVersion: 3,
+      },
+    }),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+      && error?.retryable === false
+      && !error.message.includes('secret'),
+  );
+  assert.equal(getterReads, 0);
+  assert.equal(patches, 0);
+});
+
+test('Task v2 SDK get rejects a response task getter without invoking it', async () => {
+  let getterReads = 0;
+  const data = {};
+  Object.defineProperty(data, 'task', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterReads += 1;
+      throw new Error('secret task getter failure');
+    },
+  });
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { throw new Error('not used'); },
+    async get() { return { code: 0, data }; },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return { code: 0, data: { items: [], has_more: false } }; },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+
+  await assert.rejects(
+    () => gateway.getTask('guid-effect-1'),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+      && error?.retryable === false
+      && !error.message.includes('secret'),
+  );
+  assert.equal(getterReads, 0);
+});
+
+test('Task v2 SDK list rejects a candidate extra getter before candidate readback', async () => {
+  let getterReads = 0;
+  let getCalls = 0;
+  const candidate = { guid: 'guid-effect-1' };
+  Object.defineProperty(candidate, 'extra', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterReads += 1;
+      throw new Error('secret list extra getter failure');
+    },
+  });
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { throw new Error('not used'); },
+    async get() { getCalls += 1; throw new Error('must not get candidate'); },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() {
+      return { code: 0, data: { items: [candidate], has_more: false } };
+    },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+
+  await assert.rejects(
+    () => gateway.listManagedTasks(),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+      && error?.retryable === false
+      && !error.message.includes('secret'),
+  );
+  assert.equal(getterReads, 0);
+  assert.equal(getCalls, 0);
+});
+
+test('Task v2 SDK list rejects a proxied items array without invoking its traps', async () => {
+  let trapReads = 0;
+  let getCalls = 0;
+  const items = new Proxy([], {
+    get() {
+      trapReads += 1;
+      throw new Error('secret items proxy failure');
+    },
+  });
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { throw new Error('not used'); },
+    async get() { getCalls += 1; throw new Error('must not get candidate'); },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return { code: 0, data: { items, has_more: false } }; },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+
+  await assert.rejects(
+    () => gateway.listManagedTasks(),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+      && error?.retryable === false
+      && !error.message.includes('secret'),
+  );
+  assert.equal(trapReads, 0);
+  assert.equal(getCalls, 0);
+});
+
+test('Task v2 SDK list rejects an items getter before reading the array container', async () => {
+  let getterReads = 0;
+  let getCalls = 0;
+  const data = { has_more: false };
+  Object.defineProperty(data, 'items', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterReads += 1;
+      throw new Error('secret items getter failure');
+    },
+  });
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { throw new Error('not used'); },
+    async get() { getCalls += 1; throw new Error('must not get candidate'); },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return { code: 0, data }; },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+
+  await assert.rejects(
+    () => gateway.listManagedTasks(),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+      && error?.retryable === false
+      && !error.message.includes('secret'),
+  );
+  assert.equal(getterReads, 0);
+  assert.equal(getCalls, 0);
+});
+
+test('Task v2 SDK readback rejects a proxied members array without invoking its traps', async () => {
+  let trapReads = 0;
+  const extra = JSON.stringify({
+    schema: 'zylos.task-v2-projection/v1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    effectId: 'effect-task-1-v3',
+    payloadHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  });
+  const task = nativeTask(extra);
+  task.members = new Proxy([], {
+    get() {
+      trapReads += 1;
+      throw new Error('secret members proxy failure');
+    },
+  });
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { throw new Error('not used'); },
+    async get() { return { code: 0, data: { task } }; },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return { code: 0, data: { items: [], has_more: false } }; },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+
+  await assert.rejects(
+    () => gateway.getTask('guid-effect-1'),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+      && error?.retryable === false
+      && !error.message.includes('secret'),
+  );
+  assert.equal(trapReads, 0);
+});
+
+test('Task v2 SDK readback rejects a due timestamp getter without invoking it', async () => {
+  let getterReads = 0;
+  const extra = JSON.stringify({
+    schema: 'zylos.task-v2-projection/v1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    effectId: 'effect-task-1-v3',
+    payloadHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  });
+  const task = nativeTask(extra);
+  const due = {};
+  Object.defineProperty(due, 'timestamp', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterReads += 1;
+      throw new Error('secret due getter failure');
+    },
+  });
+  task.due = due;
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { throw new Error('not used'); },
+    async get() { return { code: 0, data: { task } }; },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return { code: 0, data: { items: [], has_more: false } }; },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+
+  await assert.rejects(
+    () => gateway.getTask('guid-effect-1'),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+      && error?.retryable === false
+      && !error.message.includes('secret'),
+  );
+  assert.equal(getterReads, 0);
+});
+
+test('Task v2 SDK readback rejects a proxied task without invoking its get trap', async () => {
+  let trapReads = 0;
+  const task = new Proxy(nativeTask(JSON.stringify({
+    schema: 'zylos.task-v2-projection/v1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+  })), {
+    get() {
+      trapReads += 1;
+      throw new Error('secret task proxy failure');
+    },
+  });
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { throw new Error('not used'); },
+    async get() { return { code: 0, data: { task } }; },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return { code: 0, data: { items: [], has_more: false } }; },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+
+  await assert.rejects(
+    () => gateway.getTask('guid-effect-1'),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+      && error?.retryable === false
+      && !error.message.includes('secret'),
+  );
+  assert.equal(trapReads, 0);
+});
+
+test('Task v2 SDK readback remains stable after its source task mutates', async () => {
+  const extra = JSON.stringify({
+    schema: 'zylos.task-v2-projection/v1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    effectId: 'effect-task-1-v3',
+    payloadHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  });
+  const task = nativeTask(extra);
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { throw new Error('not used'); },
+    async get() { return { code: 0, data: { task } }; },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return { code: 0, data: { items: [], has_more: false } }; },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+  const result = await gateway.getTask('guid-effect-1');
+
+  task.guid = 'guid-mutated';
+  task.extra = JSON.stringify({
+    schema: 'zylos.task-v2-projection/v1',
+    coreTaskId: 'task-mutated',
+    coreTaskVersion: 99,
+  });
+  task.members.push({ id: 'mutated', type: 'user', role: 'assignee' });
+
+  assert.equal(result.guid, 'guid-effect-1');
+  assert.equal(result.coreTaskId, 'task-1');
+  assert.equal(result.coreTaskVersion, 3);
+  assert.deepEqual(result.members, []);
+});
+
+test('Task v2 SDK rejects non-text failure messages without coercing them', async () => {
+  let coercions = 0;
+  const hostileMessage = {
+    [Symbol.toPrimitive]() {
+      coercions += 1;
+      throw new Error('secret response message coercion');
+    },
+  };
+  const failure = { code: 400, msg: hostileMessage };
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch() { throw new Error('not used'); },
+    async get() { return failure; },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return failure; },
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+
+  await assert.rejects(
+    () => gateway.getTask('guid-effect-1'),
+    error => error?.code === 400
+      && error?.message === 'Feishu Task v2 get failed'
+      && !error.message.includes('secret'),
+  );
+  await assert.rejects(
+    () => gateway.listManagedTasks(),
+    error => error?.code === 400
+      && error?.message === 'Feishu Task v2 list failed'
+      && !error.message.includes('secret'),
+  );
+  assert.equal(coercions, 0);
+});

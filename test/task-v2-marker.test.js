@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   parseCanonicalTaskV2Marker,
+  snapshotCanonicalDataArray,
   TASK_V2_MARKER_SCHEMA,
   taskV2MarkerRecord,
 } from '../src/lib/task-v2-marker.js';
@@ -160,6 +161,7 @@ test('canonical Task v2 marker parser rejects hidden keys and non-data descripto
       throw new Error('secret proxy failure');
     },
   });
+  const frozenMarker = Object.freeze(completeMarker());
 
   for (const [name, marker] of [
     ['hidden unknown', hiddenUnknown],
@@ -171,6 +173,7 @@ test('canonical Task v2 marker parser rejects hidden keys and non-data descripto
     ['readonly field', readonlyField],
     ['non-configurable field', fixedField],
     ['proxy trap', proxyTrap],
+    ['frozen marker', frozenMarker],
   ]) {
     assert.throws(
       () => parseCanonicalTaskV2Marker(marker),
@@ -193,4 +196,75 @@ test('canonical Task v2 marker parser snapshots data before later mutation', () 
   assert.equal(parsed.coreTaskVersion, 3);
   assert.equal(parsed.effectId, 'effect-task-1-v3');
   assert.equal(Object.isFrozen(parsed), true);
+});
+
+test('canonical data array snapshot admits only dense plain data arrays', () => {
+  let getterReads = 0;
+  const sparse = new Array(1);
+  const symbol = [];
+  symbol[Symbol('evil')] = true;
+  const accessor = ['value'];
+  Object.defineProperty(accessor, '0', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      getterReads += 1;
+      return 'value';
+    },
+  });
+  const hidden = ['value'];
+  Object.defineProperty(hidden, '0', {
+    value: 'value',
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  const readonly = ['value'];
+  Object.defineProperty(readonly, '0', {
+    value: 'value',
+    enumerable: true,
+    configurable: true,
+    writable: false,
+  });
+  const proxy = new Proxy([], {
+    get() {
+      getterReads += 1;
+      throw new Error('secret array proxy failure');
+    },
+  });
+
+  for (const [name, value] of [
+    ['sparse', sparse],
+    ['symbol', symbol],
+    ['accessor', accessor],
+    ['hidden', hidden],
+    ['readonly', readonly],
+    ['proxy', proxy],
+  ]) {
+    assert.throws(
+      () => snapshotCanonicalDataArray(value),
+      error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+        && error?.retryable === false
+        && !error.message.includes('secret'),
+      name,
+    );
+  }
+  assert.equal(getterReads, 0);
+
+  const input = ['first'];
+  const snapshot = snapshotCanonicalDataArray(input);
+  input[0] = 'mutated';
+  input.push('later');
+  assert.deepEqual(snapshot, ['first']);
+  assert.equal(Object.isFrozen(snapshot), true);
+
+  const frozenInput = Object.freeze(['trusted']);
+  assert.throws(
+    () => snapshotCanonicalDataArray(frozenInput),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT' && error?.retryable === false,
+  );
+  assert.deepEqual(
+    snapshotCanonicalDataArray(frozenInput, 'SDK response array', { allowFrozen: true }),
+    ['trusted'],
+  );
 });

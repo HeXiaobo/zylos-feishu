@@ -16,7 +16,11 @@ function invalid(field, detail) {
   return error;
 }
 
-export function snapshotCanonicalDataRecord(value, field = 'canonical data record') {
+export function snapshotCanonicalDataRecord(
+  value,
+  field = 'canonical data record',
+  { allowFrozen = false } = {},
+) {
   try {
     if (!value || typeof value !== 'object' || Array.isArray(value) || utilTypes.isProxy(value)) {
       throw new TypeError('invalid record');
@@ -27,15 +31,21 @@ export function snapshotCanonicalDataRecord(value, field = 'canonical data recor
     }
     const keys = Reflect.ownKeys(value);
     const descriptors = Object.getOwnPropertyDescriptors(value);
+    const frozenInput = allowFrozen && Object.isFrozen(value);
     const snapshot = Object.create(null);
     for (const key of keys) {
       if (typeof key !== 'string') throw new TypeError('symbol key');
       const descriptor = descriptors[key];
+      const standardData = descriptor?.enumerable === true
+        && descriptor?.configurable === true
+        && descriptor?.writable === true;
+      const frozenData = frozenInput
+        && descriptor?.enumerable === true
+        && descriptor?.configurable === false
+        && descriptor?.writable === false;
       if (!descriptor
           || !Object.hasOwn(descriptor, 'value')
-          || descriptor.enumerable !== true
-          || descriptor.configurable !== true
-          || descriptor.writable !== true) {
+          || (!standardData && !frozenData)) {
         throw new TypeError('invalid property descriptor');
       }
       Object.defineProperty(snapshot, key, {
@@ -48,6 +58,58 @@ export function snapshotCanonicalDataRecord(value, field = 'canonical data recor
     return Object.freeze(snapshot);
   } catch {
     throw invalid(field, 'expected a canonical non-proxy plain data object');
+  }
+}
+
+export function snapshotCanonicalDataArray(
+  value,
+  field = 'canonical data array',
+  { allowFrozen = false } = {},
+) {
+  try {
+    if (!value || typeof value !== 'object' || utilTypes.isProxy(value) || !Array.isArray(value)) {
+      throw new TypeError('invalid array');
+    }
+    if (Object.getPrototypeOf(value) !== Array.prototype) {
+      throw new TypeError('invalid array prototype');
+    }
+    const keys = Reflect.ownKeys(value);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const lengthDescriptor = descriptors.length;
+    const frozenInput = allowFrozen && Object.isFrozen(value);
+    const canonicalLength = lengthDescriptor?.enumerable === false
+      && lengthDescriptor?.configurable === false
+      && (lengthDescriptor?.writable === true
+        || (frozenInput && lengthDescriptor?.writable === false));
+    if (!lengthDescriptor
+        || !Object.hasOwn(lengthDescriptor, 'value')
+        || !Number.isSafeInteger(lengthDescriptor.value)
+        || lengthDescriptor.value < 0
+        || !canonicalLength
+        || keys.length !== lengthDescriptor.value + 1) {
+      throw new TypeError('invalid array length');
+    }
+    const snapshot = new Array(lengthDescriptor.value);
+    for (let index = 0; index < lengthDescriptor.value; index += 1) {
+      const key = String(index);
+      const descriptor = descriptors[key];
+      const standardData = descriptor?.enumerable === true
+        && descriptor?.configurable === true
+        && descriptor?.writable === true;
+      const frozenData = frozenInput
+        && descriptor?.enumerable === true
+        && descriptor?.configurable === false
+        && descriptor?.writable === false;
+      if (!descriptor
+          || !Object.hasOwn(descriptor, 'value')
+          || (!standardData && !frozenData)) {
+        throw new TypeError('invalid array item descriptor');
+      }
+      snapshot[index] = descriptor.value;
+    }
+    return Object.freeze(snapshot);
+  } catch {
+    throw invalid(field, 'expected a canonical dense non-proxy data array');
   }
 }
 
