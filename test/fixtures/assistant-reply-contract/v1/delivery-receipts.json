@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "contract": "FeishuDeliveryAdapter",
+  "commonReceiptRef": {
+    "file": "common-contract-vectors.json",
+    "pointer": "deliveryReceipts"
+  },
+  "commonSettlementRef": {
+    "file": "common-contract-vectors.json",
+    "pointer": "deliverySettlements"
+  },
+  "receiptPolicy": {
+    "outcomeField": "outcome",
+    "externalRefField": "externalRef",
+    "forbiddenFields": [
+      "result",
+      "userRead",
+      "userReceived",
+      "settlement"
+    ],
+    "unknownNext": "reconcile_before_retry",
+    "retryExhaustion": "delivery_settlement"
+  },
+  "bindings": [
+    {
+      "name": "platform-accepted",
+      "commonReceipt": "platformAccepted"
+    },
+    {
+      "name": "unknown-before-reconcile",
+      "commonReceipt": "unknown"
+    },
+    {
+      "name": "reconciled",
+      "commonReceipt": "reconciled"
+    },
+    {
+      "name": "rejected",
+      "commonReceipt": "rejected"
+    }
+  ],
+  "settlementBindings": [
+    {
+      "name": "accepted",
+      "commonSettlement": "accepted"
+    },
+    {
+      "name": "reconciled",
+      "commonSettlement": "reconciled"
+    },
+    {
+      "name": "delivery-exhausted",
+      "commonSettlement": "unpresentable"
+    }
+  ]
+}

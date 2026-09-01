@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "contract": "FeishuProgressAdapter",
+  "commonContractRef": {
+    "file": "common-contract-vectors.json",
+    "pointer": "runtimeEventStreams"
+  },
+  "projection": {
+    "consumes": [
+      "ProgressUpdated",
+      "OutputDelta"
+    ],
+    "ignoresExecutionTerminal": true,
+    "terminalFlush": true,
+    "finalIntentIndependent": true
+  },
+  "streamBindings": [
+    {
+      "name": "answer",
+      "commonStream": "answer-completed",
+      "presentation": "card"
+    },
+    {
+      "name": "failure",
+      "commonStream": "run-failed",
+      "presentation": "failure_notice"
+    },
+    {
+      "name": "cancelled",
+      "commonStream": "run-cancelled",
+      "presentation": "execution_only",
+      "presenceSettlement": "cancelled_confirmed"
+    },
+    {
+      "name": "silent",
+      "commonStream": "silent-completed",
+      "presentation": "presence_only"
+    }
+  ]
+}

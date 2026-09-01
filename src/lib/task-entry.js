@@ -143,12 +143,15 @@ export function buildC4ReceiveArgs({
   }
   if (assistantRequest) {
     const request = requireRecord(assistantRequest, 'assistantRequest');
-    requirePayloadFields(request, ['requestId', 'sourceId'], ['requestId', 'sourceId']);
+    requirePayloadFields(request, ['requestId', 'sourceId', 'requireIdle'], ['requestId', 'sourceId']);
     args.push(
       '--assistant-request-id', requireText(request.requestId, 'assistantRequest.requestId'),
       '--assistant-source-id', requireText(request.sourceId, 'assistantRequest.sourceId'),
-      '--block-queue-until-idle',
     );
+    if (request.requireIdle !== undefined && typeof request.requireIdle !== 'boolean') {
+      throw new TypeError('assistantRequest.requireIdle must be a boolean');
+    }
+    if (request.requireIdle !== false) args.push('--block-queue-until-idle');
   }
   if (workIntakeEnvelope) {
     args.push('--work-intake-envelope-json', JSON.stringify(workIntakeEnvelope));

@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   add `ROADMAP.md` to reflect the current native Task / CardKit / Smart-mode
   direction.
 
+## [0.3.7-rc.13] - 2026-09-02
+
+### Added
+- Make inbound conversation lanes durable and enforce per-lane concurrency for
+  restart-safe, bounded-concurrency processing.
+- Project reply, presence, and CardKit state through durable per-lane
+  presentation reconciliation.
+- Route native Task effects through the durable task path.
+- Add a final reply seam for reliable terminal response delivery.
+- Apply v2 publication governance to immutable sources, evidence, and owner
+  authorization before a candidate can be published.
+
 ## [0.3.7-rc.12] - 2026-08-30
 
 ### Fixed

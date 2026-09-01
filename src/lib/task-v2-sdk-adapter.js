@@ -1,5 +1,12 @@
+import {
+  parseCanonicalTaskV2Marker,
+  snapshotCanonicalDataArray,
+  snapshotCanonicalDataRecord,
+  TASK_V2_MARKER_SCHEMA,
+  taskV2MarkerRecord,
+} from './task-v2-marker.js';
+
 const USER_ID_TYPE = 'open_id';
-const MARKER_SCHEMA = 'zylos.task-v2-projection/v1';
 const PERMANENT_FEISHU_CODES = new Set([99992402]);
 const MAX_LIST_PAGES = 1_000;
 
@@ -37,21 +44,62 @@ function optionalNonNegativeInteger(value, field) {
   return value;
 }
 
-function taskMarker(task) {
-  return JSON.stringify({
-    schema: MARKER_SCHEMA,
-    coreTaskId: requireText(task.id, 'task.id'),
+function normalizeEffectIdentity(value, task) {
+  if (value === undefined || value === null) return null;
+  const identity = snapshotCanonicalDataRecord(value, 'effectIdentity');
+  const allowed = new Set([
+    'tenantRef', 'accountRef', 'effectId', 'payloadHash', 'coreTaskId', 'coreTaskVersion',
+  ]);
+  const keys = Reflect.ownKeys(identity);
+  const unknown = keys.find(key => !allowed.has(key));
+  if (unknown || keys.length !== allowed.size) {
+    const error = new TypeError('effectIdentity contains unsupported or missing fields');
+    error.code = 'EXTERNAL_IDENTITY_CONFLICT';
+    error.retryable = false;
+    throw error;
+  }
+  if (identity.coreTaskId !== task.id || identity.coreTaskVersion !== task.version) {
+    const error = new TypeError('effectIdentity does not match task identity/version');
+    error.code = 'EXTERNAL_IDENTITY_CONFLICT';
+    error.retryable = false;
+    throw error;
+  }
+  const marker = parseCanonicalTaskV2Marker({
+    schema: TASK_V2_MARKER_SCHEMA,
+    coreTaskId: task.id,
     coreTaskVersion: task.version,
-  });
+    tenantRef: identity.tenantRef,
+    accountRef: identity.accountRef,
+    effectId: identity.effectId,
+    payloadHash: identity.payloadHash,
+  }, 'effectIdentity');
+  return {
+    tenantRef: marker.tenantRef,
+    accountRef: marker.accountRef,
+    effectId: marker.effectId,
+    payloadHash: marker.payloadHash,
+  };
+}
+
+function taskMarker(task, rawEffectIdentity) {
+  const identity = normalizeEffectIdentity(rawEffectIdentity, task);
+  return JSON.stringify(taskV2MarkerRecord({
+    schema: TASK_V2_MARKER_SCHEMA,
+    coreTaskId: task.id,
+    coreTaskVersion: task.version,
+    ...(identity ?? {}),
+  }));
 }
 
 function parseTaskMarker(extra) {
   if (typeof extra !== 'string' || extra === '') return null;
   try {
     const marker = JSON.parse(extra);
-    if (marker?.schema !== MARKER_SCHEMA || typeof marker.coreTaskId !== 'string') return null;
-    return marker;
-  } catch {
+    if (!marker || typeof marker !== 'object' || Array.isArray(marker)) return null;
+    if (!Object.hasOwn(marker, 'schema') && !Object.hasOwn(marker, 'coreTaskId')) return null;
+    return parseCanonicalTaskV2Marker(marker);
+  } catch (error) {
+    if (error?.code === 'EXTERNAL_IDENTITY_CONFLICT') throw error;
     return null;
   }
 }
@@ -122,6 +170,47 @@ function normalizeReminder(value, field = 'reminders') {
   });
 }
 
+function snapshotSdkResponseRecord(value, field) {
+  return snapshotCanonicalDataRecord(value, field, { allowFrozen: true });
+}
+
+function snapshotSdkResponseArray(value, field) {
+  return snapshotCanonicalDataArray(value, field, { allowFrozen: true });
+}
+
+function snapshotResponseRecords(value, field) {
+  const items = snapshotSdkResponseArray(value, field);
+  return items.map((item, index) => snapshotSdkResponseRecord(
+    item,
+    `${field}[${index}]`,
+  ));
+}
+
+function sdkFailureMessage(value, fallback) {
+  return typeof value === 'string' && value !== '' ? value : fallback;
+}
+
+function dueAtFromResponse(value) {
+  if (value === undefined || value === null) return null;
+  const due = snapshotSdkResponseRecord(value, 'Feishu Task v2 due');
+  const timestamp = due.timestamp;
+  if (timestamp === undefined || timestamp === null || timestamp === '') return null;
+  if (typeof timestamp !== 'string' && typeof timestamp !== 'number') {
+    const error = new TypeError('Feishu Task v2 due timestamp is not canonical');
+    error.code = 'EXTERNAL_IDENTITY_CONFLICT';
+    error.retryable = false;
+    throw error;
+  }
+  const milliseconds = Number(timestamp);
+  if (!Number.isFinite(milliseconds)) {
+    const error = new TypeError('Feishu Task v2 due timestamp is not finite');
+    error.code = 'EXTERNAL_IDENTITY_CONFLICT';
+    error.retryable = false;
+    throw error;
+  }
+  return new Date(milliseconds).toISOString();
+}
+
 export class FeishuTaskV2Error extends Error {
   constructor(message, { retryable = true, code, cause } = {}) {
     super(message, { cause });
@@ -132,39 +221,104 @@ export class FeishuTaskV2Error extends Error {
 }
 
 function taskFromResponse(response, operation) {
-  if (response?.code !== 0) {
-    const code = response?.code;
-    throw new FeishuTaskV2Error(response?.msg || `Feishu Task v2 ${operation} failed`, {
-      code,
-      retryable: !PERMANENT_FEISHU_CODES.has(code),
+  let envelope;
+  try {
+    envelope = snapshotSdkResponseRecord(
+      response,
+      `Feishu Task v2 ${operation} response`,
+    );
+  } catch (cause) {
+    throw new FeishuTaskV2Error('Task v2 response is not canonical', {
+      code: 'EXTERNAL_IDENTITY_CONFLICT',
+      retryable: false,
+      cause,
     });
   }
-  const task = response?.data?.task;
-  if (!task || typeof task !== 'object') {
+  if (envelope.code !== 0) {
+    const code = envelope.code;
+    throw new FeishuTaskV2Error(
+      sdkFailureMessage(envelope.msg, `Feishu Task v2 ${operation} failed`),
+      {
+        code,
+        retryable: !PERMANENT_FEISHU_CODES.has(code),
+      },
+    );
+  }
+  let data;
+  try {
+    data = snapshotSdkResponseRecord(
+      envelope.data,
+      `Feishu Task v2 ${operation} response data`,
+    );
+  } catch (cause) {
+    throw new FeishuTaskV2Error('Task v2 response data is not canonical', {
+      code: 'EXTERNAL_IDENTITY_CONFLICT',
+      retryable: false,
+      cause,
+    });
+  }
+  if (!data.task || typeof data.task !== 'object') {
     throw new FeishuTaskV2Error(`Feishu Task v2 ${operation} returned no task`);
   }
-  const marker = parseTaskMarker(task.extra);
-  const reminder = normalizeReminder(
+  let task;
+  try {
+    task = snapshotSdkResponseRecord(
+      data.task,
+      `Feishu Task v2 ${operation} task`,
+    );
+  } catch (cause) {
+    throw new FeishuTaskV2Error('Task v2 response task is not canonical', {
+      code: 'EXTERNAL_IDENTITY_CONFLICT',
+      retryable: false,
+      cause,
+    });
+  }
+  let marker;
+  try {
+    marker = parseTaskMarker(task.extra);
+  } catch (cause) {
+    throw new FeishuTaskV2Error(
+      'Task v2 marker is not canonical',
+      { code: 'EXTERNAL_IDENTITY_CONFLICT', retryable: false, cause },
+    );
+  }
+  const reminders = snapshotResponseRecords(
     task.reminders ?? [],
     'Feishu Task v2 reminders',
   );
+  const members = snapshotResponseRecords(
+    task.members ?? [],
+    'Feishu Task v2 members',
+  );
+  const reminder = normalizeReminder(reminders, 'Feishu Task v2 reminders');
   return Object.freeze({
     guid: requireText(task.guid, `Feishu Task v2 ${operation} guid`),
     url: requireText(task.url, `Feishu Task v2 ${operation} url`),
     summary: optionalText(task.summary, 'Feishu Task v2 summary'),
     description: optionalText(task.description, 'Feishu Task v2 description'),
-    dueAt: task.due?.timestamp ? new Date(Number(task.due.timestamp)).toISOString() : null,
+    dueAt: dueAtFromResponse(task.due),
     reminderMinutesBeforeDue: reminder?.minutesBeforeDue ?? null,
     reminderId: reminder?.id ?? null,
-    members: Object.freeze(normalizeMembers(task.members ?? [], 'Feishu Task v2 members')),
+    members: Object.freeze(normalizeMembers(members, 'Feishu Task v2 members')),
     completedAt: optionalText(task.completed_at, 'Feishu Task v2 completed_at') ?? '0',
     coreTaskId: marker?.coreTaskId ?? null,
     coreTaskVersion: marker?.coreTaskVersion ?? null,
+    tenantRef: marker?.tenantRef ?? null,
+    accountRef: marker?.accountRef ?? null,
+    effectId: marker?.effectId ?? null,
+    payloadHash: marker?.payloadHash ?? null,
   });
 }
 
 function wrapSdkFailure(operation, error) {
   if (error instanceof FeishuTaskV2Error) throw error;
+  if (error?.code === 'EXTERNAL_IDENTITY_CONFLICT' && error?.retryable === false) {
+    throw new FeishuTaskV2Error('Task v2 marker is not canonical', {
+      code: 'EXTERNAL_IDENTITY_CONFLICT',
+      retryable: false,
+      cause: error,
+    });
+  }
   const status = error?.response?.status;
   const retryable = status === undefined || status === 429 || status >= 500;
   throw new FeishuTaskV2Error(error?.message || `Feishu Task v2 ${operation} failed`, {
@@ -174,7 +328,7 @@ function wrapSdkFailure(operation, error) {
   });
 }
 
-function createPayload(task, members, clientToken) {
+function createPayload(task, members, clientToken, effectIdentity) {
   const due = dueFromTask(task);
   return {
     summary: requireText(task.title, 'task.title'),
@@ -183,14 +337,52 @@ function createPayload(task, members, clientToken) {
     completed_at: completionFromTask(task),
     members: normalizeMembers(members),
     client_token: requireText(clientToken, 'clientToken'),
-    extra: taskMarker(task),
+    extra: taskMarker(task, effectIdentity),
     origin: {
       platform_i18n_name: { zh_cn: 'Zylos 任务', en_us: 'Zylos Task' },
     },
   };
 }
 
-function patchPayload(task, current) {
+function patchPayload(task, current, effectIdentity) {
+  if ((effectIdentity === undefined || effectIdentity === null) && current.effectId !== null) {
+    throw new FeishuTaskV2Error(
+      'Task v2 update requires the current TaskEffect identity; refusing a legacy writer',
+      { retryable: false },
+    );
+  }
+  const desiredIdentity = normalizeEffectIdentity(effectIdentity, task);
+  if (desiredIdentity !== null) {
+    if (current.coreTaskId !== task.id) {
+      throw new FeishuTaskV2Error(
+        'Task v2 update cannot change the managed Core task identity',
+        { code: 'EXTERNAL_IDENTITY_CONFLICT', retryable: false },
+      );
+    }
+    if (current.effectId === null) {
+      const isLegacyMarker = current.tenantRef === null
+        && current.accountRef === null
+        && current.payloadHash === null;
+      throw new FeishuTaskV2Error(
+        isLegacyMarker
+          ? 'Task v2 legacy marker requires a separate durable adoption transaction'
+          : 'Task v2 marker has an incomplete TaskEffect identity',
+        {
+          code: isLegacyMarker
+            ? 'LEGACY_PROJECTION_REQUIRES_ADOPTION'
+            : 'EXTERNAL_IDENTITY_CONFLICT',
+          retryable: false,
+        },
+      );
+    }
+    if (current.tenantRef !== desiredIdentity.tenantRef
+        || current.accountRef !== desiredIdentity.accountRef) {
+      throw new FeishuTaskV2Error(
+        'Task v2 update cannot change the managed tenant/account identity',
+        { code: 'EXTERNAL_IDENTITY_CONFLICT', retryable: false },
+      );
+    }
+  }
   const patch = {};
   const updateFields = [];
   const summary = requireText(task.title, 'task.title');
@@ -216,8 +408,14 @@ function patchPayload(task, current) {
     patch.completed_at = completedAt;
     updateFields.push('completed_at');
   }
-  if (current.coreTaskId !== task.id || current.coreTaskVersion !== task.version) {
-    patch.extra = taskMarker(task);
+  const desiredMarker = JSON.parse(taskMarker(task, effectIdentity));
+  if (current.coreTaskId !== desiredMarker.coreTaskId
+      || current.coreTaskVersion !== desiredMarker.coreTaskVersion
+      || current.tenantRef !== (desiredMarker.tenantRef ?? null)
+      || current.accountRef !== (desiredMarker.accountRef ?? null)
+      || current.effectId !== (desiredMarker.effectId ?? null)
+      || current.payloadHash !== (desiredMarker.payloadHash ?? null)) {
+    patch.extra = JSON.stringify(desiredMarker);
     updateFields.push('extra');
   }
   return { task: patch, update_fields: updateFields };
@@ -288,7 +486,7 @@ export function createSdkTaskV2Gateway({ client } = {}) {
       let exhausted = false;
       for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
         throwIfAborted(signal);
-        const response = await taskApi.list({
+        const responseInput = await taskApi.list({
           params: {
             user_id_type: USER_ID_TYPE,
             type: 'my_tasks',
@@ -297,14 +495,32 @@ export function createSdkTaskV2Gateway({ client } = {}) {
             ...(pageToken ? { page_token: pageToken } : {}),
           },
         });
-        if (response?.code !== 0) {
-          throw new FeishuTaskV2Error(response?.msg || 'Feishu Task v2 list failed', {
-            code: response?.code,
-            retryable: !PERMANENT_FEISHU_CODES.has(response?.code),
-          });
+        const response = snapshotSdkResponseRecord(
+          responseInput,
+          'Feishu Task v2 list response',
+        );
+        if (response.code !== 0) {
+          throw new FeishuTaskV2Error(
+            sdkFailureMessage(response.msg, 'Feishu Task v2 list failed'),
+            {
+              code: response.code,
+              retryable: !PERMANENT_FEISHU_CODES.has(response.code),
+            },
+          );
         }
-        const candidates = response?.data?.items ?? [];
-        for (const candidate of candidates) {
+        const data = snapshotSdkResponseRecord(
+          response.data,
+          'Feishu Task v2 list response data',
+        );
+        const candidates = snapshotSdkResponseArray(
+          data.items ?? [],
+          'Feishu Task v2 list items',
+        );
+        for (const candidateInput of candidates) {
+          const candidate = snapshotSdkResponseRecord(
+            candidateInput,
+            'Feishu Task v2 list item',
+          );
           const taskGuid = requireText(candidate.guid, 'Task v2 list item guid');
           if (seenTaskGuids.has(taskGuid)) continue;
           seenTaskGuids.add(taskGuid);
@@ -328,11 +544,11 @@ export function createSdkTaskV2Gateway({ client } = {}) {
             )
           ) tasks.push(snapshot);
         }
-        if (!response?.data?.has_more) {
+        if (!data.has_more) {
           exhausted = true;
           break;
         }
-        const nextPageToken = requireText(response?.data?.page_token, 'Task v2 list page_token');
+        const nextPageToken = requireText(data.page_token, 'Task v2 list page_token');
         if (seenPageTokens.has(nextPageToken)) {
           throw new FeishuTaskV2Error('Feishu Task v2 list repeated a page token', {
             retryable: false,
@@ -378,12 +594,12 @@ export function createSdkTaskV2Gateway({ client } = {}) {
   }
 
   return Object.freeze({
-    async createTask({ task, members, clientToken } = {}) {
+    async createTask({ task, members, clientToken, effectIdentity } = {}) {
       try {
         const normalizedTask = requireRecord(task, 'task');
         const created = taskFromResponse(await taskApi.create({
           params: { user_id_type: USER_ID_TYPE },
-          data: createPayload(normalizedTask, members, clientToken),
+          data: createPayload(normalizedTask, members, clientToken, effectIdentity),
         }), 'create');
         const reminderMinutesBeforeDue = reminderFromTask(normalizedTask);
         if (reminderMinutesBeforeDue === null) return created;
@@ -404,13 +620,13 @@ export function createSdkTaskV2Gateway({ client } = {}) {
       }
     },
 
-    async updateTask({ taskGuid, task, members, clientToken } = {}) {
+    async updateTask({ taskGuid, task, members, clientToken, effectIdentity } = {}) {
       const guid = requireText(taskGuid, 'taskGuid');
       const desiredMembers = normalizeMembers(members);
       try {
         const current = await getTask(guid);
         const normalizedTask = requireRecord(task, 'task');
-        const patch = patchPayload(normalizedTask, current);
+        const patch = patchPayload(normalizedTask, current, effectIdentity);
         const desiredReminder = reminderFromTask(normalizedTask);
         const normalizedClientToken = requireText(clientToken, 'clientToken');
         // A reminder update is a separate native API operation. Complete the
@@ -469,4 +685,4 @@ export function createSdkTaskV2Gateway({ client } = {}) {
   });
 }
 
-export const TASK_V2_MARKER_SCHEMA = MARKER_SCHEMA;
+export { TASK_V2_MARKER_SCHEMA };

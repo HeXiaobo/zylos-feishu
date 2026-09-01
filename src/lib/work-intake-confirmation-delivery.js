@@ -107,7 +107,12 @@ export function createWorkIntakeConfirmationDelivery({ outboxPath, deliver, cloc
       persist();
       return result;
     } catch (error) {
-      record.lastError = error instanceof Error ? error.message : String(error);
+      // Persist only bounded operational classification. Error messages from
+      // platform SDKs may contain tokens, request context, or message bodies.
+      record.lastError = JSON.stringify({
+        code: typeof error?.code === 'string' ? error.code.slice(0, 128) : 'DELIVERY_FAILED',
+        retryable: error?.retryable !== false,
+      });
       record.updatedAt = requireNow(clock);
       persist();
       throw error;

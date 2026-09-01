@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "contract": "OfficialFeishuControl",
+  "repository": "zylos-ai/zylos-feishu",
+  "controlSha": "890a7fdcccb8b9bd083f177621a33709209d6bc6",
+  "forkBaselineSha": "3beabc63f0c83b1ef247e38c11b7bd4c13249dd4",
+  "expectedMergeBase": "890a7fdcccb8b9bd083f177621a33709209d6bc6",
+  "expectedForkCommitsAhead": 41,
+  "responsibilities": [
+    {
+      "flow": "receive",
+      "path": "src/index.js",
+      "meaning": "authenticate and format Feishu input, then invoke c4-receive",
+      "patterns": ["const args = \\[\\s*C4_RECEIVE", "execFile\\('node', args"]
+    },
+    {
+      "flow": "send",
+      "path": "scripts/send.js",
+      "meaning": "be invoked by c4-send and send through Feishu APIs",
+      "patterns": ["C4 Communication Bridge Interface", "sendMessage"]
+    }
+  ],
+  "forkExtensions": [
+    "src/lib/inbound-event-inbox.js",
+    "src/lib/conversation-response-stream.js",
+    "src/lib/conversation-response-delivery.js",
+    "src/lib/feishu-work-intake-inbound.js",
+    "src/lib/task-v2-projection.js",
+    "src/lib/task-v2-status-inbox.js"
+  ],
+  "classification": {
+    "retainBehindAdapterSeams": [
+      "durable inbound inbox and lease recovery",
+      "CardKit projection and fallback assets",
+      "WorkIntake and Task v2 durability/reconciliation assets"
+    ],
+    "replaceAccidentalCoupling": [
+      "global one-row awaited inbound drain",
+      "ordinary-message idle gate",
+      "projection timeout manufacturing a failed run",
+      "reaction removal on card open or normal 120-second timeout"
+    ]
+  }
+}

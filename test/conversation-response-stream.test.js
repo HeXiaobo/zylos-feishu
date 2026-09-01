@@ -148,6 +148,22 @@ test('opens once, coalesces real deltas, keeps sequence monotonic, and closes th
   assert.equal(cardElement(finalCard, 'zylos_answer').element_id.length <= 20, true);
 }));
 
+test('visible Core events may start late and keep their original non-contiguous sequence', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(5, 'ProgressUpdated', { stage: 'reading' })],
+  });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(9, 'RunCompleted', { output: '完成' })],
+  });
+  assert.equal(calls.filter(([name]) => name === 'update').length, 2);
+  assert.equal(calls.filter(([name]) => name === 'close').length, 1);
+}));
+
 for (const conversion of [true, false]) {
   const mode = conversion ? 'CardKit' : 'ordinary-card fallback';
   test(`keeps interleaved requests and a background completion on separate cards in ${mode}`, () => withState(async stateDirectory => {
@@ -246,7 +262,7 @@ test('phase events stay visible while running and disappear when completion supp
   assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
 }));
 
-test('recovers a queued stream after the configured timeout with an honest retry terminal', () => withState(async stateDirectory => {
+test('records a queued timeout without inventing a user-visible terminal', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   let now = 1_000;
   const stream = createConversationResponseStream({
@@ -262,6 +278,7 @@ test('recovers a queued stream after the configured timeout with an honest retry
     requestId: 'assistant.feishu.om_1',
     events: [event(1, 'RunQueued')],
   });
+  const callsBeforeTimeout = calls.length;
 
   now = 2_001;
   const timedOut = await stream.apply({
@@ -269,11 +286,21 @@ test('recovers a queued stream after the configured timeout with an honest retry
     events: [],
   });
 
-  assert.equal(timedOut.status, 'failed');
-  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 排队超时，请重试');
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
-  assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
+  assert.deepEqual(timedOut, {
+    handled: true,
+    pending: true,
+    replayed: true,
+    status: 'queued',
+    reason: 'queued_timeout_observed',
+  });
+  assert.equal(calls.length, callsBeforeTimeout);
+  const persisted = JSON.parse(fs.readFileSync(
+    path.join(stateDirectory, fs.readdirSync(stateDirectory).find(name => name.endsWith('.json'))),
+    'utf8',
+  ));
+  assert.equal(persisted.status, 'queued');
+  assert.equal(persisted.compatibilityTerminal, false);
+  assert.equal(persisted.queuedTimeoutObservedAt, now);
 }));
 
 test('fails a started stream after the configured main timeout with an honest retry terminal', () => withState(async stateDirectory => {
@@ -619,17 +646,20 @@ test('normalizes the completed answer into the ordinary-card chat-list summary',
   }
 });
 
-test('uses a completion fallback for empty answers and preserves failure summaries', () => withState(async stateDirectory => {
+test('rejects empty completed answers and preserves explicit failure summaries', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
 
   await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
-  await stream.apply({
-    requestId: 'assistant.feishu.om_1',
-    events: [event(1, 'RunCompleted', { output: '' })],
-  });
-  let finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(finalCard.config.summary.content, '处理完成。');
+  const callsBeforeInvalidCompletion = calls.length;
+  await assert.rejects(
+    stream.apply({
+      requestId: 'assistant.feishu.om_1',
+      events: [event(1, 'RunCompleted', { output: ' \n\t' })],
+    }),
+    error => error?.code === 'MISSING_OUTPUT',
+  );
+  assert.equal(calls.length, callsBeforeInvalidCompletion);
 
   await withState(async failedStateDirectory => {
     const failed = createClient();
@@ -643,7 +673,7 @@ test('uses a completion fallback for empty answers and preserves failure summari
       requestId: 'assistant.feishu.om_1',
       events: [event(1, 'RunFailed', { retryable: true })],
     });
-    finalCard = JSON.parse(failed.calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+    const finalCard = JSON.parse(failed.calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
     assert.equal(finalCard.config.summary.content, '⚠️ 本次处理未完成，可重试');
     assert.match(cardElement(finalCard, 'zylos_answer').content, /请重新发送/);
     assert.doesNotMatch(cardElement(finalCard, 'zylos_answer').content, /没有可显示的回答/);

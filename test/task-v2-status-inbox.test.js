@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +11,129 @@ import {
   processTaskV2StatusInboxOnce,
 } from '../src/lib/task-v2-status-inbox.js';
 import { createTaskV2StatusEventIngestor } from '../src/lib/task-v2-status-event.js';
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalize(value[key])]));
+}
+
+function payloadHash(value) {
+  return `sha256:${createHash('sha256')
+    .update(JSON.stringify(canonicalize(value)))
+    .digest('hex')}`;
+}
+
+test('status inbox rejects a reused logical hash for different canonical payload', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-forged-hash-'));
+  const firstPayload = { action: 'SubmitForReview', expectedVersion: 7 };
+  const first = {
+    event_id: 'evt-first',
+    task_id: 'guid-forged',
+    app_id: 'cli_app',
+    logical_key: 'acct-1:guid-forged:SubmitForReview:v7',
+    payload_hash: payloadHash(firstPayload),
+    payload: firstPayload,
+  };
+  try {
+    const inbox = createTaskV2StatusInbox({ directory, clock: () => 1_787_900_000_000 });
+    assert.equal(inbox.enqueue(first).created, true);
+    assert.throws(
+      () => inbox.enqueue({
+        ...first,
+        event_id: 'evt-second',
+        payload: { action: 'AcceptTask', expectedVersion: 7 },
+      }),
+      error => error?.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('status inbox rejects a whitespace-padded supplied hash before persistence', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-hash-whitespace-'));
+  const payload = { action: 'SubmitForReview', expectedVersion: 7 };
+  try {
+    const inbox = createTaskV2StatusInbox({ directory, clock: () => 1_787_900_000_000 });
+    assert.throws(
+      () => inbox.enqueue({
+        event_id: 'evt-whitespace-hash',
+        task_id: 'guid-whitespace-hash',
+        app_id: 'cli_app',
+        logical_key: 'acct-1:guid-whitespace-hash:SubmitForReview:v7',
+        payload_hash: ` ${payloadHash(payload)}`,
+        payload,
+      }),
+      /canonical sha256/,
+    );
+    assert.deepEqual(inbox.pending({ limit: 10 }), []);
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('status inbox deduplicates transport and logical native task identities independently', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-dual-identity-'));
+  const payload = {
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    actorId: 'user-1',
+    action: 'SubmitForReview',
+    expectedVersion: 7,
+  };
+  const base = {
+    task_id: 'guid-dual',
+    app_id: 'cli_app',
+    event_types: ['task_completed_update'],
+    logical_key: 'acct-1:guid-dual:SubmitForReview:v7',
+    payload_hash: payloadHash(payload),
+    payload,
+  };
+  try {
+    const inbox = createTaskV2StatusInbox({ directory, clock: () => 1_787_900_000_000 });
+    assert.equal(inbox.enqueue({ ...base, event_id: 'evt-websocket' }).created, true);
+    const logicalReplay = inbox.enqueue({ ...base, event_id: 'evt-webhook' });
+    assert.equal(logicalReplay.created, false);
+    assert.equal(logicalReplay.event.event_id, 'evt-websocket');
+    assert.deepEqual(inbox.pending({ limit: 10 }), [{ ...base, event_id: 'evt-websocket' }]);
+    assert.throws(
+      () => inbox.enqueue({
+        ...base,
+        event_id: 'evt-conflict',
+        payload_hash: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      }),
+      error => error?.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('status inbox persists only structured redacted failure metadata', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-redacted-error-'));
+  try {
+    const inbox = createTaskV2StatusInbox({ directory, clock: () => 1_787_900_000_000 });
+    inbox.enqueue({ event_id: 'evt-redacted', task_id: 'guid-redacted', app_id: 'cli_app' });
+    const [claim] = inbox.claim({ workerId: 'worker-redacted', leaseMs: 5_000 });
+    const failure = new Error('access_token=secret; message body: private task text');
+    failure.code = 'PLATFORM_REJECTED';
+    failure.retryable = false;
+    inbox.fail({ receipt: claim.receipt, error: failure, retryAfterMs: 1_000, maxAttempts: 5 });
+    const persisted = inbox.query({ eventId: 'evt-redacted' }).error;
+    assert.deepEqual(JSON.parse(persisted), {
+      code: 'PLATFORM_REJECTED',
+      retryable: false,
+    });
+    assert.doesNotMatch(persisted, /secret|private task text|access_token/);
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test('status inbox atomically migrates legacy NDJSON evidence into its durable store', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-status-migration-'));
