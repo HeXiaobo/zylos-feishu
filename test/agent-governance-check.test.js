@@ -133,7 +133,7 @@ function writeManifestFile(manifestPath, manifest, { receipt = 'publish' } = {})
   fs.writeFileSync(manifestPath, JSON.stringify(manifest));
 }
 
-function globalV2Manifest({ headSha = git(ROOT, 'rev-parse', 'HEAD'), version = '0.3.7-rc.12', ...overrides } = {}) {
+function globalV2Manifest({ headSha = git(ROOT, 'rev-parse', 'HEAD'), version = '0.3.7-rc.13', ...overrides } = {}) {
   return {
     schema: 'zylos.release-manifest/v2',
     releaseId: 'ZYL-TEST-V2-FEISHU',
@@ -206,7 +206,7 @@ function runGovernanceCli(root, mode, manifestPath) {
       'scripts/agent-governance-check.js',
       mode,
       '--branch',
-      'release/0.3.7-rc.12',
+      'release/0.3.7-rc.13',
       '--manifest',
       manifestPath,
     ],
@@ -239,14 +239,14 @@ function governanceCliFixture() {
   const fixtureHead = git(root, 'rev-parse', 'HEAD');
   git(root, 'remote', 'add', 'origin', 'https://github.com/HeXiaobo/zylos-feishu.git');
   git(root, 'update-ref', 'refs/remotes/origin/main', fixtureHead);
-  git(root, 'checkout', '-qb', 'release/0.3.7-rc.12');
+  git(root, 'checkout', '-qb', 'release/0.3.7-rc.13');
   return root;
 }
 
-test('repository release metadata is aligned at the release 0.3.7-rc.12 baseline', () => {
+test('repository release metadata is aligned at the release 0.3.7-rc.13 baseline', () => {
   const result = validateReleaseMetadata(ROOT);
   assert.deepEqual(result.failures, []);
-  assert.equal(result.packageVersion, '0.3.7-rc.12');
+  assert.equal(result.packageVersion, '0.3.7-rc.13');
 });
 
 test('classifies protected, release, and feature branches', () => {
@@ -386,7 +386,7 @@ test('release CLI accepts a global v2 manifest without a per-agent target', () =
         'scripts/agent-governance-check.js',
         'release',
         '--branch',
-        'release/0.3.7-rc.12',
+        'release/0.3.7-rc.13',
         '--manifest',
         manifestPath,
       ],
@@ -625,7 +625,7 @@ test('global v2 accepts legitimate GitHub repository URL forms', () => {
         manifestPath,
         headSha,
         packageName: 'zylos-feishu',
-        packageVersion: '0.3.7-rc.12',
+        packageVersion: '0.3.7-rc.13',
       });
       assert.deepEqual(result.failures, [], `${repo}: ${result.failures.join('; ')}`);
     }
@@ -649,7 +649,7 @@ test('global v2 deploy keeps status, evidence, and identity gates', () => {
     const result = runGovernance({
       root: fixtureRoot,
       mode: 'deploy',
-      branch: 'release/0.3.7-rc.12',
+      branch: 'release/0.3.7-rc.13',
       manifestPath,
     });
     assert.equal(result.status, 'HOLD');
@@ -859,7 +859,7 @@ test('v2 release and deploy read the actual symbolic branch and reject conflicti
     });
     assert.equal(conflicting.status, 'HOLD');
     assert.ok(conflicting.failures.some(message => message.includes('CI branch ref')));
-    assert.equal(conflicting.branch, 'release/0.3.7-rc.12');
+    assert.equal(conflicting.branch, 'release/0.3.7-rc.13');
   } finally {
     fs.rmSync(manifestDir, { recursive: true, force: true });
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
