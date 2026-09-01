@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -38,6 +39,98 @@ function writeFixtureMetadata(root, version) {
     JSON.stringify({ schemaVersion: 1, product: 'zylos-feishu', release: version }, null, 2) + '\n',
   );
   fs.writeFileSync(path.join(root, 'SKILL.md'), `---\nname: feishu\nversion: ${version}\n---\n`);
+}
+
+function sha256File(filename) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
+}
+
+function bindOwnerAuthorizationReport(manifest, directory, filename = 'owner-authorization.json') {
+  const authorization = manifest.evidence?.ownerAuthorization;
+  if (!authorization || typeof authorization !== 'object') return manifest;
+  const report = { ...authorization };
+  delete report.report;
+  delete report.reportSha256;
+  const reportPath = path.resolve(directory, filename);
+  fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n');
+  authorization.report = reportPath;
+  authorization.reportSha256 = sha256File(reportPath);
+  return manifest;
+}
+
+function bindPreflightReceipt(
+  manifest,
+  directory,
+  { mode = 'deploy', filename = `${mode}-preflight.json`, receiptType } = {},
+) {
+  const candidateBundle = {
+    coreSha: manifest.candidate?.core?.sha,
+    feishuSha: manifest.candidate?.feishu?.sha,
+    hxaSha: manifest.candidate?.hxa?.sha,
+  };
+  const report = {
+    schema: 'zylos.agent-preflight/v1',
+    receiptType: receiptType ?? (mode === 'deploy' ? 'workspace-deploy' : 'workspace-publish'),
+    mode,
+    status: 'PASS',
+    releaseId: manifest.releaseId,
+    targetMode: 'global',
+    gate: mode === 'deploy' ? 'FINALIZE' : 'PUBLICATION',
+    deploymentStage: mode === 'deploy' ? 'final' : null,
+    deploymentAllowed: manifest.deploymentAllowed,
+    publicationAllowed: manifest.publicationAllowed === true,
+    candidateBundle,
+    generatedAt: new Date().toISOString(),
+    runtimeTarget: mode === 'deploy'
+      ? {
+          agent: 'yueran',
+          profileId: 'profile-id',
+          hostname: 'runtime-host',
+          deploymentOrgLabel: 'zylos',
+          deploymentProfileId: 'profile-id',
+          identityObservedAt: new Date().toISOString(),
+        }
+      : undefined,
+  };
+  const reportPath = path.resolve(directory, filename);
+  fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n');
+  const key = mode === 'deploy' ? 'globalPreflight' : 'workspacePublish';
+  manifest.evidence[key] = {
+    receiptType: report.receiptType,
+    report: reportPath,
+    reportSha256: sha256File(reportPath),
+  };
+  return manifest;
+}
+
+function hardenV2Manifest(manifest, directory, { deploy = false } = {}) {
+  const authorization = manifest.evidence.ownerAuthorization;
+  authorization.schema = 'zylos.release-publication-authorization/v1';
+  authorization.releaseId = manifest.releaseId;
+  authorization.authorizedBy = 'owner@example.invalid';
+  authorization.authorizationRef = `task:${manifest.releaseId}`;
+  authorization.authorizedAt = new Date().toISOString();
+  authorization.publicationAuthorized = true;
+  authorization.scope = 'RELEASE_GLOBAL_BUNDLE';
+  authorization.bundle = {
+    coreSha: manifest.candidate.core.sha,
+    feishuSha: manifest.candidate.feishu.sha,
+    hxaSha: manifest.candidate.hxa.sha,
+  };
+  bindOwnerAuthorizationReport(manifest, directory);
+  if (deploy) bindPreflightReceipt(manifest, directory, { mode: 'deploy' });
+  else bindPreflightReceipt(manifest, directory, { mode: 'publish' });
+  return manifest;
+}
+
+function writeManifestFile(manifestPath, manifest, { receipt = 'publish' } = {}) {
+  const directory = path.dirname(manifestPath);
+  if (manifest.schema === 'zylos.release-manifest/v2' && manifest.evidence?.ownerAuthorization) {
+    bindOwnerAuthorizationReport(manifest, directory);
+    if (receipt === 'publish') bindPreflightReceipt(manifest, directory, { mode: 'publish' });
+    if (receipt === 'deploy') bindPreflightReceipt(manifest, directory, { mode: 'deploy' });
+  }
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest));
 }
 
 function globalV2Manifest({ headSha = git(ROOT, 'rev-parse', 'HEAD'), version = '0.3.7-rc.12', ...overrides } = {}) {
@@ -84,11 +177,16 @@ function globalV2Manifest({ headSha = git(ROOT, 'rev-parse', 'HEAD'), version = 
     },
     evidence: {
       ownerAuthorization: {
+        schema: 'zylos.release-publication-authorization/v1',
         status: 'PASS',
+        releaseId: 'ZYL-TEST-V2-FEISHU',
         identity: 'user',
+        authorizedBy: 'owner@example.invalid',
+        authorizationRef: 'task:ZYL-TEST-V2-FEISHU',
+        authorizedAt: new Date().toISOString(),
         publicationAuthorized: true,
         deploymentAuthorized: true,
-        scope: 'GLOBAL_BUNDLE',
+        scope: 'RELEASE_GLOBAL_BUNDLE',
         bundle: {
           coreSha: '2'.repeat(40),
           feishuSha: headSha,
@@ -138,6 +236,10 @@ function governanceCliFixture() {
   git(root, 'config', 'user.name', 'Governance Tests');
   git(root, 'add', '.');
   git(root, 'commit', '-qm', 'fixture');
+  const fixtureHead = git(root, 'rev-parse', 'HEAD');
+  git(root, 'remote', 'add', 'origin', 'https://github.com/HeXiaobo/zylos-feishu.git');
+  git(root, 'update-ref', 'refs/remotes/origin/main', fixtureHead);
+  git(root, 'checkout', '-qb', 'release/0.3.7-rc.12');
   return root;
 }
 
@@ -273,11 +375,11 @@ test('release CLI accepts a global v2 manifest without a per-agent target', () =
   const fixtureRoot = governanceCliFixture();
   const manifestPath = path.join(tempDirectory(), 'release-manifest-v2.json');
   try {
-    fs.writeFileSync(manifestPath, JSON.stringify(globalV2Manifest({
+    writeManifestFile(manifestPath, globalV2Manifest({
       headSha: git(fixtureRoot, 'rev-parse', 'HEAD'),
       status: 'HOLD',
       deploymentAllowed: false,
-    })));
+    }));
     const output = execFileSync(
       process.execPath,
       [
@@ -313,7 +415,7 @@ test('global v2 CLI selects only candidate.feishu and never a legacy fallback', 
         manifest[fallback] = candidate;
       }
       const manifestPath = path.join(manifestDir, `fallback-${index}.json`);
-      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      writeManifestFile(manifestPath, manifest);
       const result = runGovernanceCli(fixtureRoot, 'release', manifestPath);
       assert.equal(result.report.status, 'HOLD', `${fallback} unexpectedly supplied the v2 component`);
       assert.ok(
@@ -339,7 +441,7 @@ test('global v2 CLI keeps root status and permissions authoritative', () => {
     });
     manifest.candidate.feishu.status = 'READY';
     manifest.candidate.feishu.deploymentAllowed = true;
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    writeManifestFile(manifestPath, manifest);
     const result = runGovernanceCli(fixtureRoot, 'release', manifestPath);
     assert.equal(result.report.status, 'PASS', result.report.failures?.join('\n'));
   } finally {
@@ -359,12 +461,12 @@ test('global v2 CLI fails closed for incomplete owner authorization', () => {
           delete authorization.publicationAuthorized;
           delete authorization.releaseAuthorized;
         },
-        expected: 'publicationAuthorized (or releaseAuthorized) must be true',
+        expected: 'publicationAuthorized must be true',
       },
       {
         name: 'missing-scope',
         mutate: authorization => delete authorization.scope,
-        expected: 'scope must authorize the global bundle',
+        expected: 'scope must be exactly RELEASE_GLOBAL_BUNDLE',
       },
       {
         name: 'missing-core-sha',
@@ -383,7 +485,7 @@ test('global v2 CLI fails closed for incomplete owner authorization', () => {
       const manifest = globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') });
       item.mutate(manifest.evidence.ownerAuthorization);
       const manifestPath = path.join(manifestDir, `${item.name}.json`);
-      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      writeManifestFile(manifestPath, manifest);
       const result = runGovernanceCli(fixtureRoot, 'release', manifestPath);
       assert.equal(result.report.status, 'HOLD', item.name);
       assert.ok(
@@ -397,7 +499,7 @@ test('global v2 CLI fails closed for incomplete owner authorization', () => {
   }
 });
 
-test('global v2 publication accepts release authorization as the explicit owner grant', () => {
+test('global v2 publication rejects release authorization without publication authorization', () => {
   const fixtureRoot = governanceCliFixture();
   const manifestDir = tempDirectory('zylos-feishu-v2-release-auth-');
   const manifestPath = path.join(manifestDir, 'release-authorized.json');
@@ -405,9 +507,10 @@ test('global v2 publication accepts release authorization as the explicit owner 
     const manifest = globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') });
     delete manifest.evidence.ownerAuthorization.publicationAuthorized;
     manifest.evidence.ownerAuthorization.releaseAuthorized = true;
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    writeManifestFile(manifestPath, manifest);
     const result = runGovernanceCli(fixtureRoot, 'release', manifestPath);
-    assert.equal(result.report.status, 'PASS', result.report.failures?.join('\n'));
+    assert.equal(result.report.status, 'HOLD');
+    assert.ok(result.report.failures.some(message => message.includes('publicationAuthorized must be true')));
   } finally {
     fs.rmSync(manifestDir, { recursive: true, force: true });
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
@@ -453,7 +556,7 @@ test('global v2 CLI requires an exact source policy, branch, and deployment cont
       const manifest = globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') });
       item.mutate(manifest);
       const manifestPath = path.join(manifestDir, `${item.name}.json`);
-      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      writeManifestFile(manifestPath, manifest);
       const result = runGovernanceCli(fixtureRoot, 'release', manifestPath);
       assert.equal(result.report.status, 'HOLD', item.name);
       assert.ok(
@@ -474,7 +577,7 @@ test('global v2 CLI rejects an evil repository host despite a matching path suff
   try {
     const manifest = globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') });
     manifest.candidate.feishu.repo = 'https://evil.example/HeXiaobo/zylos-feishu.git';
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    writeManifestFile(manifestPath, manifest);
     const result = runGovernanceCli(fixtureRoot, 'release', manifestPath);
     assert.equal(result.report.status, 'HOLD');
     assert.ok(result.report.failures.some(message => message.includes('GitHub repository')));
@@ -489,9 +592,9 @@ test('global v2 CLI rejects an evil origin even when the manifest path looks cor
   const manifestDir = tempDirectory('zylos-feishu-v2-origin-');
   const manifestPath = path.join(manifestDir, 'origin.json');
   try {
-    git(fixtureRoot, 'remote', 'add', 'origin', 'https://evil.example/HeXiaobo/zylos-feishu.git');
+    git(fixtureRoot, 'remote', 'set-url', 'origin', 'https://evil.example/HeXiaobo/zylos-feishu.git');
     const manifest = globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') });
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    writeManifestFile(manifestPath, manifest);
     const result = runGovernanceCli(fixtureRoot, 'release', manifestPath);
     assert.equal(result.report.status, 'HOLD');
     assert.ok(result.report.failures.some(message => message.includes('repository origin')));
@@ -502,7 +605,7 @@ test('global v2 CLI rejects an evil origin even when the manifest path looks cor
 });
 
 test('global v2 accepts legitimate GitHub repository URL forms', () => {
-  const headSha = git(ROOT, 'rev-parse', 'HEAD');
+  const headSha = git(ROOT, 'rev-parse', 'origin/main');
   const fixture = tempDirectory();
   const forms = [
     'HeXiaobo/zylos-feishu',
@@ -514,9 +617,9 @@ test('global v2 accepts legitimate GitHub repository URL forms', () => {
   try {
     for (const [index, repo] of forms.entries()) {
       const manifestPath = path.join(fixture, `${index}.json`);
-      const manifest = globalV2Manifest({ headSha });
+      const manifest = hardenV2Manifest(globalV2Manifest({ headSha }), fixture);
       manifest.candidate.feishu.repo = repo;
-      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      writeManifestFile(manifestPath, manifest);
       const result = validateReleaseManifest({
         root: ROOT,
         manifestPath,
@@ -558,32 +661,23 @@ test('global v2 deploy keeps status, evidence, and identity gates', () => {
 });
 
 test('global v2 component deploy consumes a global preflight receipt instead of a manifest target', () => {
-  const releaseId = 'ZYL-TEST-V2-FEISHU';
-  const manifest = {
-    schema: 'zylos.release-manifest/v2',
-    releaseId,
-    evidence: {
+  const manifestDir = tempDirectory('zylos-feishu-v2-receipt-contract-');
+  try {
+    const manifest = globalV2Manifest({ headSha: git(ROOT, 'rev-parse', 'origin/main') });
+    Object.assign(manifest.evidence, {
       pairReport: { status: 'PASS' },
       canary: 'PASS',
       hxa: { status: 'PASS' },
-      globalPreflight: {
-        schema: 'zylos.agent-preflight/v1',
-        mode: 'deploy',
-        status: 'PASS',
-        releaseId,
-        runtimeTarget: {
-          agent: 'yueran',
-          profileId: 'profile-id',
-          hostname: 'runtime-host',
-        },
-      },
-    },
-  };
-  assert.deepEqual(validateDeploymentReadiness(manifest), []);
-  delete manifest.evidence.globalPreflight;
-  const blocked = validateDeploymentReadiness(manifest);
-  assert.ok(blocked.some(message => message.includes('globalPreflight')));
-  assert.ok(!blocked.some(message => message.includes('target.agent')));
+    });
+    hardenV2Manifest(manifest, manifestDir, { deploy: true });
+    assert.deepEqual(validateDeploymentReadiness(manifest), []);
+    delete manifest.evidence.globalPreflight;
+    const blocked = validateDeploymentReadiness(manifest);
+    assert.ok(blocked.some(message => message.includes('globalPreflight')));
+    assert.ok(!blocked.some(message => message.includes('target.agent')));
+  } finally {
+    fs.rmSync(manifestDir, { recursive: true, force: true });
+  }
 });
 
 test('global v2 component deploy passes with a release-bound global preflight receipt', () => {
@@ -591,27 +685,16 @@ test('global v2 component deploy passes with a release-bound global preflight re
   const manifestDir = tempDirectory('zylos-feishu-v2-deploy-receipt-');
   const manifestPath = path.join(manifestDir, 'manifest.json');
   try {
-    const manifest = globalV2Manifest({
+    const manifest = hardenV2Manifest(globalV2Manifest({
       headSha: git(fixtureRoot, 'rev-parse', 'HEAD'),
       evidence: {
         ...globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') }).evidence,
         pairReport: { status: 'PASS' },
         canary: 'PASS',
         hxa: { status: 'PASS' },
-        globalPreflight: {
-          schema: 'zylos.agent-preflight/v1',
-          mode: 'deploy',
-          status: 'PASS',
-          releaseId: 'ZYL-TEST-V2-FEISHU',
-          runtimeTarget: {
-            agent: 'yueran',
-            profileId: 'profile-id',
-            hostname: 'runtime-host',
-          },
-        },
       },
-    });
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    }), manifestDir, { deploy: true });
+    writeManifestFile(manifestPath, manifest, { receipt: 'deploy' });
     const result = runGovernanceCli(fixtureRoot, 'deploy', manifestPath);
     assert.equal(result.report.status, 'PASS', result.report.failures?.join('\n'));
   } finally {
@@ -720,4 +803,166 @@ test('CLI argument parsing supports mode, base, manifest, and environment handof
     mode: 'deploy',
     manifestPath: '/tmp/release.json',
   });
+});
+
+test('v2 publication authorization uses an exact scope and a release-bound report body', () => {
+  const fixtureRoot = governanceCliFixture();
+  const manifestDir = tempDirectory('zylos-feishu-v2-auth-binding-');
+  const manifestPath = path.join(manifestDir, 'manifest.json');
+  try {
+    const manifest = hardenV2Manifest(
+      globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') }),
+      manifestDir,
+    );
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const accepted = runGovernanceCli(fixtureRoot, 'release', manifestPath);
+    assert.equal(accepted.report.status, 'PASS', accepted.report.failures?.join('\n'));
+
+    manifest.evidence.ownerAuthorization.scope = 'RELEASE_GLOBAL_BUNDLE_CANARY';
+    bindOwnerAuthorizationReport(manifest, manifestDir, 'scope-owner.json');
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const scopeAttack = runGovernanceCli(fixtureRoot, 'release', manifestPath);
+    assert.equal(scopeAttack.report.status, 'HOLD');
+    assert.ok(scopeAttack.report.failures.some(message => message.includes('scope must be exactly')));
+
+    manifest.evidence.ownerAuthorization.scope = 'RELEASE_GLOBAL_BUNDLE';
+    bindOwnerAuthorizationReport(manifest, manifestDir, 'body-owner.json');
+    const reportPath = manifest.evidence.ownerAuthorization.report;
+    const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+    report.authorizationRef = 'tampered-ref';
+    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n');
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const bodyAttack = runGovernanceCli(fixtureRoot, 'release', manifestPath);
+    assert.equal(bodyAttack.report.status, 'HOLD');
+    assert.ok(bodyAttack.report.failures.some(message => message.includes('reportSha256 mismatch')));
+  } finally {
+    fs.rmSync(manifestDir, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('v2 release and deploy read the actual symbolic branch and reject conflicting CI refs', () => {
+  const fixtureRoot = governanceCliFixture();
+  const manifestDir = tempDirectory('zylos-feishu-v2-branch-identity-');
+  const manifestPath = path.join(manifestDir, 'manifest.json');
+  try {
+    const manifest = hardenV2Manifest(
+      globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') }),
+      manifestDir,
+    );
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const conflicting = runGovernance({
+      root: fixtureRoot,
+      mode: 'release',
+      manifestPath,
+      env: { GITHUB_REF_NAME: 'release/forged-ref' },
+    });
+    assert.equal(conflicting.status, 'HOLD');
+    assert.ok(conflicting.failures.some(message => message.includes('CI branch ref')));
+    assert.equal(conflicting.branch, 'release/0.3.7-rc.12');
+  } finally {
+    fs.rmSync(manifestDir, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('v2 immutable source requires the exact origin and candidate ancestry', () => {
+  const fixtureRoot = governanceCliFixture();
+  const manifestDir = tempDirectory('zylos-feishu-v2-source-lineage-');
+  const manifestPath = path.join(manifestDir, 'manifest.json');
+  try {
+    git(fixtureRoot, 'commit', '--allow-empty', '-qm', 'candidate');
+    let manifest = hardenV2Manifest(
+      globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') }),
+      manifestDir,
+    );
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    git(fixtureRoot, 'update-ref', 'refs/remotes/origin/main', git(fixtureRoot, 'rev-parse', 'HEAD~1'));
+    const nonAncestor = runGovernanceCli(fixtureRoot, 'release', manifestPath);
+    assert.equal(nonAncestor.report.status, 'HOLD');
+    assert.ok(nonAncestor.report.failures.some(message => message.includes('ancestor of origin/main')));
+
+    git(fixtureRoot, 'remote', 'remove', 'origin');
+    manifest = hardenV2Manifest(
+      globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') }),
+      manifestDir,
+    );
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const missingOrigin = runGovernanceCli(fixtureRoot, 'release', manifestPath);
+    assert.equal(missingOrigin.report.status, 'HOLD');
+    assert.ok(missingOrigin.report.failures.some(message => message.includes('repository origin must identify')));
+  } finally {
+    fs.rmSync(manifestDir, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('v2 deploy requires a hashed, release-bound deploy receipt with full identity attestation', () => {
+  const fixtureRoot = governanceCliFixture();
+  const manifestDir = tempDirectory('zylos-feishu-v2-deploy-receipt-hardening-');
+  const manifestPath = path.join(manifestDir, 'manifest.json');
+  try {
+    const baseEvidence = globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') }).evidence;
+    const manifest = hardenV2Manifest(
+      globalV2Manifest({
+        headSha: git(fixtureRoot, 'rev-parse', 'HEAD'),
+        evidence: {
+          ...baseEvidence,
+          pairReport: { status: 'PASS' },
+          canary: 'PASS',
+          hxa: { status: 'PASS' },
+        },
+      }),
+      manifestDir,
+      { deploy: true },
+    );
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const accepted = runGovernanceCli(fixtureRoot, 'deploy', manifestPath);
+    assert.equal(accepted.report.status, 'PASS', accepted.report.failures?.join('\n'));
+
+    delete manifest.evidence.globalPreflight.reportSha256;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const missingHash = runGovernanceCli(fixtureRoot, 'deploy', manifestPath);
+    assert.equal(missingHash.report.status, 'HOLD');
+    assert.ok(missingHash.report.failures.some(message => message.includes('reportSha256')));
+
+    bindPreflightReceipt(manifest, manifestDir, { mode: 'deploy', filename: 'bad-bundle.json' });
+    const reportPath = manifest.evidence.globalPreflight.report;
+    const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+    delete report.runtimeTarget.hostname;
+    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n');
+    manifest.evidence.globalPreflight.reportSha256 = sha256File(reportPath);
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const incompleteIdentity = runGovernanceCli(fixtureRoot, 'deploy', manifestPath);
+    assert.equal(incompleteIdentity.report.status, 'HOLD');
+    assert.ok(incompleteIdentity.report.failures.some(message => message.includes('runtimeTarget.hostname')));
+  } finally {
+    fs.rmSync(manifestDir, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('v2 release uses a distinct workspace publish receipt instead of a deploy receipt', () => {
+  const fixtureRoot = governanceCliFixture();
+  const manifestDir = tempDirectory('zylos-feishu-v2-publish-receipt-');
+  const manifestPath = path.join(manifestDir, 'manifest.json');
+  try {
+    const manifest = hardenV2Manifest(
+      globalV2Manifest({ headSha: git(fixtureRoot, 'rev-parse', 'HEAD') }),
+      manifestDir,
+    );
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const accepted = runGovernanceCli(fixtureRoot, 'release', manifestPath);
+    assert.equal(accepted.report.status, 'PASS', accepted.report.failures?.join('\n'));
+
+    delete manifest.evidence.workspacePublish;
+    bindPreflightReceipt(manifest, manifestDir, { mode: 'deploy', filename: 'wrong-deploy.json' });
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const wrongType = runGovernanceCli(fixtureRoot, 'release', manifestPath);
+    assert.equal(wrongType.report.status, 'HOLD');
+    assert.ok(wrongType.report.failures.some(message => message.includes('workspacePublish')));
+  } finally {
+    fs.rmSync(manifestDir, { recursive: true, force: true });
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
