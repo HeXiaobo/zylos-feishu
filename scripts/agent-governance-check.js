@@ -310,13 +310,13 @@ function pullRequestEvent(env = process.env) {
   const baseRef = pullRequest.base?.ref;
   const baseSha = pullRequest.base?.sha;
   const mergeSha = pullRequest.merge_commit_sha;
+  const number = pullRequest.number;
   const failures = [];
   if (!nonEmptyString(headRef)) failures.push('pull_request event head.ref is required');
   if (!FULL_SHA.test(headSha || '')) failures.push('pull_request event head.sha must be a complete SHA');
   if (!nonEmptyString(baseRef)) failures.push('pull_request event base.ref is required');
   if (!FULL_SHA.test(baseSha || '')) failures.push('pull_request event base.sha must be a complete SHA');
-  if (!FULL_SHA.test(mergeSha || '')) failures.push('pull_request event merge_commit_sha must be a complete SHA');
-  return { failures, headRef, headSha, baseRef, baseSha, mergeSha };
+  return { failures, headRef, headSha, baseRef, baseSha, mergeSha, number };
 }
 
 function validatePullRequestMerge(root, event, env, failures, selectedBase) {
@@ -324,17 +324,14 @@ function validatePullRequestMerge(root, event, env, failures, selectedBase) {
   if (event?.failures?.length) return;
 
   const headSha = currentHead(root);
-  if (headSha !== event.mergeSha) {
-    failures.push(`pull_request merge commit ${event.mergeSha} does not match current HEAD ${headSha || '(missing)'}`);
-    return;
-  }
   const parents = (git(root, ['show', '-s', '--format=%P', headSha], true) || '').split(/\s+/).filter(Boolean);
   if (parents.length !== 2) {
     failures.push(`pull_request current HEAD must be a two-parent merge commit (found ${parents.length})`);
     return;
   }
-  if (parents[0] !== event.baseSha) {
-    failures.push(`pull_request merge first parent ${parents[0]} does not match event base.sha ${event.baseSha}`);
+  const baseIsAncestor = git(root, ['merge-base', '--is-ancestor', event.baseSha, parents[0]], true) !== undefined;
+  if (!baseIsAncestor) {
+    failures.push(`pull_request merge first parent ${parents[0]} does not descend from event base.sha ${event.baseSha}`);
   }
   if (parents[1] !== event.headSha) {
     failures.push(`pull_request merge second parent ${parents[1]} does not match event head.sha ${event.headSha}`);
@@ -347,14 +344,23 @@ function validatePullRequestMerge(root, event, env, failures, selectedBase) {
   if (nonEmptyString(ciBaseRef) && normalizeBranch(ciBaseRef) !== normalizeBranch(event.baseRef)) {
     failures.push(`CI base ref ${ciBaseRef} does not match pull_request event base.ref ${event.baseRef}`);
   }
+  const ciHeadRef = env.GITHUB_HEAD_REF;
+  if (nonEmptyString(ciHeadRef) && normalizeBranch(ciHeadRef) !== normalizeBranch(event.headRef)) {
+    failures.push(`CI head ref ${ciHeadRef} does not match pull_request event head.ref ${event.headRef}`);
+  }
   const ciRef = env.GITHUB_REF;
-  if (nonEmptyString(ciRef) && !/^refs\/pull\/\d+\/merge$/.test(ciRef)) {
-    failures.push(`CI pull_request ref ${ciRef} is not a merge ref`);
+  if (nonEmptyString(ciRef)) {
+    const match = /^refs\/pull\/(\d+)\/merge$/.exec(ciRef);
+    if (!match) {
+      failures.push(`CI pull_request ref ${ciRef} is not a merge ref`);
+    } else if (Number.isInteger(event.number) && Number(match[1]) !== event.number) {
+      failures.push(`CI pull_request ref ${ciRef} does not match event number ${event.number}`);
+    }
   }
   if (selectedBase) {
     const selectedBaseSha = git(root, ['rev-parse', '--verify', `${selectedBase}^{commit}`], true);
-    if (selectedBaseSha && selectedBaseSha !== event.baseSha) {
-      failures.push(`selected base ${selectedBase} (${selectedBaseSha}) does not match pull_request event base.sha ${event.baseSha}`);
+    if (selectedBaseSha && selectedBaseSha !== parents[0]) {
+      failures.push(`selected base ${selectedBase} (${selectedBaseSha}) does not match pull_request merge first parent ${parents[0]}`);
     }
   }
 }

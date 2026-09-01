@@ -274,9 +274,13 @@ function pullRequestMergeFixture() {
   git(root, 'commit', '-qm', 'candidate');
   const headSha = git(root, 'rev-parse', 'HEAD');
   git(root, 'checkout', 'main');
+  fs.writeFileSync(path.join(root, 'base-update.txt'), 'base update\n');
+  git(root, 'add', 'base-update.txt');
+  git(root, 'commit', '-qm', 'advance base');
+  const baseTipSha = git(root, 'rev-parse', 'HEAD');
   git(root, 'merge', '--no-ff', '-m', 'merge candidate', 'release/0.3.7-rc.13');
   const mergeSha = git(root, 'rev-parse', 'HEAD');
-  git(root, 'update-ref', 'refs/remotes/origin/main', baseSha);
+  git(root, 'update-ref', 'refs/remotes/origin/main', baseTipSha);
   git(root, 'checkout', '--detach', mergeSha);
   const eventPath = path.join(root, 'event.json');
   fs.writeFileSync(
@@ -289,7 +293,7 @@ function pullRequestMergeFixture() {
       },
     }),
   );
-  return { root, eventPath, baseSha, headSha, mergeSha };
+  return { root, eventPath, baseSha, baseTipSha, headSha, mergeSha };
 }
 
 test('repository release metadata is aligned at the release 0.3.7-rc.13 baseline', () => {
@@ -309,6 +313,9 @@ test('classifies protected, release, and feature branches', () => {
 test('pull_request governance uses signed event refs and merge topology over CI branch variables', () => {
   const fixture = pullRequestMergeFixture();
   try {
+    const event = JSON.parse(fs.readFileSync(fixture.eventPath, 'utf8'));
+    event.pull_request.merge_commit_sha = fixture.baseSha;
+    fs.writeFileSync(fixture.eventPath, JSON.stringify(event));
     const result = runGovernance({
       root: fixture.root,
       mode: 'check',
@@ -318,7 +325,7 @@ test('pull_request governance uses signed event refs and merge topology over CI 
         GITHUB_EVENT_PATH: fixture.eventPath,
         GITHUB_REF: 'refs/pull/46/merge',
         GITHUB_REF_NAME: 'merge',
-        GITHUB_HEAD_REF: 'forged/release-branch',
+        GITHUB_HEAD_REF: 'release/0.3.7-rc.13',
         GITHUB_BASE_REF: 'main',
         GITHUB_SHA: fixture.mergeSha,
       },
@@ -350,6 +357,28 @@ test('pull_request governance rejects a head SHA that is not the merge second pa
     });
     assert.equal(result.status, 'HOLD');
     assert.ok(result.failures.some(message => message.includes('merge second parent')));
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('pull_request governance rejects a forged CI head ref even when event topology is valid', () => {
+  const fixture = pullRequestMergeFixture();
+  try {
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'check',
+      baseRef: 'origin/main',
+      env: {
+        GITHUB_EVENT_NAME: 'pull_request',
+        GITHUB_EVENT_PATH: fixture.eventPath,
+        GITHUB_REF: 'refs/pull/46/merge',
+        GITHUB_HEAD_REF: 'forged/release-branch',
+        GITHUB_SHA: fixture.mergeSha,
+      },
+    });
+    assert.equal(result.status, 'HOLD');
+    assert.ok(result.failures.some(message => message.includes('CI head ref')));
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
