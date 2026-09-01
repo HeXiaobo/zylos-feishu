@@ -106,15 +106,18 @@ test('current card opening and 120-second timer remove reaction before settlemen
   );
 });
 
-test('current queue/main timeout copy is projection evidence, not Runtime evidence', () => {
+test('queued timeout stays observational while the legacy main timeout remains projection evidence', () => {
   const source = fs.readFileSync(
     path.join(REPO_ROOT, 'src/lib/conversation-response-stream.js'),
     'utf8',
   );
-  assert.match(source, /Queued response stream timed out; projecting a retry terminal/);
+  assert.match(source, /Queued response stream exceeded its observation window/);
+  assert.match(source, /state\.queuedTimeoutObservedAt = clock\(\)/);
+  assert.match(source, /reason: 'queued_timeout_observed'/);
+  assert.doesNotMatch(source, /Queued response stream timed out; projecting a retry terminal/);
+  assert.doesNotMatch(source, /排队超时/);
   assert.match(source, /Main response stream timed out; projecting a retry terminal/);
   assert.match(source, /state\.status = 'failed'/);
-  assert.match(source, /排队超时/);
   assert.match(source, /本次回复未生成/);
   const observation = loadContractFixture('current-behavior.json').observations
     .find((entry) => entry.name === 'projection-timeout-terminalization');

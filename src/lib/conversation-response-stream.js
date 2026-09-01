@@ -19,7 +19,6 @@ const SUMMARY_ELLIPSIS = '…';
 const DEFAULT_THROTTLE_MS = 250;
 const RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请重新发送。';
 const NON_RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请稍后再试。';
-const QUEUED_TIMEOUT_PHASE = '⚠️ 排队超时，请重试';
 const MAIN_TIMEOUT_PHASE = '⚠️ 回复超时，请重试';
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
@@ -446,8 +445,15 @@ function validateEvent(event, requestId) {
       throw new TypeError('PublicReasoningDelta exceeds the supported size');
     }
   }
-  if (value.type === 'RunCompleted' && typeof value.payload.output !== 'string') {
-    throw new TypeError('RunCompleted requires canonical output');
+  if (value.type === 'RunCompleted') {
+    if (typeof value.payload.output !== 'string') {
+      throw new TypeError('RunCompleted requires canonical output');
+    }
+    if (value.payload.output.trim() === '') {
+      const error = new Error('RunCompleted output is blank');
+      error.code = 'MISSING_OUTPUT';
+      throw error;
+    }
   }
   if (value.type === 'ProgressUpdated' && !Object.hasOwn(SAFE_PROGRESS, value.payload.stage)) {
     throw new TypeError('ProgressUpdated stage is not safe to display');
@@ -483,6 +489,7 @@ export function createConversationResponseStream({
   queuedTimeoutMs = DEFAULT_QUEUED_TIMEOUT_MS,
   mainTimeoutMs = DEFAULT_MAIN_TIMEOUT_MS,
   processDisplay = 'collapsible',
+  completedDeliveryReconciler = null,
   logger = console,
 } = {}) {
   requireRecord(client, 'client');
@@ -500,6 +507,9 @@ export function createConversationResponseStream({
     throw new TypeError('mainTimeoutMs is invalid');
   }
   if (!PROCESS_DISPLAYS.has(processDisplay)) throw new TypeError('processDisplay is invalid');
+  if (completedDeliveryReconciler !== null && typeof completedDeliveryReconciler !== 'function') {
+    throw new TypeError('completedDeliveryReconciler must be a function or null');
+  }
 
   function load(requestId) {
     return readState(statePath(stateDirectory, requestId));
@@ -522,6 +532,7 @@ export function createConversationResponseStream({
     }
     clearTransientProcess(state);
     delete state.queuedAt;
+    delete state.queuedTimeoutObservedAt;
     delete state.mainStartedAt;
     delete state.output;
     for (const card of state.cards) delete card.rendered;
@@ -951,7 +962,7 @@ export function createConversationResponseStream({
       const messageId = await sendPlain(
         client,
         state.target,
-        output || '处理完成。',
+        output,
         state.delivery.uuid,
       );
       state.plainMessageId = messageId;
@@ -975,50 +986,130 @@ export function createConversationResponseStream({
     }
   }
 
+  function normalizeCompletedRequest(input) {
+    const request = requireRecord(input, 'completed response request');
+    requireExactFields(request, ['requestId', 'target', 'output'], 'completed response request');
+    const requestId = requireText(request.requestId, 'requestId');
+    const targetValue = requireRecord(request.target, 'target');
+    requireExactFields(targetValue, ['chatId', 'chatType', 'replyToMessageId'], 'target');
+    const target = {
+      chatId: requireText(targetValue.chatId, 'target.chatId'),
+      chatType: targetValue.chatType,
+      replyToMessageId: targetValue.replyToMessageId === null
+        ? null
+        : requireText(targetValue.replyToMessageId, 'target.replyToMessageId'),
+    };
+    if (!['p2p', 'group'].includes(target.chatType)) {
+      throw new TypeError('target.chatType is unsupported');
+    }
+    const output = typeof request.output === 'string' ? request.output : String(request.output || '');
+    if (output.trim() === '') {
+      const error = new Error('completed response output is blank');
+      error.code = 'MISSING_OUTPUT';
+      throw error;
+    }
+    return { requestId, target, output };
+  }
+
+  function assertCompletedStateIdentity(state, { target, output }) {
+    if (state.status !== 'completed'
+      || !terminalOutputMatches(state, output)
+      || JSON.stringify(state.target) !== JSON.stringify(target)) {
+      const error = new Error('completed response requestId already owns different content');
+      error.code = 'ASSISTANT_TERMINAL_CONFLICT';
+      throw error;
+    }
+  }
+
+  function completedReplay(state) {
+    return {
+      handled: true,
+      replayed: true,
+      parts: state.cards.length || 1,
+      messageId: state.cards[0]?.messageId || state.plainMessageId,
+    };
+  }
+
+  async function finishCompletedCards(state, output) {
+    const segments = splitUtf8(output, answerBytesPerCard);
+    try {
+      for (let part = state.cards.length; part < segments.length; part += 1) {
+        const card = renderCard({
+          phase: state.phase,
+          answer: segments[part],
+          summary: completedChatListSummary(output),
+          streaming: false,
+          part,
+          totalParts: segments.length,
+          processDisplay,
+        });
+        state.delivery.part = part;
+        state.delivery.uuid = stableToken(state.requestId, `completed:${part}`);
+        delete state.delivery.lastError;
+        save(state);
+        const messageId = await sendInteractive(
+          client,
+          state.target,
+          card,
+          state.delivery.uuid,
+        );
+        state.cards.push({
+          part,
+          messageId,
+          cardId: null,
+          nextSequence: 1,
+          closed: true,
+          rendered: card,
+        });
+        save(state);
+      }
+    } catch (error) {
+      state.delivery.lastError = error.message;
+      save(state);
+      error.deliveredParts = state.cards.length;
+      if (error.deliveryOutcome === 'rejected' && state.cards.length === 0) {
+        logger.warn?.('Completed response card was rejected; using one idempotent plain fallback', {
+          requestId: state.requestId,
+          error: error.message,
+        });
+        state.mode = 'plain_text';
+        state.delivery = {
+          kind: 'completed_plain',
+          status: 'pending',
+          uuid: stableToken(state.requestId, 'completed-plain'),
+        };
+        save(state);
+        return finishCompletedPlain(state, output);
+      }
+      throw error;
+    }
+    state.delivery.status = 'sent';
+    delete state.delivery.part;
+    delete state.delivery.uuid;
+    delete state.delivery.lastError;
+    compactTerminalState(state);
+    save(state);
+    return {
+      handled: true,
+      replayed: false,
+      parts: state.cards.length,
+      messageId: state.cards[0]?.messageId,
+    };
+  }
+
   const stream = Object.freeze({
     async sendCompleted(input) {
-      const request = requireRecord(input, 'completed response request');
-      requireExactFields(request, ['requestId', 'target', 'output'], 'completed response request');
-      const requestId = requireText(request.requestId, 'requestId');
-      const targetValue = requireRecord(request.target, 'target');
-      requireExactFields(targetValue, ['chatId', 'chatType', 'replyToMessageId'], 'target');
-      const target = {
-        chatId: requireText(targetValue.chatId, 'target.chatId'),
-        chatType: targetValue.chatType,
-        replyToMessageId: targetValue.replyToMessageId === null
-          ? null
-          : requireText(targetValue.replyToMessageId, 'target.replyToMessageId'),
-      };
-      if (!['p2p', 'group'].includes(target.chatType)) {
-        throw new TypeError('target.chatType is unsupported');
-      }
-      const output = typeof request.output === 'string' ? request.output : String(request.output || '');
+      const { requestId, target, output } = normalizeCompletedRequest(input);
       const release = await acquireRequestLock(requestId);
       try {
         let state = load(requestId);
         if (state) {
-          if (state.status !== 'completed'
-            || !terminalOutputMatches(state, output)
-            || JSON.stringify(state.target) !== JSON.stringify(target)) {
-            const error = new Error('completed response requestId already owns different content');
-            error.code = 'ASSISTANT_TERMINAL_CONFLICT';
-            throw error;
-          }
+          assertCompletedStateIdentity(state, { target, output });
           if (state.delivery?.status === 'sent') {
-            return {
-              handled: true,
-              replayed: true,
-              parts: state.cards.length,
-              messageId: state.cards[0]?.messageId || state.plainMessageId,
-            };
+            return completedReplay(state);
           }
           if (!state.delivery && (state.cards.length > 0 || state.plainMessageId)) {
-            return {
-              handled: true,
-              replayed: true,
-              parts: state.cards.length || 1,
-              messageId: state.cards[0]?.messageId || state.plainMessageId,
-            };
+            return completedReplay(state);
           }
         }
 
@@ -1046,69 +1137,116 @@ export function createConversationResponseStream({
         if (state.delivery?.kind === 'completed_plain') {
           return finishCompletedPlain(state, output);
         }
-        const segments = splitUtf8(output, answerBytesPerCard);
-        try {
-          for (let part = state.cards.length; part < segments.length; part += 1) {
-            const card = renderCard({
-              phase: state.phase,
-              answer: segments[part],
-              summary: completedChatListSummary(output),
-              streaming: false,
-              part,
-              totalParts: segments.length,
-              processDisplay,
-            });
-            state.delivery.part = part;
-            state.delivery.uuid = stableToken(requestId, `completed:${part}`);
-            delete state.delivery.lastError;
-            save(state);
-            const messageId = await sendInteractive(
-              client,
-              target,
-              card,
-              state.delivery.uuid,
-            );
-            state.cards.push({
-              part,
-              messageId,
-              cardId: null,
-              nextSequence: 1,
-              closed: true,
-              rendered: card,
-            });
-            save(state);
-          }
-        } catch (error) {
-          state.delivery.lastError = error.message;
-          save(state);
-          error.deliveredParts = state.cards.length;
-          if (error.deliveryOutcome === 'rejected' && state.cards.length === 0) {
-            logger.warn?.('Completed response card was rejected; using one idempotent plain fallback', {
-              requestId,
-              error: error.message,
-            });
-            state.mode = 'plain_text';
-            state.delivery = {
-              kind: 'completed_plain',
-              status: 'pending',
-              uuid: stableToken(requestId, 'completed-plain'),
-            };
-            save(state);
-            return finishCompletedPlain(state, output);
-          }
+        return finishCompletedCards(state, output);
+      } finally {
+        release();
+      }
+    },
+
+    async reconcileCompleted(input) {
+      const { requestId, target, output } = normalizeCompletedRequest(input);
+      const release = await acquireRequestLock(requestId);
+      try {
+        const state = load(requestId);
+        if (!state) {
+          return {
+            outcome: 'rejected',
+            errorCode: 'FEISHU_DELIVERY_STATE_NOT_FOUND',
+            retryable: true,
+            messageId: null,
+          };
+        }
+        assertCompletedStateIdentity(state, { target, output });
+        if (state.delivery?.status === 'sent'
+          || (!state.delivery && (state.cards.length > 0 || state.plainMessageId))) {
+          return {
+            outcome: 'reconciled',
+            messageId: completedReplay(state).messageId,
+          };
+        }
+        if (typeof completedDeliveryReconciler !== 'function') {
+          const error = new Error('completed delivery reconciliation is unavailable');
+          error.code = 'FEISHU_RECONCILIATION_UNAVAILABLE';
+          error.deliveryOutcome = 'unknown';
           throw error;
         }
-        state.delivery.status = 'sent';
-        delete state.delivery.part;
-        delete state.delivery.uuid;
+        const uuid = requireText(state.delivery?.uuid, 'pending completed delivery uuid');
+        let result;
+        try {
+          result = requireRecord(await completedDeliveryReconciler({
+            requestId,
+            target: structuredClone(state.target),
+            outputHash: outputHash(output),
+            deliveryKind: state.delivery.kind,
+            part: state.delivery.part ?? 0,
+            uuid,
+          }), 'completed delivery reconciliation result');
+        } catch (error) {
+          throw deliveryError(error);
+        }
+        if (result.outcome === 'rejected') {
+          return {
+            outcome: 'rejected',
+            errorCode: requireText(
+              result.errorCode,
+              'completed delivery reconciliation errorCode',
+            ),
+            retryable: result.retryable === true,
+            messageId: null,
+          };
+        }
+        if (result.outcome !== 'reconciled') {
+          const error = new Error('completed delivery reconciliation was inconclusive');
+          error.code = 'FEISHU_RECONCILIATION_INCONCLUSIVE';
+          error.deliveryOutcome = 'unknown';
+          throw error;
+        }
+        const messageId = requireText(
+          result.messageId,
+          'completed delivery reconciliation messageId',
+        );
+        if (state.delivery.kind === 'completed_plain') {
+          state.plainMessageId = messageId;
+          state.delivery.status = 'sent';
+          state.delivery.messageId = messageId;
+          delete state.delivery.lastError;
+          compactTerminalState(state);
+          save(state);
+          return { outcome: 'reconciled', messageId };
+        }
+        if (state.delivery.kind !== 'completed_cards') {
+          throw new TypeError('pending completed delivery kind is unsupported');
+        }
+        const part = state.delivery.part ?? state.cards.length;
+        if (part !== state.cards.length) {
+          const error = new Error('completed delivery part identity is inconsistent');
+          error.code = 'ASSISTANT_TERMINAL_CONFLICT';
+          throw error;
+        }
+        const segments = splitUtf8(output, answerBytesPerCard);
+        const card = renderCard({
+          phase: state.phase,
+          answer: segments[part],
+          summary: completedChatListSummary(output),
+          streaming: false,
+          part,
+          totalParts: segments.length,
+          processDisplay,
+        });
+        state.cards.push({
+          part,
+          messageId,
+          cardId: null,
+          nextSequence: 1,
+          closed: true,
+          rendered: card,
+        });
         delete state.delivery.lastError;
-        compactTerminalState(state);
         save(state);
+        const completed = await finishCompletedCards(state, output);
         return {
-          handled: true,
-          replayed: false,
-          parts: state.cards.length,
-          messageId: state.cards[0]?.messageId,
+          outcome: 'reconciled',
+          messageId: completed.messageId,
         };
       } finally {
         release();
@@ -1289,7 +1427,10 @@ export function createConversationResponseStream({
           if (event.type === 'RunQueued' && !Number.isSafeInteger(state.queuedAt)) {
             state.queuedAt = clock();
           }
-          if (event.type === 'RunStarted') delete state.queuedAt;
+          if (event.type === 'RunStarted') {
+            delete state.queuedAt;
+            delete state.queuedTimeoutObservedAt;
+          }
         }
         if (!compatibility && state.status === 'started' && !Number.isSafeInteger(state.mainStartedAt)) {
           state.mainStartedAt = clock();
@@ -1304,37 +1445,21 @@ export function createConversationResponseStream({
           : 0;
         const queuedTimedOut = state.status === 'queued' && queuedElapsed >= queuedTimeoutMs;
         if (queuedTimedOut) {
-          logger.warn?.('Queued response stream timed out; projecting a retry terminal', {
-            requestId,
-            queuedElapsed,
-            queuedTimeoutMs,
-          });
-          state.output = '';
-          state.status = 'failed';
-          state.phase = QUEUED_TIMEOUT_PHASE;
-          clearTransientProcess(state);
-          state.compatibilityTerminal = true;
-          if (projectionError) {
-            compactTerminalState(state);
-            state.terminalProjectionPending = true;
-            save(state);
-            return {
-              handled: true,
-              pending: true,
-              replayed: false,
-              status: state.status,
-              reason: 'queued_timeout',
-            };
+          if (!Number.isSafeInteger(state.queuedTimeoutObservedAt)) {
+            state.queuedTimeoutObservedAt = clock();
+            logger.warn?.('Queued response stream exceeded its observation window', {
+              requestId,
+              queuedElapsed,
+              queuedTimeoutMs,
+            });
           }
-          await render(state, { terminal: true, purpose: 'queued-timeout' });
-          compactTerminalState(state);
           save(state);
           return {
             handled: true,
-            replayed: false,
+            pending: true,
+            replayed: true,
             status: state.status,
-            reason: 'queued_timeout',
-            parts: state.cards.length || 1,
+            reason: 'queued_timeout_observed',
           };
         }
         const mainElapsed = state.status === 'started'
@@ -1466,11 +1591,17 @@ export function createConversationResponseStream({
 
     async completeWithFullAnswer({ requestId, output } = {}) {
       const id = requireText(requestId, 'requestId');
+      const visibleOutput = typeof output === 'string' ? output : String(output || '');
+      if (visibleOutput.trim() === '') {
+        const error = new Error('completed response output is blank');
+        error.code = 'MISSING_OUTPUT';
+        throw error;
+      }
       const release = await acquireRequestLock(id);
       try {
         return await terminalCompatibility(
           id,
-          typeof output === 'string' ? output : String(output || ''),
+          visibleOutput,
           'completed',
           '',
         );
