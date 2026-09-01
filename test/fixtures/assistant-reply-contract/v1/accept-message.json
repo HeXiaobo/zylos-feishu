@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "contract": "AcceptMessage",
+  "vectors": [
+    {
+      "name": "feishu-group-reply-tree",
+      "command": {
+        "schemaVersion": 1,
+        "type": "AcceptMessage",
+        "commandId": "cmd:feishu:om_reply_2",
+        "idempotencyKey": "feishu:cli_app_a:im.message.receive_v1:evt_ws_2",
+        "traceId": "trace:feishu:om_reply_2",
+        "source": {
+          "adapterId": "feishu",
+          "accountRef": "cli_app_a",
+          "targetRef": "feishu-route:v1:opaque-group-reply",
+          "conversationKey": "feishu:cli_app_a:group:oc_group_a:reply:om_root_a",
+          "messageId": "om_reply_2",
+          "eventId": "evt_ws_2",
+          "eventType": "im.message.receive_v1",
+          "payloadHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "actor": {
+          "provider": "feishu",
+          "tenantRef": "tenant_a",
+          "externalId": "ou_actor_a"
+        },
+        "content": {
+          "kind": "text",
+          "text": "Summarize the quoted decision."
+        },
+        "contextHints": {
+          "threadRef": null,
+          "rootRef": "om_root_a",
+          "parentRef": "om_reply_1",
+          "quoteRefs": ["om_reply_1"],
+          "mentionRefs": [],
+          "attachmentRefs": []
+        },
+        "reply": {
+          "mode": "required",
+          "targetRef": "feishu-route:v1:opaque-group-reply"
+        },
+        "policy": {
+          "priority": 2,
+          "requireIdle": false
+        }
+      },
+      "accepted": {
+        "requestId": "req:feishu:om_reply_2",
+        "conversationLaneKey": "feishu:cli_app_a:group:oc_group_a:reply:om_root_a",
+        "laneSequence": 7,
+        "orderingMode": "acceptance",
+        "sourceOrder": null
+      }
+    },
+    {
+      "name": "feishu-topic-group-thread",
+      "command": {
+        "schemaVersion": 1,
+        "type": "AcceptMessage",
+        "commandId": "cmd:feishu:om_topic_1",
+        "idempotencyKey": "feishu:cli_app_a:im.message.receive_v1:evt_topic_1",
+        "traceId": "trace:feishu:om_topic_1",
+        "source": {
+          "adapterId": "feishu",
+          "accountRef": "cli_app_a",
+          "targetRef": "feishu-route:v1:opaque-topic-thread",
+          "conversationKey": "feishu:cli_app_a:topic_group:oc_group_a:thread:omt_thread_a",
+          "messageId": "om_topic_1",
+          "eventId": "evt_topic_1",
+          "eventType": "im.message.receive_v1",
+          "payloadHash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "actor": {
+          "provider": "feishu",
+          "tenantRef": "tenant_a",
+          "externalId": "ou_actor_a"
+        },
+        "content": {
+          "kind": "text",
+          "text": "Continue in this topic."
+        },
+        "contextHints": {
+          "threadRef": "omt_thread_a",
+          "rootRef": "om_topic_root_a",
+          "parentRef": "om_topic_parent_a",
+          "quoteRefs": [],
+          "mentionRefs": ["ou_mentioned_a"],
+          "attachmentRefs": []
+        },
+        "reply": {
+          "mode": "required",
+          "targetRef": "feishu-route:v1:opaque-topic-thread"
+        },
+        "policy": {
+          "priority": 2,
+          "requireIdle": false
+        }
+      },
+      "accepted": {
+        "requestId": "req:feishu:om_topic_1",
+        "conversationLaneKey": "feishu:cli_app_a:topic_group:oc_group_a:thread:omt_thread_a",
+        "laneSequence": 3,
+        "orderingMode": "acceptance",
+        "sourceOrder": null
+      }
+    }
+  ]
+}

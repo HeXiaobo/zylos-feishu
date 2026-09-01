@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "contract": "DeliveryReceipt",
+  "vectors": [
+    {
+      "name": "platform-accepted",
+      "receipt": {
+        "schemaVersion": 1,
+        "type": "DeliveryReceipt",
+        "receiptId": "receipt:delivery-answer:1",
+        "intentId": "intent:req-answer:feishu",
+        "deliveryId": "delivery:intent-req-answer:feishu",
+        "attemptId": "attempt:delivery-answer:1",
+        "traceId": "trace:req-answer",
+        "adapterId": "feishu",
+        "result": "platform_accepted",
+        "externalRef": "opaque:feishu-message-ref",
+        "settlement": "accepted",
+        "userRead": "unknown"
+      }
+    },
+    {
+      "name": "unknown-before-reconcile",
+      "receipt": {
+        "schemaVersion": 1,
+        "type": "DeliveryReceipt",
+        "receiptId": "receipt:delivery-answer:2",
+        "intentId": "intent:req-answer:feishu",
+        "deliveryId": "delivery:intent-req-answer:feishu",
+        "attemptId": "attempt:delivery-answer:2",
+        "traceId": "trace:req-answer",
+        "adapterId": "feishu",
+        "result": "unknown",
+        "externalRef": null,
+        "settlement": "pending_reconciliation",
+        "userRead": "unknown"
+      }
+    },
+    {
+      "name": "reconciled",
+      "receipt": {
+        "schemaVersion": 1,
+        "type": "DeliveryReceipt",
+        "receiptId": "receipt:delivery-answer:reconciled",
+        "intentId": "intent:req-answer:feishu",
+        "deliveryId": "delivery:intent-req-answer:feishu",
+        "attemptId": "attempt:delivery-answer:2",
+        "traceId": "trace:req-answer",
+        "adapterId": "feishu",
+        "result": "reconciled",
+        "externalRef": "opaque:reconciled-message-ref",
+        "settlement": "reconciled",
+        "userRead": "unknown"
+      }
+    },
+    {
+      "name": "suppressed",
+      "receipt": {
+        "schemaVersion": 1,
+        "type": "DeliveryReceipt",
+        "receiptId": "receipt:delivery-silent:1",
+        "intentId": "intent:req-silent:feishu",
+        "deliveryId": "delivery:intent-req-silent:feishu",
+        "attemptId": "attempt:delivery-silent:1",
+        "traceId": "trace:req-silent",
+        "adapterId": "feishu",
+        "result": "suppressed",
+        "externalRef": null,
+        "settlement": "suppressed",
+        "userRead": "not_applicable"
+      }
+    },
+    {
+      "name": "delivery-exhausted",
+      "receipt": {
+        "schemaVersion": 1,
+        "type": "DeliveryReceipt",
+        "receiptId": "receipt:delivery-failure:exhausted",
+        "intentId": "intent:req-failure:feishu",
+        "deliveryId": "delivery:intent-req-failure:feishu",
+        "attemptId": "attempt:delivery-failure:5",
+        "traceId": "trace:req-failure",
+        "adapterId": "feishu",
+        "result": "rejected",
+        "externalRef": null,
+        "settlement": "unpresentable",
+        "exhausted": true,
+        "userRead": "unknown"
+      }
+    }
+  ]
+}

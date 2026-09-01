@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "algorithm": "sha256",
+  "commonContracts": [
+    {
+      "name": "AcceptMessage",
+      "file": "accept-message.json",
+      "sha256": "b64fa0677933ae3377d3a218d8244c78cdf856e1dc9cf13068e06615c4680530"
+    },
+    {
+      "name": "RuntimeEvents",
+      "file": "run-events.json",
+      "sha256": "05c29bcaeaa8cd32de65e656899103ff8ac081a49a0912969d87544b9da48f7b"
+    },
+    {
+      "name": "ReplyIntent",
+      "file": "reply-intents.json",
+      "sha256": "721e5bdb993c42f56c559f28901f1306d1cea0e5e8e1b20bec3ca91a4aaddf8f"
+    },
+    {
+      "name": "DeliveryReceipt",
+      "file": "delivery-receipts.json",
+      "sha256": "59cba570baab16d813c203277caaeffd4e03e7077a644057da00a34c88c07657"
+    }
+  ]
+}

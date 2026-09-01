@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "contract": "ReplyIntent",
+  "vectors": [
+    {
+      "name": "answer",
+      "intent": {
+        "schemaVersion": 1,
+        "type": "ReplyIntent",
+        "intentId": "intent:req-answer:feishu",
+        "requestId": "req:answer",
+        "traceId": "trace:req-answer",
+        "cause": { "kind": "run_terminal", "eventId": "event:req-answer:5" },
+        "route": { "adapterId": "feishu", "targetRef": "feishu-route:v1:opaque-group-reply" },
+        "disposition": "send",
+        "payload": { "format": "text", "text": "The decision is approved." },
+        "contentHash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "idempotencyKey": "reply:req-answer:feishu-route-a"
+      }
+    },
+    {
+      "name": "explicit-silent",
+      "intent": {
+        "schemaVersion": 1,
+        "type": "ReplyIntent",
+        "intentId": "intent:req-silent:feishu",
+        "requestId": "req:silent",
+        "traceId": "trace:req-silent",
+        "cause": { "kind": "run_terminal", "eventId": "event:req-silent:4" },
+        "route": { "adapterId": "feishu", "targetRef": "feishu-route:v1:opaque-p2p" },
+        "disposition": "suppress",
+        "payload": { "format": "none", "reason": "explicit_silent" },
+        "contentHash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "idempotencyKey": "reply:req-silent:feishu-route-b"
+      }
+    },
+    {
+      "name": "failure-notice",
+      "intent": {
+        "schemaVersion": 1,
+        "type": "ReplyIntent",
+        "intentId": "intent:req-failure:feishu",
+        "requestId": "req:failure",
+        "traceId": "trace:req-failure",
+        "cause": { "kind": "run_terminal", "eventId": "event:req-failure:4" },
+        "route": { "adapterId": "feishu", "targetRef": "feishu-route:v1:opaque-group-reply" },
+        "disposition": "failure_notice",
+        "payload": { "format": "text", "text": "The assistant could not complete this request." },
+        "contentHash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "idempotencyKey": "reply:req-failure:feishu-route-a"
+      }
+    },
+    {
+      "name": "task-receipt",
+      "intent": {
+        "schemaVersion": 1,
+        "type": "ReplyIntent",
+        "intentId": "intent:task-effect-17:feishu",
+        "requestId": "req:task-command",
+        "traceId": "trace:req-task-command",
+        "cause": { "kind": "task_effect", "eventId": "task-effect:17:applied" },
+        "route": { "adapterId": "feishu", "targetRef": "feishu-route:v1:opaque-task-receipt" },
+        "disposition": "task_receipt",
+        "payload": { "format": "text", "text": "Task submitted for review." },
+        "contentHash": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "idempotencyKey": "reply:task-effect-17:feishu-route-task"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "empty-visible-answer",
+      "expectedError": "MISSING_OUTPUT",
+      "intent": {
+        "schemaVersion": 1,
+        "type": "ReplyIntent",
+        "intentId": "intent:req-empty:feishu",
+        "requestId": "req:empty",
+        "traceId": "trace:req-empty",
+        "cause": { "kind": "run_terminal", "eventId": "event:req-empty:4" },
+        "route": { "adapterId": "feishu", "targetRef": "feishu-route:v1:opaque-p2p" },
+        "disposition": "send",
+        "payload": { "format": "text", "text": "" },
+        "contentHash": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+        "idempotencyKey": "reply:req-empty:feishu-route-b"
+      }
+    }
+  ]
+}
