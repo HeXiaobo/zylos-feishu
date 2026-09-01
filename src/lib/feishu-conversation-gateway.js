@@ -33,6 +33,13 @@ function deadLetterError(entry) {
   return error;
 }
 
+function gatewayError(code, message, cause = undefined) {
+  const error = new Error(message);
+  error.code = code;
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
 /**
  * Deep Feishu inbound Module. It owns authentication, normalization, durable
  * Inbox replay, dual dedupe, lane ordering, and bounded Core durable accept.
@@ -69,7 +76,80 @@ export function createFeishuConversationGateway({
   const coordinator = createConversationLaneCoordinator({ concurrency });
   const inFlight = new Map();
   let cycle = 0;
-  let closing = false;
+  let lifecycle = 'open';
+  let activeOperations = 0;
+  let resolveDrain = null;
+  let closePromise = null;
+  let drainFailure = null;
+
+  function recordDrainFailure(error) {
+    if (lifecycle === 'draining' && drainFailure === null) drainFailure = error;
+  }
+
+  function finishOperation() {
+    activeOperations -= 1;
+    if (activeOperations === 0 && resolveDrain) {
+      const resolve = resolveDrain;
+      resolveDrain = null;
+      resolve();
+    }
+  }
+
+  function runOperation(kind, execute) {
+    if (lifecycle !== 'open') {
+      return Promise.reject(gatewayError(
+        'GATEWAY_DRAINING',
+        'Feishu Conversation Gateway is draining',
+      ));
+    }
+    activeOperations += 1;
+    return Promise.resolve()
+      .then(execute)
+      .then(
+        (result) => {
+          if (kind === 'recover' && (result.failed > 0 || result.deadLettered > 0)) {
+            recordDrainFailure(new Error(
+              'gateway recover left retryable or dead-lettered messages',
+            ));
+          }
+          return result;
+        },
+        (error) => {
+          recordDrainFailure(error);
+          throw error;
+        },
+      )
+      .finally(finishOperation);
+  }
+
+  function waitForActiveOperations() {
+    if (activeOperations === 0) return Promise.resolve();
+    return new Promise((resolve) => { resolveDrain = resolve; });
+  }
+
+  function closeGateway() {
+    if (closePromise) return closePromise;
+    lifecycle = 'draining';
+    const drained = waitForActiveOperations();
+    closePromise = (async () => {
+      await drained;
+      let closeFailure = null;
+      try {
+        inbox.close();
+      } catch (error) {
+        closeFailure = error;
+      }
+      lifecycle = 'closed';
+      if (drainFailure || closeFailure) {
+        throw gatewayError(
+          'GATEWAY_DRAIN_FAILED',
+          'Feishu Conversation Gateway closed after an incomplete drain',
+          drainFailure ?? closeFailure,
+        );
+      }
+    })();
+    return closePromise;
+  }
 
   function identityFor(normalized) {
     return {
@@ -82,7 +162,7 @@ export function createFeishuConversationGateway({
 
   async function processCycle(limit = concurrency) {
     cycle += 1;
-    return processInboundEventInboxOnce({
+    const summary = await processInboundEventInboxOnce({
       inbox,
       coordinator,
       concurrency,
@@ -97,6 +177,12 @@ export function createFeishuConversationGateway({
         sourceOrder: metadata.sourceOrder,
       }),
     });
+    if (summary.failed > 0 || summary.deadLettered > 0) {
+      recordDrainFailure(new Error(
+        'gateway processing left retryable or dead-lettered messages',
+      ));
+    }
+    return summary;
   }
 
   async function settle(identity) {
@@ -122,50 +208,48 @@ export function createFeishuConversationGateway({
   }
 
   return Object.freeze({
-    async accept(rawEvent, options = {}) {
-      if (closing) throw new Error('Feishu Conversation Gateway is closing');
-      if (await authorize(rawEvent, options) !== true) {
-        return Object.freeze({ status: 'ignored', reason: 'unauthorized' });
-      }
-      const normalized = normalizeFeishuInboundMessage(rawEvent, {
-        accountRef: normalizedAccountRef,
-        eventId: options.eventId,
-        eventType: options.eventType,
-        sourceOrder: options.sourceOrder ?? null,
-        clock,
-        priority: options.priority ?? 2,
-      });
-      const received = inbox.receive({
-        adapterId: normalized.adapterId,
-        accountRef: normalized.accountRef,
-        eventType: normalized.eventType,
-        eventId: normalized.eventId,
-        messageId: normalized.messageId,
-        payload: normalized.message,
-        payloadHash: normalized.payloadHash,
-        legacyPayload: normalizeInboundMessageEvent(rawEvent, normalized.eventId).payload,
-        conversationLaneKey: normalized.conversationLaneKey,
-        sourceOrder: normalized.sourceOrder,
-      });
-      const receipt = await settleEntry(received.entry, identityFor(normalized));
-      return Object.freeze({
-        status: received.created ? 'accepted' : 'duplicate',
-        receipt,
+    accept(rawEvent, options = {}) {
+      return runOperation('accept', async () => {
+        if (await authorize(rawEvent, options) !== true) {
+          return Object.freeze({ status: 'ignored', reason: 'unauthorized' });
+        }
+        const normalized = normalizeFeishuInboundMessage(rawEvent, {
+          accountRef: normalizedAccountRef,
+          eventId: options.eventId,
+          eventType: options.eventType,
+          sourceOrder: options.sourceOrder ?? null,
+          clock,
+          priority: options.priority ?? 2,
+        });
+        const received = inbox.receive({
+          adapterId: normalized.adapterId,
+          accountRef: normalized.accountRef,
+          eventType: normalized.eventType,
+          eventId: normalized.eventId,
+          messageId: normalized.messageId,
+          payload: normalized.message,
+          payloadHash: normalized.payloadHash,
+          legacyPayload: normalizeInboundMessageEvent(rawEvent, normalized.eventId).payload,
+          conversationLaneKey: normalized.conversationLaneKey,
+          sourceOrder: normalized.sourceOrder,
+        });
+        const receipt = await settleEntry(received.entry, identityFor(normalized));
+        return Object.freeze({
+          status: received.created ? 'accepted' : 'duplicate',
+          receipt,
+        });
       });
     },
-    async recover() {
-      if (closing) throw new Error('Feishu Conversation Gateway is closing');
-      const total = { claimed: 0, committed: 0, failed: 0, deadLettered: 0 };
-      for (;;) {
-        const summary = await processCycle(concurrency);
-        for (const key of Object.keys(total)) total[key] += summary[key];
-        if (summary.claimed === 0) return Object.freeze(total);
-      }
+    recover() {
+      return runOperation('recover', async () => {
+        const total = { claimed: 0, committed: 0, failed: 0, deadLettered: 0 };
+        for (;;) {
+          const summary = await processCycle(concurrency);
+          for (const key of Object.keys(total)) total[key] += summary[key];
+          if (summary.claimed === 0) return Object.freeze(total);
+        }
+      });
     },
-    async close() {
-      closing = true;
-      await Promise.allSettled([...inFlight.values()]);
-      inbox.close();
-    },
+    close: closeGateway,
   });
 }

@@ -6,6 +6,26 @@ import test from 'node:test';
 
 import { createInMemoryCoreMessageIntake } from '../src/lib/core-message-intake-port.js';
 import { createFeishuConversationGateway } from '../src/lib/feishu-conversation-gateway.js';
+import { normalizeFeishuInboundMessage } from '../src/lib/feishu-inbound-normalizer.js';
+import { openInboundEventInbox } from '../src/lib/inbound-event-inbox.js';
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function assertPending(promise) {
+  const outcome = await Promise.race([
+    promise.then(() => 'settled', () => 'settled'),
+    new Promise((resolve) => setImmediate(() => resolve('pending'))),
+  ]);
+  assert.equal(outcome, 'pending');
+}
 
 function event({ eventId, messageId = 'om-1', chatId = 'oc-1', text = 'hello' }) {
   return {
@@ -272,6 +292,170 @@ test('p2p, group chat, reply-tree root fallback, and topic thread produce durabl
     ]);
   } finally {
     await gateway.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('close drains an accept registered before authorization and rejects later operations', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-gateway-close-auth-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const raw = event({ eventId: 'evt-close-auth', messageId: 'om-close-auth' });
+  const authorizationEntered = deferred();
+  const releaseAuthorization = deferred();
+  const core = createInMemoryCoreMessageIntake();
+  const gateway = createFeishuConversationGateway({
+    dbPath,
+    accountRef: 'cli_app_a',
+    authorize: async () => {
+      authorizationEntered.resolve();
+      await releaseAuthorization.promise;
+      return true;
+    },
+    coreIntake: core,
+    workerId: 'gateway-close-auth',
+    clock: () => 1_788_220_800_000,
+    pollIntervalMs: 1,
+  });
+  let accepted;
+  let closing;
+  try {
+    accepted = gateway.accept(raw);
+    await authorizationEntered.promise;
+    closing = gateway.close();
+    assert.strictEqual(gateway.close(), closing);
+    await assertPending(closing);
+    await assert.rejects(
+      gateway.accept(event({ eventId: 'evt-after-close', messageId: 'om-after-close' })),
+      (error) => error.code === 'GATEWAY_DRAINING',
+    );
+    await assert.rejects(
+      gateway.recover(),
+      (error) => error.code === 'GATEWAY_DRAINING',
+    );
+
+    releaseAuthorization.resolve();
+    const result = await accepted;
+    assert.equal(result.status, 'accepted');
+    await closing;
+    assert.equal(core.acceptedEffects().length, 1);
+
+    const reopened = createFeishuConversationGateway({
+      dbPath,
+      accountRef: 'cli_app_a',
+      authorize: async () => true,
+      coreIntake: core,
+      workerId: 'gateway-close-auth-restart',
+      clock: () => 1_788_220_800_001,
+      pollIntervalMs: 1,
+    });
+    try {
+      const replay = await reopened.accept(raw);
+      assert.equal(replay.status, 'duplicate');
+      assert.equal(core.acceptedEffects().length, 1);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    releaseAuthorization.resolve();
+    await Promise.allSettled([accepted, closing, gateway.close()].filter(Boolean));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('close reports a draining recover failure and restart safely retries ambiguous Core accept', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-gateway-close-recover-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const raw = event({ eventId: 'evt-close-recover', messageId: 'om-close-recover' });
+  const normalized = normalizeFeishuInboundMessage(raw, { accountRef: 'cli_app_a' });
+  const seed = openInboundEventInbox({
+    dbPath,
+    clock: () => 1_788_220_800_000,
+    maxAttempts: 3,
+  });
+  seed.receive({
+    adapterId: normalized.adapterId,
+    accountRef: normalized.accountRef,
+    eventType: normalized.eventType,
+    eventId: normalized.eventId,
+    messageId: normalized.messageId,
+    payload: normalized.message,
+    payloadHash: normalized.payloadHash,
+    conversationLaneKey: normalized.conversationLaneKey,
+    sourceOrder: normalized.sourceOrder,
+  });
+  seed.close();
+
+  const coreEntered = deferred();
+  const releaseCore = deferred();
+  const durableCore = createInMemoryCoreMessageIntake();
+  const gateway = createFeishuConversationGateway({
+    dbPath,
+    accountRef: 'cli_app_a',
+    authorize: async () => true,
+    coreIntake: {
+      async accept(message, acceptance) {
+        await durableCore.accept(message, acceptance);
+        coreEntered.resolve();
+        await releaseCore.promise;
+        throw Object.assign(new Error('ambiguous Core response'), { retryable: true });
+      },
+    },
+    workerId: 'gateway-close-recover',
+    clock: () => 1_788_220_800_000,
+    maxAttempts: 3,
+    pollIntervalMs: 1,
+    baseRetryDelayMs: 1,
+    maxRetryDelayMs: 1,
+  });
+  let recovering;
+  let closing;
+  try {
+    recovering = gateway.recover();
+    await coreEntered.promise;
+    closing = gateway.close();
+    assert.strictEqual(gateway.close(), closing);
+    await assertPending(closing);
+    releaseCore.resolve();
+
+    assert.deepEqual(await recovering, {
+      claimed: 1,
+      committed: 0,
+      failed: 1,
+      deadLettered: 0,
+    });
+    await assert.rejects(
+      closing,
+      (error) => error.code === 'GATEWAY_DRAIN_FAILED'
+        && error.cause?.message === 'gateway processing left retryable or dead-lettered messages',
+    );
+    assert.equal(durableCore.acceptedEffects().length, 1);
+
+    const reopened = createFeishuConversationGateway({
+      dbPath,
+      accountRef: 'cli_app_a',
+      authorize: async () => true,
+      coreIntake: durableCore,
+      workerId: 'gateway-close-recover-restart',
+      clock: () => 1_788_220_800_001,
+      maxAttempts: 3,
+      pollIntervalMs: 1,
+      baseRetryDelayMs: 1,
+      maxRetryDelayMs: 1,
+    });
+    try {
+      assert.deepEqual(await reopened.recover(), {
+        claimed: 1,
+        committed: 1,
+        failed: 0,
+        deadLettered: 0,
+      });
+      assert.equal(durableCore.acceptedEffects().length, 1);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    releaseCore.resolve();
+    await Promise.allSettled([recovering, closing, gateway.close()].filter(Boolean));
     rmSync(directory, { recursive: true, force: true });
   }
 });
