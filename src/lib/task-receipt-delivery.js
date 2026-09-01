@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 
 import { createWorkIntakeConfirmationDelivery } from './work-intake-confirmation-delivery.js';
+import { verifyTaskEffectSettlement } from './task-effect-settlement.js';
 
-const SETTLED_EFFECT_OUTCOMES = new Set(['platform_accepted', 'reconciled', 'suppressed']);
 const ROUTE_FIELDS = new Set(['adapterId', 'targetRef']);
 
 function requireRecord(value, field) {
@@ -72,16 +72,14 @@ function normalizeEffect(value) {
 }
 
 function normalizeSettlement(value, effect) {
-  const settlement = requireRecord(value, 'task receipt TaskEffect settlement');
-  if (!SETTLED_EFFECT_OUTCOMES.has(settlement.outcome)) {
-    throw new TypeError('task receipt requires a settled TaskEffect');
-  }
-  if (settlement.effectId !== effect.effectId) {
-    const error = new Error('task receipt TaskEffect settlement identity conflict');
-    error.code = 'IDEMPOTENCY_CONFLICT';
+  try {
+    return verifyTaskEffectSettlement({ effect, settlement: value });
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new TypeError(`verified TaskEffect settlement required: ${error.message}`);
+    }
     throw error;
   }
-  return structuredClone(settlement);
 }
 
 function buildIntent(effect, route) {

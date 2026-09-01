@@ -76,3 +76,57 @@ test('Task v2 SDK marker persists exact effect identity for crash reconciliation
     error => error?.retryable === false && /effect identity/i.test(error.message),
   );
 });
+
+test('Task v2 SDK can adopt a legacy marker only when exact effect identity is supplied', async () => {
+  let persistedExtra = JSON.stringify({
+    schema: 'zylos.task-v2-projection/v1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+  });
+  let patches = 0;
+  const taskApi = {
+    async create() { throw new Error('not used'); },
+    async patch({ data }) {
+      patches += 1;
+      persistedExtra = data.task.extra;
+      return { code: 0, data: { task: nativeTask(persistedExtra) } };
+    },
+    async get() { return { code: 0, data: { task: nativeTask(persistedExtra) } }; },
+    async addMembers() { throw new Error('not used'); },
+    async removeMembers() { throw new Error('not used'); },
+    async addReminders() { throw new Error('not used'); },
+    async removeReminders() { throw new Error('not used'); },
+    async list() { return { code: 0, data: { items: [], has_more: false } }; },
+  };
+  const identity = {
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    effectId: 'effect-task-1-v3',
+    payloadHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+  };
+  const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+  const adopted = await gateway.updateTask({
+    taskGuid: 'guid-effect-1',
+    task: {
+      id: 'task-1', version: 3, title: 'Effect identity', state: 'in_progress',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    },
+    members: [],
+    clientToken: 'zte_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    effectIdentity: identity,
+  });
+
+  assert.equal(patches, 1);
+  assert.deepEqual(JSON.parse(persistedExtra), {
+    schema: 'zylos.task-v2-projection/v1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 3,
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    effectId: 'effect-task-1-v3',
+    payloadHash: identity.payloadHash,
+  });
+  assert.equal(adopted.effectId, identity.effectId);
+});

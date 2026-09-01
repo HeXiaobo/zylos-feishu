@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 
+import {
+  createVerifiedTaskEffectSettlement,
+  taskEffectPayloadHash,
+} from './task-effect-settlement.js';
+
 const CLAIM_FIELDS = new Set([
   'effect',
   'attempt',
@@ -40,18 +45,6 @@ function requirePositive(value, field) {
     throw new TypeError(`${field} must be a positive integer`);
   }
   return value;
-}
-
-function canonicalize(value) {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalize(value[key])]));
-}
-
-function payloadHash(value) {
-  return `sha256:${createHash('sha256')
-    .update(JSON.stringify(canonicalize(value)))
-    .digest('hex')}`;
 }
 
 function clientToken(effectId) {
@@ -114,7 +107,7 @@ function effectIdentity(effect, identity) {
     tenantRef: identity.tenantRef,
     accountRef: identity.accountRef,
     effectId: effect.effectId,
-    payloadHash: payloadHash(effect),
+    payloadHash: taskEffectPayloadHash(effect),
     coreTaskId: effect.taskId,
     coreTaskVersion: effect.coreVersion,
   });
@@ -130,21 +123,29 @@ function normalizeRemote(value) {
   };
 }
 
-function receipt(outcome, claim, identity, remote) {
-  return Object.freeze({
+function receipt(outcome, claim, remote) {
+  return createVerifiedTaskEffectSettlement({
     outcome,
-    effectId: identity.effectId,
-    payloadHash: identity.payloadHash,
-    externalTaskId: remote.guid,
-    externalVersion: remote.coreTaskVersion,
-    attempt: claim.attempt,
-    leaseEpoch: claim.leaseEpoch,
-    workerId: claim.workerId,
-    generation: claim.generation,
+    effect: claim.effect,
+    claim,
+    remote,
   });
 }
 
+function isLegacyProjection(remote) {
+  return remote.coreTaskId !== null
+    && remote.coreTaskVersion !== null
+    && [remote.tenantRef, remote.accountRef, remote.effectId, remote.payloadHash]
+      .every(value => value === null || value === undefined);
+}
+
 function assertNoIdentityConflict(remote, identity) {
+  if (isLegacyProjection(remote) && remote.coreTaskId === identity.coreTaskId) {
+    throw domainError(
+      'LEGACY_PROJECTION_REQUIRES_ADOPTION',
+      `legacy native Task projection requires explicit adoption: ${remote.guid}`,
+    );
+  }
   if (remote.coreTaskId !== identity.coreTaskId
       || remote.tenantRef !== identity.tenantRef
       || remote.accountRef !== identity.accountRef) {
@@ -166,13 +167,27 @@ function assertNoIdentityConflict(remote, identity) {
   }
 }
 
+function normalizeLegacyProjectionAdoption(value) {
+  if (value === undefined || value === null) return null;
+  const adoption = requireRecord(value, 'legacyProjectionAdoption');
+  if (Object.keys(adoption).length !== 1 || typeof adoption.authorize !== 'function') {
+    throw new TypeError('legacyProjectionAdoption must provide only authorize()');
+  }
+  return adoption;
+}
+
 /**
  * Feishu Native Task Effect adapter. Durability, retry attempts and leases are
  * owned by Core's TaskEffect relay. This adapter contributes stable platform
  * identity, exact reconciliation, payload conflict checks and monotonic Core
  * version projection without introducing another delivery queue.
  */
-export function createFeishuTaskEffectAdapter({ gateway, memberMapper, identity: rawIdentity } = {}) {
+export function createFeishuTaskEffectAdapter({
+  gateway,
+  memberMapper,
+  identity: rawIdentity,
+  legacyProjectionAdoption: rawLegacyProjectionAdoption,
+} = {}) {
   const remote = requireRecord(gateway, 'TaskEffect gateway');
   for (const operation of ['findTasksByCoreTaskId', 'createTask', 'updateTask']) {
     if (typeof remote[operation] !== 'function') {
@@ -183,6 +198,34 @@ export function createFeishuTaskEffectAdapter({ gateway, memberMapper, identity:
     throw new TypeError('memberMapper.map must be a function');
   }
   const adapterIdentity = normalizeIdentity(rawIdentity);
+  const legacyProjectionAdoption = normalizeLegacyProjectionAdoption(
+    rawLegacyProjectionAdoption,
+  );
+
+  async function authorizeLegacyProjection(current, effect, identity) {
+    if (legacyProjectionAdoption === null) {
+      assertNoIdentityConflict(current, identity);
+    }
+    if (current.coreTaskVersion > effect.coreVersion) {
+      throw domainError(
+        'LEGACY_PROJECTION_VERSION_CONFLICT',
+        `legacy native Task projection is newer than TaskEffect: ${current.guid}`,
+      );
+    }
+    const decision = await legacyProjectionAdoption.authorize(Object.freeze({
+      remote: Object.freeze(structuredClone(current)),
+      effect: Object.freeze(structuredClone(effect)),
+      identity,
+    }));
+    if (decision?.authorized !== true
+        || typeof decision.adoptionId !== 'string'
+        || decision.adoptionId.trim() === '') {
+      throw domainError(
+        'LEGACY_PROJECTION_ADOPTION_DENIED',
+        `legacy native Task projection adoption was not authorized: ${current.guid}`,
+      );
+    }
+  }
 
   async function find(effect) {
     const candidates = await remote.findTasksByCoreTaskId(effect.taskId);
@@ -205,12 +248,27 @@ export function createFeishuTaskEffectAdapter({ gateway, memberMapper, identity:
     const identity = effectIdentity(effect, adapterIdentity);
     const current = await find(effect);
     if (current === null) return Object.freeze({ outcome: 'not_delivered', ...identity });
+    if (isLegacyProjection(current)) {
+      if (legacyProjectionAdoption === null) assertNoIdentityConflict(current, identity);
+      if (current.coreTaskVersion > effect.coreVersion) {
+        throw domainError(
+          'LEGACY_PROJECTION_VERSION_CONFLICT',
+          `legacy native Task projection is newer than TaskEffect: ${current.guid}`,
+        );
+      }
+      return Object.freeze({
+        outcome: 'not_delivered',
+        ...identity,
+        externalTaskId: current.guid,
+        externalVersion: current.coreTaskVersion,
+      });
+    }
     assertNoIdentityConflict(current, identity);
     if (current.effectId === identity.effectId) {
-      return receipt('reconciled', claim, identity, current);
+      return receipt('reconciled', claim, current);
     }
     if (current.coreTaskVersion > effect.coreVersion) {
-      return receipt('suppressed', claim, identity, current);
+      return receipt('suppressed', claim, current);
     }
     return Object.freeze({
       outcome: 'not_delivered',
@@ -234,12 +292,16 @@ export function createFeishuTaskEffectAdapter({ gateway, memberMapper, identity:
       }
       const current = await find(claim.effect);
       if (current !== null) {
-        assertNoIdentityConflict(current, identity);
+        if (isLegacyProjection(current)) {
+          await authorizeLegacyProjection(current, claim.effect, identity);
+        } else {
+          assertNoIdentityConflict(current, identity);
+        }
         if (current.effectId === identity.effectId) {
-          return receipt('reconciled', claim, identity, current);
+          return receipt('reconciled', claim, current);
         }
         if (current.coreTaskVersion > claim.effect.coreVersion) {
-          return receipt('suppressed', claim, identity, current);
+          return receipt('suppressed', claim, current);
         }
       }
       let members;
@@ -265,7 +327,7 @@ export function createFeishuTaskEffectAdapter({ gateway, memberMapper, identity:
           true,
         );
       }
-      return receipt('platform_accepted', claim, identity, projected);
+      return receipt('platform_accepted', claim, projected);
     },
   });
 }

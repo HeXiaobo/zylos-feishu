@@ -98,6 +98,16 @@ function fingerprint(serialized) {
   return createHash('sha256').update(serialized).digest('hex');
 }
 
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalize(value[key])]));
+}
+
+function canonicalPayloadHash(value) {
+  return `sha256:${fingerprint(serializeJson(canonicalize(value), 'status event.payload'))}`;
+}
+
 function redactedError(error) {
   return JSON.stringify({
     code: typeof error?.code === 'string' && error.code.trim() !== ''
@@ -154,10 +164,17 @@ function normalizeEvent(value) {
     if (!/^sha256:[a-f0-9]{64}$/.test(payloadHash)) {
       throw new TypeError('status event.payload_hash must be a sha256 digest');
     }
+    const payload = structuredClone(requireRecord(event.payload, 'status event.payload'));
+    if (payloadHash !== canonicalPayloadHash(payload)) {
+      throw domainError(
+        'IDEMPOTENCY_CONFLICT',
+        'status event.payload_hash does not match canonical payload',
+      );
+    }
     logicalIdentity = {
       logical_key: requireText(event.logical_key, 'status event.logical_key'),
       payload_hash: payloadHash,
-      payload: structuredClone(requireRecord(event.payload, 'status event.payload')),
+      payload,
     };
   }
   return {

@@ -61,13 +61,74 @@ function harness() {
       return structuredClone(remote);
     },
   };
-  const adapter = () => createFeishuTaskEffectAdapter({
+  const adapter = (options = {}) => createFeishuTaskEffectAdapter({
     gateway,
     memberMapper: { map: () => [] },
     identity: { tenantRef: 'tenant-1', accountRef: 'acct-1' },
+    ...options,
   });
   return { adapter, calls, get remote() { return remote; }, set remote(value) { remote = value; } };
 }
+
+test('legacy Task marker requires an explicit adoption strategy', async () => {
+  const state = harness();
+  state.remote = {
+    guid: 'guid-task-1',
+    url: 'https://example.invalid/task-1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 1,
+    tenantRef: null,
+    accountRef: null,
+    effectId: null,
+    payloadHash: null,
+  };
+
+  await assert.rejects(
+    () => state.adapter().apply({
+      effect: effect(1), attempt: 1, leaseEpoch: 1, workerId: 'worker-a', generation: 0,
+    }),
+    error => error?.code === 'LEGACY_PROJECTION_REQUIRES_ADOPTION'
+      && error?.retryable === false,
+  );
+  assert.equal(state.calls.some(([name]) => name === 'update'), false);
+});
+
+test('an explicitly authorized legacy Task marker is adopted with exact effect identity', async () => {
+  const state = harness();
+  state.remote = {
+    guid: 'guid-task-1',
+    url: 'https://example.invalid/task-1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 1,
+    tenantRef: null,
+    accountRef: null,
+    effectId: null,
+    payloadHash: null,
+  };
+  const decisions = [];
+  const adapter = state.adapter({
+    legacyProjectionAdoption: {
+      async authorize(request) {
+        decisions.push(request);
+        return { authorized: true, adoptionId: 'migration-legacy-task-1' };
+      },
+    },
+  });
+
+  const result = await adapter.apply({
+    effect: effect(1), attempt: 1, leaseEpoch: 1, workerId: 'worker-a', generation: 0,
+  });
+  assert.equal(result.outcome, 'platform_accepted');
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].remote.guid, 'guid-task-1');
+  assert.equal(decisions[0].effect.effectId, effect(1).effectId);
+  assert.equal(decisions[0].identity.coreTaskId, 'task-1');
+  assert.equal(state.calls.filter(([name]) => name === 'update').length, 1);
+  assert.equal(state.remote.tenantRef, 'tenant-1');
+  assert.equal(state.remote.accountRef, 'acct-1');
+  assert.equal(state.remote.effectId, effect(1).effectId);
+  assert.match(state.remote.payloadHash, /^sha256:[a-f0-9]{64}$/);
+});
 
 test('TaskEffect create/update/replay use stable identity and never regress out of order', async () => {
   const state = harness();

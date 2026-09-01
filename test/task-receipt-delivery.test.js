@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { createTaskReceiptDelivery } from '../src/lib/task-receipt-delivery.js';
+import { taskEffectPayloadHash } from '../src/lib/task-effect-settlement.js';
 
 function effect() {
   return {
@@ -17,6 +18,21 @@ function effect() {
     taskId: 'task-1',
     coreVersion: 2,
     task: { id: 'task-1', version: 2, title: 'Reply after projection' },
+  };
+}
+
+function settlement(taskEffect, overrides = {}) {
+  return {
+    outcome: 'platform_accepted',
+    effectId: taskEffect.effectId,
+    payloadHash: taskEffectPayloadHash(taskEffect),
+    externalTaskId: 'guid-task-1',
+    externalVersion: taskEffect.coreVersion,
+    attempt: 1,
+    leaseEpoch: 1,
+    workerId: 'worker-a',
+    generation: 0,
+    ...overrides,
   };
 }
 
@@ -39,10 +55,7 @@ test('task receipt is an independent durable ReplyIntent bound to an applied Tas
     });
     await assert.rejects(() => delivery.send({
       effect: effect(),
-      settlement: {
-        outcome: 'platform_accepted', effectId: effect().effectId,
-        externalTaskId: 'guid-task-1', externalVersion: 2,
-      },
+      settlement: settlement(effect()),
       route: { adapterId: 'feishu', targetRef: 'opaque:reply-1' },
     }));
     assert.equal(delivery.pending().length, 1);
@@ -91,10 +104,7 @@ test('unknown task receipt delivery reconciles before any resend', async () => {
     });
     const result = await delivery.send({
       effect: effect(),
-      settlement: {
-        outcome: 'reconciled', effectId: effect().effectId,
-        externalTaskId: 'guid-task-1', externalVersion: 2,
-      },
+      settlement: settlement(effect(), { outcome: 'reconciled' }),
       route: { adapterId: 'feishu', targetRef: 'opaque:chat-1' },
     });
     assert.equal(result.success, true);
@@ -122,6 +132,66 @@ test('unknown or dead-letter TaskEffect states cannot manufacture a task receipt
         route: { adapterId: 'feishu', targetRef: 'opaque:chat-1' },
       }), /settled TaskEffect/);
     }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an incomplete TaskEffect settlement cannot manufacture a task receipt', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-receipt-spoofed-'));
+  try {
+    const delivery = createTaskReceiptDelivery({
+      outboxPath: path.join(directory, 'task-receipts.json'),
+      clock: () => 1_788_000_000_000,
+      resolveTarget: () => ({ kind: 'chat', id: 'oc-chat-1' }),
+      deliver: async () => ({ success: true }),
+      reconcile: async () => ({ outcome: 'not_delivered' }),
+    });
+
+    assert.throws(() => delivery.prepare({
+      effect: effect(),
+      settlement: {
+        outcome: 'platform_accepted',
+        effectId: effect().effectId,
+      },
+      route: { adapterId: 'feishu', targetRef: 'opaque:chat-1' },
+    }), /verified TaskEffect settlement/);
+    assert.deepEqual(delivery.pending(), []);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a settlement with mismatched effect content or lease fence cannot manufacture a receipt', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-receipt-conflict-'));
+  try {
+    const delivery = createTaskReceiptDelivery({
+      outboxPath: path.join(directory, 'task-receipts.json'),
+      clock: () => 1_788_000_000_000,
+      resolveTarget: () => ({ kind: 'chat', id: 'oc-chat-1' }),
+      deliver: async () => ({ success: true }),
+      reconcile: async () => ({ outcome: 'not_delivered' }),
+    });
+    const taskEffect = effect();
+    const request = overrides => ({
+      effect: taskEffect,
+      settlement: settlement(taskEffect, overrides),
+      route: { adapterId: 'feishu', targetRef: 'opaque:chat-1' },
+    });
+
+    assert.throws(
+      () => delivery.prepare(request({
+        payloadHash: 'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+      })),
+      error => error?.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    for (const invalidFence of [{ attempt: 0 }, { leaseEpoch: 0 }, { generation: -1 }]) {
+      assert.throws(
+        () => delivery.prepare(request(invalidFence)),
+        /verified TaskEffect settlement/,
+      );
+    }
+    assert.deepEqual(delivery.pending(), []);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

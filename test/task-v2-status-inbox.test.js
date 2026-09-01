@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,21 +12,62 @@ import {
 } from '../src/lib/task-v2-status-inbox.js';
 import { createTaskV2StatusEventIngestor } from '../src/lib/task-v2-status-event.js';
 
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalize(value[key])]));
+}
+
+function payloadHash(value) {
+  return `sha256:${createHash('sha256')
+    .update(JSON.stringify(canonicalize(value)))
+    .digest('hex')}`;
+}
+
+test('status inbox rejects a reused logical hash for different canonical payload', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-forged-hash-'));
+  const firstPayload = { action: 'SubmitForReview', expectedVersion: 7 };
+  const first = {
+    event_id: 'evt-first',
+    task_id: 'guid-forged',
+    app_id: 'cli_app',
+    logical_key: 'acct-1:guid-forged:SubmitForReview:v7',
+    payload_hash: payloadHash(firstPayload),
+    payload: firstPayload,
+  };
+  try {
+    const inbox = createTaskV2StatusInbox({ directory, clock: () => 1_787_900_000_000 });
+    assert.equal(inbox.enqueue(first).created, true);
+    assert.throws(
+      () => inbox.enqueue({
+        ...first,
+        event_id: 'evt-second',
+        payload: { action: 'AcceptTask', expectedVersion: 7 },
+      }),
+      error => error?.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('status inbox deduplicates transport and logical native task identities independently', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-dual-identity-'));
+  const payload = {
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    actorId: 'user-1',
+    action: 'SubmitForReview',
+    expectedVersion: 7,
+  };
   const base = {
     task_id: 'guid-dual',
     app_id: 'cli_app',
     event_types: ['task_completed_update'],
     logical_key: 'acct-1:guid-dual:SubmitForReview:v7',
-    payload_hash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    payload: {
-      tenantRef: 'tenant-1',
-      accountRef: 'acct-1',
-      actorId: 'user-1',
-      action: 'SubmitForReview',
-      expectedVersion: 7,
-    },
+    payload_hash: payloadHash(payload),
+    payload,
   };
   try {
     const inbox = createTaskV2StatusInbox({ directory, clock: () => 1_787_900_000_000 });
