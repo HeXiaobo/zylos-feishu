@@ -836,3 +836,62 @@ test('namespaced payload hashes are controlled and canonical payload drift fails
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('schema migration rebuilds missing namespaced identities without duplicating an inbox row', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-identity-rebuild-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const raw = {
+    event_id: 'evt_identity_rebuild',
+    create_time: '1787900000000',
+    message: {
+      message_id: 'om_identity_rebuild',
+      chat_id: 'oc_identity_rebuild',
+      chat_type: 'group',
+      message_type: 'text',
+      content: JSON.stringify({ text: 'identity rebuild' }),
+    },
+    sender: {
+      sender_id: { open_id: 'ou_identity_rebuild' },
+      tenant_key: 'tenant_identity_rebuild',
+    },
+  };
+  const normalized = normalizeFeishuInboundMessage(raw, { accountRef: 'cli_app_a' });
+  const receive = (inbox) => inbox.receive({
+    adapterId: normalized.adapterId,
+    accountRef: normalized.accountRef,
+    eventType: normalized.eventType,
+    eventId: normalized.eventId,
+    messageId: normalized.messageId,
+    payload: normalized.message,
+    payloadHash: normalized.payloadHash,
+    conversationLaneKey: normalized.conversationLaneKey,
+    sourceOrder: normalized.sourceOrder,
+  });
+  try {
+    const first = openInboundEventInbox({ dbPath, clock: () => 5, maxAttempts: 3 });
+    const created = receive(first);
+    assert.equal(created.created, true);
+    first.close();
+
+    const damaged = new Database(dbPath);
+    damaged.prepare('DELETE FROM feishu_inbound_source_identities').run();
+    damaged.close();
+
+    const reopened = openInboundEventInbox({ dbPath, clock: () => 6, maxAttempts: 3 });
+    const replay = receive(reopened);
+    assert.equal(replay.created, false);
+    assert.equal(replay.entry.id, created.entry.id);
+    reopened.close();
+
+    const verify = new Database(dbPath);
+    assert.equal(verify.prepare('SELECT COUNT(*) AS count FROM feishu_inbound_inbox').get().count, 1);
+    assert.equal(
+      verify.prepare('SELECT COUNT(*) AS count FROM feishu_inbound_source_identities').get().count,
+      2,
+    );
+    assert.deepEqual(verify.pragma('foreign_key_check'), []);
+    verify.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

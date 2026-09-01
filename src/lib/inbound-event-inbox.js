@@ -309,6 +309,78 @@ function initializeSchema(database) {
     CREATE INDEX IF NOT EXISTS idx_feishu_inbound_lane_claim
       ON feishu_inbound_inbox(conversation_lane_key, lane_sequence, status);
   `);
+
+  const sourceRows = database.prepare(`
+    SELECT id, adapter_id, account_ref, event_type, event_id, message_id
+    FROM feishu_inbound_inbox
+    WHERE adapter_id IS NOT NULL
+      AND account_ref IS NOT NULL
+      AND event_type IS NOT NULL
+  `).all();
+  const selectBinding = database.prepare(`
+    SELECT inbox_id
+    FROM feishu_inbound_source_identities
+    WHERE adapter_id = ? AND account_ref = ? AND event_type = ?
+      AND kind = ? AND value = ?
+  `);
+  const insertBinding = database.prepare(`
+    INSERT OR IGNORE INTO feishu_inbound_source_identities (
+      adapter_id, account_ref, event_type, kind, value, inbox_id
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const desiredBindings = new Map();
+  for (const row of sourceRows) {
+    for (const field of ['adapter_id', 'account_ref', 'event_type']) {
+      if (typeof row[field] !== 'string' || row[field].trim() === '') {
+        throw domainError(
+          'IDENTITY_CONFLICT',
+          'namespaced inbox row has an invalid source namespace',
+        );
+      }
+    }
+    const pairs = [
+      row.event_id ? { kind: 'event', value: row.event_id } : null,
+      row.message_id ? { kind: 'message', value: row.message_id } : null,
+    ].filter(Boolean);
+    for (const pair of pairs) {
+      const key = JSON.stringify([
+        row.adapter_id,
+        row.account_ref,
+        row.event_type,
+        pair.kind,
+        pair.value,
+      ]);
+      const desiredInboxId = desiredBindings.get(key);
+      if (desiredInboxId !== undefined && desiredInboxId !== row.id) {
+        throw domainError(
+          'IDENTITY_CONFLICT',
+          'multiple namespaced inbox rows claim the same source identity',
+        );
+      }
+      const existing = selectBinding.get(
+        row.adapter_id,
+        row.account_ref,
+        row.event_type,
+        pair.kind,
+        pair.value,
+      );
+      if (existing && existing.inbox_id !== row.id) {
+        throw domainError(
+          'IDENTITY_CONFLICT',
+          'source identity binding conflicts with its namespaced inbox row',
+        );
+      }
+      desiredBindings.set(key, row.id);
+      insertBinding.run(
+        row.adapter_id,
+        row.account_ref,
+        row.event_type,
+        pair.kind,
+        pair.value,
+        row.id,
+      );
+    }
+  }
 }
 
 function toView(row) {
