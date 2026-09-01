@@ -487,6 +487,9 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
 
   function requirePresenceReceipt(receipt) {
     const value = requireRecord(receipt, 'presence receipt');
+    if (!Number.isSafeInteger(value.version) || value.version < 1) {
+      throw new TypeError('presence receipt.version must be a positive integer');
+    }
     return {
       requestId: requireText(value.requestId, 'presence receipt.requestId'),
       workerId: requireText(value.workerId, 'presence receipt.workerId', 256),
@@ -496,19 +499,18 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
 
   const completePresence = database.transaction(({ receipt, reactionId = null }) => {
     const normalized = requirePresenceReceipt(receipt);
-    if (!Number.isSafeInteger(normalized.version) || normalized.version < 1) {
-      throw new TypeError('presence receipt.version must be a positive integer');
-    }
+    const now = requireNow(clock);
     const row = selectPresence.get(normalized.requestId);
     if (
       !row
       || row.lease_version !== normalized.version
       || row.lease_owner !== normalized.workerId
       || row.operation_status !== 'inflight'
+      || row.lease_until === null
+      || row.lease_until <= now
     ) {
       throw domainError('LEASE_LOST', 'presence effect lease is no longer owned by this worker');
     }
-    const now = requireNow(clock);
     if (row.operation === 'add') {
       const id = requireText(reactionId, 'presence reactionId');
       if (row.finish_requested === 1) {
@@ -543,18 +545,20 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
 
   const completeAbsentPresence = database.transaction(({ receipt }) => {
     const normalized = requirePresenceReceipt(receipt);
+    const now = requireNow(clock);
     const row = selectPresence.get(normalized.requestId);
     if (
       !row
       || row.lease_version !== normalized.version
       || row.lease_owner !== normalized.workerId
       || row.operation_status !== 'inflight'
+      || row.lease_until === null
+      || row.lease_until <= now
       || row.operation !== 'add'
       || row.finish_requested !== 1
     ) {
       throw domainError('LEASE_LOST', 'absent presence effect is no longer owned by this worker');
     }
-    const now = requireNow(clock);
     database.prepare(`
       UPDATE feishu_presence_effects
       SET status = 'finished', operation = NULL, operation_status = NULL,
@@ -612,19 +616,21 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
     if (!Number.isSafeInteger(retryAfterMs) || retryAfterMs < 0) {
       throw new TypeError('presence retryAfterMs must be a non-negative integer');
     }
+    const now = requireNow(clock);
     const row = selectPresence.get(normalized.requestId);
     if (
       !row
       || row.lease_version !== normalized.version
       || row.lease_owner !== normalized.workerId
       || row.operation_status !== 'inflight'
+      || row.lease_until === null
+      || row.lease_until <= now
     ) {
       throw domainError('LEASE_LOST', 'presence effect lease is no longer owned by this worker');
     }
     if (outcome !== 'unknown' && outcome !== 'rejected') {
       throw new TypeError('presence deferred outcome is unsupported');
     }
-    const now = requireNow(clock);
     const message = String(error ?? outcome).slice(0, 4_096);
     const status = row.operation === 'remove' && outcome !== 'unknown'
       ? 'orphaned'
@@ -918,21 +924,23 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
 
   function leasedProjection(receipt) {
     const normalized = requireProjectionReceipt(receipt);
+    const now = requireNow(clock);
     const row = selectProjection.get(normalized.requestId, normalized.presentationId);
     if (
       !row
       || row.lease_version !== normalized.version
       || row.lease_owner !== normalized.workerId
       || row.operation_status !== 'inflight'
+      || row.lease_until === null
+      || row.lease_until <= now
     ) {
       throw domainError('LEASE_LOST', 'projection lease is no longer owned by this worker');
     }
-    return row;
+    return { row, now };
   }
 
   const completeProjection = database.transaction(({ receipt, cardId = null }) => {
-    const row = leasedProjection(receipt);
-    const now = requireNow(clock);
+    const { row, now } = leasedProjection(receipt);
     const opensBeforeTerminal = row.operation_kind === 'open'
       && row.terminal_sequence !== null
       && row.terminal_sequence <= row.operation_source_watermark;
@@ -976,14 +984,13 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
     error,
     retryAfterMs,
   }) => {
-    const row = leasedProjection(receipt);
+    const { row, now } = leasedProjection(receipt);
     if (!Number.isSafeInteger(retryAfterMs) || retryAfterMs < 0) {
       throw new TypeError('projection retryAfterMs must be a non-negative integer');
     }
     if (outcome !== 'unknown' && outcome !== 'rejected') {
       throw new TypeError('projection deferred outcome is unsupported');
     }
-    const now = requireNow(clock);
     database.prepare(`
       UPDATE feishu_progress_projections
       SET status = 'degraded', operation_status = ?, available_at = ?,

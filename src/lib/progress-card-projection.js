@@ -80,9 +80,14 @@ export function createProgressCardProjection({
       let applied = 0;
       let pending = 0;
       for (const claim of claims) {
-        const projection = await applyClaim(claim);
-        if (projection.operationStatus === null) applied += 1;
-        else pending += 1;
+        try {
+          const projection = await applyClaim(claim);
+          if (projection.operationStatus === null) applied += 1;
+          else pending += 1;
+        } catch (error) {
+          if (error?.code !== 'LEASE_LOST') throw error;
+          pending += 1;
+        }
       }
       return { attempted: claims.length, applied, pending };
     },
