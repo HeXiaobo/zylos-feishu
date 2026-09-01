@@ -296,6 +296,69 @@ function currentBranch(root, env = process.env) {
   return actualBranch(root);
 }
 
+function pullRequestEvent(env = process.env) {
+  if (env.GITHUB_EVENT_NAME !== 'pull_request') return undefined;
+  const eventPath = env.GITHUB_EVENT_PATH;
+  if (!nonEmptyString(eventPath)) return { failures: ['pull_request event metadata path is required'] };
+  const parsed = readJsonFile(eventPath);
+  if (parsed.error || !isObject(parsed.value?.pull_request)) {
+    return { failures: ['pull_request event metadata is missing or invalid'] };
+  }
+  const pullRequest = parsed.value.pull_request;
+  const headRef = pullRequest.head?.ref;
+  const headSha = pullRequest.head?.sha;
+  const baseRef = pullRequest.base?.ref;
+  const baseSha = pullRequest.base?.sha;
+  const mergeSha = pullRequest.merge_commit_sha;
+  const failures = [];
+  if (!nonEmptyString(headRef)) failures.push('pull_request event head.ref is required');
+  if (!FULL_SHA.test(headSha || '')) failures.push('pull_request event head.sha must be a complete SHA');
+  if (!nonEmptyString(baseRef)) failures.push('pull_request event base.ref is required');
+  if (!FULL_SHA.test(baseSha || '')) failures.push('pull_request event base.sha must be a complete SHA');
+  if (!FULL_SHA.test(mergeSha || '')) failures.push('pull_request event merge_commit_sha must be a complete SHA');
+  return { failures, headRef, headSha, baseRef, baseSha, mergeSha };
+}
+
+function validatePullRequestMerge(root, event, env, failures, selectedBase) {
+  failures.push(...(event?.failures || []));
+  if (event?.failures?.length) return;
+
+  const headSha = currentHead(root);
+  if (headSha !== event.mergeSha) {
+    failures.push(`pull_request merge commit ${event.mergeSha} does not match current HEAD ${headSha || '(missing)'}`);
+    return;
+  }
+  const parents = (git(root, ['show', '-s', '--format=%P', headSha], true) || '').split(/\s+/).filter(Boolean);
+  if (parents.length !== 2) {
+    failures.push(`pull_request current HEAD must be a two-parent merge commit (found ${parents.length})`);
+    return;
+  }
+  if (parents[0] !== event.baseSha) {
+    failures.push(`pull_request merge first parent ${parents[0]} does not match event base.sha ${event.baseSha}`);
+  }
+  if (parents[1] !== event.headSha) {
+    failures.push(`pull_request merge second parent ${parents[1]} does not match event head.sha ${event.headSha}`);
+  }
+  const ciSha = env.GITHUB_SHA;
+  if (nonEmptyString(ciSha) && ciSha !== headSha) {
+    failures.push(`CI commit ${ciSha} does not match pull_request merge HEAD ${headSha}`);
+  }
+  const ciBaseRef = env.GITHUB_BASE_REF;
+  if (nonEmptyString(ciBaseRef) && normalizeBranch(ciBaseRef) !== normalizeBranch(event.baseRef)) {
+    failures.push(`CI base ref ${ciBaseRef} does not match pull_request event base.ref ${event.baseRef}`);
+  }
+  const ciRef = env.GITHUB_REF;
+  if (nonEmptyString(ciRef) && !/^refs\/pull\/\d+\/merge$/.test(ciRef)) {
+    failures.push(`CI pull_request ref ${ciRef} is not a merge ref`);
+  }
+  if (selectedBase) {
+    const selectedBaseSha = git(root, ['rev-parse', '--verify', `${selectedBase}^{commit}`], true);
+    if (selectedBaseSha && selectedBaseSha !== event.baseSha) {
+      failures.push(`selected base ${selectedBase} (${selectedBaseSha}) does not match pull_request event base.sha ${event.baseSha}`);
+    }
+  }
+}
+
 function baseRef(root, supplied, env = process.env) {
   const requested = supplied || env.ZYLOS_GOVERNANCE_BASE || env.GITHUB_BASE_REF;
   if (nonEmptyString(requested)) {
@@ -881,17 +944,23 @@ export function runGovernance({
   failures.push(...metadata.failures);
   const immutableMode = normalizedMode === 'release' || normalizedMode === 'deploy';
   const observedBranch = actualBranch(root);
-  const suppliedCiBranches = [
-    branch,
-    env.ZYLOS_BRANCH,
-    env.GITHUB_HEAD_REF,
-    env.GITHUB_REF_NAME,
-    env.GITHUB_REF,
-  ]
-    .filter(nonEmptyString)
-    .map(normalizeBranch);
-  const resolvedBranch = immutableMode ? observedBranch : (branch ?? currentBranch(root, env));
-  if (immutableMode) {
+  const pullRequest = pullRequestEvent(env);
+  const selectedBase = explicitBase ?? baseRef(root, base, env);
+  const resolvedBranch = pullRequest
+    ? (pullRequest.headRef || '')
+    : (immutableMode ? observedBranch : (branch ?? currentBranch(root, env)));
+  if (pullRequest) {
+    validatePullRequestMerge(root, pullRequest, env, failures, selectedBase);
+  } else if (immutableMode) {
+    const suppliedCiBranches = [
+      branch,
+      env.ZYLOS_BRANCH,
+      env.GITHUB_HEAD_REF,
+      env.GITHUB_REF_NAME,
+      env.GITHUB_REF,
+    ]
+      .filter(nonEmptyString)
+      .map(normalizeBranch);
     for (const suppliedBranch of suppliedCiBranches) {
       if (suppliedBranch !== observedBranch) {
         failures.push(`CI branch ref ${suppliedBranch} does not match actual symbolic-ref/HEAD ${observedBranch || '(detached HEAD)'}`);
@@ -900,7 +969,6 @@ export function runGovernance({
   }
   const branchClass = classifyBranch(resolvedBranch);
   const headSha = currentHead(root) || null;
-  const selectedBase = explicitBase ?? baseRef(root, base, env);
 
   if (branchClass === 'unknown' || branchClass === 'detached') {
     failures.push(`branch cannot be classified for governance: ${resolvedBranch || '(detached HEAD)'}`);

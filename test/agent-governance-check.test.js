@@ -199,6 +199,22 @@ function globalV2Manifest({ headSha = git(ROOT, 'rev-parse', 'HEAD'), version = 
   };
 }
 
+function withoutCiEnvironment() {
+  const env = { ...process.env };
+  for (const key of [
+    'GITHUB_EVENT_NAME',
+    'GITHUB_EVENT_PATH',
+    'GITHUB_REF',
+    'GITHUB_REF_NAME',
+    'GITHUB_HEAD_REF',
+    'GITHUB_BASE_REF',
+    'GITHUB_SHA',
+    'ZYLOS_BRANCH',
+    'ZYLOS_GOVERNANCE_BASE',
+  ]) delete env[key];
+  return env;
+}
+
 function runGovernanceCli(root, mode, manifestPath) {
   const result = spawnSync(
     process.execPath,
@@ -210,7 +226,7 @@ function runGovernanceCli(root, mode, manifestPath) {
       '--manifest',
       manifestPath,
     ],
-    { cwd: root, encoding: 'utf8' },
+    { cwd: root, encoding: 'utf8', env: withoutCiEnvironment() },
   );
   let report;
   try {
@@ -243,6 +259,39 @@ function governanceCliFixture() {
   return root;
 }
 
+function pullRequestMergeFixture() {
+  const root = tempDirectory('zylos-feishu-pull-request-merge-');
+  writeFixtureMetadata(root, '0.3.7-rc.13');
+  git(root, 'init', '-q', '-b', 'main');
+  git(root, 'config', 'user.email', 'governance-tests@example.invalid');
+  git(root, 'config', 'user.name', 'Governance Tests');
+  git(root, 'add', '.');
+  git(root, 'commit', '-qm', 'base');
+  const baseSha = git(root, 'rev-parse', 'HEAD');
+  git(root, 'checkout', '-qb', 'release/0.3.7-rc.13');
+  fs.writeFileSync(path.join(root, 'candidate.txt'), 'candidate\n');
+  git(root, 'add', 'candidate.txt');
+  git(root, 'commit', '-qm', 'candidate');
+  const headSha = git(root, 'rev-parse', 'HEAD');
+  git(root, 'checkout', 'main');
+  git(root, 'merge', '--no-ff', '-m', 'merge candidate', 'release/0.3.7-rc.13');
+  const mergeSha = git(root, 'rev-parse', 'HEAD');
+  git(root, 'update-ref', 'refs/remotes/origin/main', baseSha);
+  git(root, 'checkout', '--detach', mergeSha);
+  const eventPath = path.join(root, 'event.json');
+  fs.writeFileSync(
+    eventPath,
+    JSON.stringify({
+      pull_request: {
+        head: { ref: 'release/0.3.7-rc.13', sha: headSha },
+        base: { ref: 'main', sha: baseSha },
+        merge_commit_sha: mergeSha,
+      },
+    }),
+  );
+  return { root, eventPath, baseSha, headSha, mergeSha };
+}
+
 test('repository release metadata is aligned at the release 0.3.7-rc.13 baseline', () => {
   const result = validateReleaseMetadata(ROOT);
   assert.deepEqual(result.failures, []);
@@ -255,6 +304,55 @@ test('classifies protected, release, and feature branches', () => {
   assert.equal(classifyBranch('codex/agent-governance-gates'), 'functional');
   assert.equal(classifyBranch('refs/heads/fix/metadata-gate'), 'functional');
   assert.equal(classifyBranch('detached'), 'unknown');
+});
+
+test('pull_request governance uses signed event refs and merge topology over CI branch variables', () => {
+  const fixture = pullRequestMergeFixture();
+  try {
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'check',
+      baseRef: 'origin/main',
+      env: {
+        GITHUB_EVENT_NAME: 'pull_request',
+        GITHUB_EVENT_PATH: fixture.eventPath,
+        GITHUB_REF: 'refs/pull/46/merge',
+        GITHUB_REF_NAME: 'merge',
+        GITHUB_HEAD_REF: 'forged/release-branch',
+        GITHUB_BASE_REF: 'main',
+        GITHUB_SHA: fixture.mergeSha,
+      },
+    });
+    assert.equal(result.status, 'PASS', result.failures.join('\n'));
+    assert.equal(result.branch, 'release/0.3.7-rc.13');
+    assert.equal(result.base, 'origin/main');
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('pull_request governance rejects a head SHA that is not the merge second parent', () => {
+  const fixture = pullRequestMergeFixture();
+  try {
+    const event = JSON.parse(fs.readFileSync(fixture.eventPath, 'utf8'));
+    event.pull_request.head.sha = '0'.repeat(40);
+    fs.writeFileSync(fixture.eventPath, JSON.stringify(event));
+    const result = runGovernance({
+      root: fixture.root,
+      mode: 'check',
+      baseRef: 'origin/main',
+      env: {
+        GITHUB_EVENT_NAME: 'pull_request',
+        GITHUB_EVENT_PATH: fixture.eventPath,
+        GITHUB_REF: 'refs/pull/46/merge',
+        GITHUB_SHA: fixture.mergeSha,
+      },
+    });
+    assert.equal(result.status, 'HOLD');
+    assert.ok(result.failures.some(message => message.includes('merge second parent')));
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
 });
 
 test('feature checks compare release versions with their base', () => {
@@ -272,7 +370,7 @@ test('feature checks compare release versions with their base', () => {
     git(fixture, 'add', '.');
     git(fixture, 'commit', '-qm', 'version change');
 
-    const result = runGovernance({ root: fixture, branch: 'feat/version-change', baseRef: 'HEAD~1' });
+    const result = runGovernance({ root: fixture, branch: 'feat/version-change', baseRef: 'HEAD~1', env: {} });
     assert.equal(result.status, 'HOLD');
     assert.ok(result.failures.some(message => message.includes('changed package version')));
   } finally {
@@ -387,10 +485,10 @@ test('release CLI accepts a global v2 manifest without a per-agent target', () =
         'release',
         '--branch',
         'release/0.3.7-rc.13',
-        '--manifest',
-        manifestPath,
-      ],
-      { cwd: fixtureRoot, encoding: 'utf8' },
+      '--manifest',
+      manifestPath,
+    ],
+      { cwd: fixtureRoot, encoding: 'utf8', env: withoutCiEnvironment() },
     );
     const report = JSON.parse(output);
     assert.equal(report.status, 'PASS', report.failures?.join('\n'));
