@@ -228,6 +228,38 @@ function patchPayload(task, current, effectIdentity) {
       { retryable: false },
     );
   }
+  const desiredIdentity = normalizeEffectIdentity(effectIdentity, task);
+  if (desiredIdentity !== null) {
+    if (current.coreTaskId !== task.id) {
+      throw new FeishuTaskV2Error(
+        'Task v2 update cannot change the managed Core task identity',
+        { code: 'EXTERNAL_IDENTITY_CONFLICT', retryable: false },
+      );
+    }
+    if (current.effectId === null) {
+      const isLegacyMarker = current.tenantRef === null
+        && current.accountRef === null
+        && current.payloadHash === null;
+      throw new FeishuTaskV2Error(
+        isLegacyMarker
+          ? 'Task v2 legacy marker requires a separate durable adoption transaction'
+          : 'Task v2 marker has an incomplete TaskEffect identity',
+        {
+          code: isLegacyMarker
+            ? 'LEGACY_PROJECTION_REQUIRES_ADOPTION'
+            : 'EXTERNAL_IDENTITY_CONFLICT',
+          retryable: false,
+        },
+      );
+    }
+    if (current.tenantRef !== desiredIdentity.tenantRef
+        || current.accountRef !== desiredIdentity.accountRef) {
+      throw new FeishuTaskV2Error(
+        'Task v2 update cannot change the managed tenant/account identity',
+        { code: 'EXTERNAL_IDENTITY_CONFLICT', retryable: false },
+      );
+    }
+  }
   const patch = {};
   const updateFields = [];
   const summary = requireText(task.title, 'task.title');

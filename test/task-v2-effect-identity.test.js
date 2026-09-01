@@ -77,7 +77,7 @@ test('Task v2 SDK marker persists exact effect identity for crash reconciliation
   );
 });
 
-test('Task v2 SDK can adopt a legacy marker only when exact effect identity is supplied', async () => {
+test('Task v2 SDK refuses to adopt a legacy marker through ordinary update', async () => {
   let persistedExtra = JSON.stringify({
     schema: 'zylos.task-v2-projection/v1',
     coreTaskId: 'task-1',
@@ -107,26 +107,83 @@ test('Task v2 SDK can adopt a legacy marker only when exact effect identity is s
     coreTaskVersion: 3,
   };
   const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
-  const adopted = await gateway.updateTask({
-    taskGuid: 'guid-effect-1',
-    task: {
-      id: 'task-1', version: 3, title: 'Effect identity', state: 'in_progress',
-      updatedAt: '2026-09-01T00:00:00.000Z',
-    },
-    members: [],
-    clientToken: 'zte_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    effectIdentity: identity,
-  });
+  await assert.rejects(
+    () => gateway.updateTask({
+      taskGuid: 'guid-effect-1',
+      task: {
+        id: 'task-1', version: 3, title: 'Effect identity', state: 'in_progress',
+        updatedAt: '2026-09-01T00:00:00.000Z',
+      },
+      members: [],
+      clientToken: 'zte_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      effectIdentity: identity,
+    }),
+    error => error?.code === 'LEGACY_PROJECTION_REQUIRES_ADOPTION'
+      && error?.retryable === false,
+  );
 
-  assert.equal(patches, 1);
+  assert.equal(patches, 0);
   assert.deepEqual(JSON.parse(persistedExtra), {
     schema: 'zylos.task-v2-projection/v1',
     coreTaskId: 'task-1',
     coreTaskVersion: 3,
-    tenantRef: 'tenant-1',
-    accountRef: 'acct-1',
-    effectId: 'effect-task-1-v3',
-    payloadHash: identity.payloadHash,
   });
-  assert.equal(adopted.effectId, identity.effectId);
+});
+
+test('Task v2 SDK refuses partial or cross-scope TaskEffect marker rewrites', async () => {
+  const attemptedMarkers = [
+    {
+      schema: 'zylos.task-v2-projection/v1',
+      coreTaskId: 'task-1',
+      coreTaskVersion: 3,
+      tenantRef: 'tenant-other',
+    },
+    {
+      schema: 'zylos.task-v2-projection/v1',
+      coreTaskId: 'task-1',
+      coreTaskVersion: 3,
+      tenantRef: 'tenant-other',
+      accountRef: 'acct-1',
+      effectId: 'effect-task-1-v2',
+      payloadHash: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    },
+  ];
+  for (const marker of attemptedMarkers) {
+    let patches = 0;
+    const taskApi = {
+      async create() { throw new Error('not used'); },
+      async patch() { patches += 1; throw new Error('must not patch'); },
+      async get() {
+        return { code: 0, data: { task: nativeTask(JSON.stringify(marker)) } };
+      },
+      async addMembers() { throw new Error('not used'); },
+      async removeMembers() { throw new Error('not used'); },
+      async addReminders() { throw new Error('not used'); },
+      async removeReminders() { throw new Error('not used'); },
+      async list() { return { code: 0, data: { items: [], has_more: false } }; },
+    };
+    const gateway = createSdkTaskV2Gateway({ client: { task: { v2: { task: taskApi } } } });
+    await assert.rejects(
+      () => gateway.updateTask({
+        taskGuid: 'guid-effect-1',
+        task: {
+          id: 'task-1', version: 3, title: 'Effect identity', state: 'in_progress',
+          updatedAt: '2026-09-01T00:00:00.000Z',
+        },
+        members: [],
+        clientToken: 'zte_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        effectIdentity: {
+          tenantRef: 'tenant-1',
+          accountRef: 'acct-1',
+          effectId: 'effect-task-1-v3',
+          payloadHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          coreTaskId: 'task-1',
+          coreTaskVersion: 3,
+        },
+      }),
+      error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+        && error?.retryable === false,
+    );
+    assert.equal(patches, 0);
+  }
 });

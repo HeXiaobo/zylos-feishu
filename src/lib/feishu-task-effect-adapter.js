@@ -167,26 +167,18 @@ function assertNoIdentityConflict(remote, identity) {
   }
 }
 
-function normalizeLegacyProjectionAdoption(value) {
-  if (value === undefined || value === null) return null;
-  const adoption = requireRecord(value, 'legacyProjectionAdoption');
-  if (Object.keys(adoption).length !== 1 || typeof adoption.authorize !== 'function') {
-    throw new TypeError('legacyProjectionAdoption must provide only authorize()');
-  }
-  return adoption;
-}
-
 /**
  * Feishu Native Task Effect adapter. Durability, retry attempts and leases are
  * owned by Core's TaskEffect relay. This adapter contributes stable platform
  * identity, exact reconciliation, payload conflict checks and monotonic Core
- * version projection without introducing another delivery queue.
+ * version projection without introducing another delivery queue. Legacy
+ * markers are deliberately not adopted here: migration requires a separately
+ * accepted durable Core transaction and this adapter always fails them closed.
  */
 export function createFeishuTaskEffectAdapter({
   gateway,
   memberMapper,
   identity: rawIdentity,
-  legacyProjectionAdoption: rawLegacyProjectionAdoption,
 } = {}) {
   const remote = requireRecord(gateway, 'TaskEffect gateway');
   for (const operation of ['findTasksByCoreTaskId', 'createTask', 'updateTask']) {
@@ -198,34 +190,6 @@ export function createFeishuTaskEffectAdapter({
     throw new TypeError('memberMapper.map must be a function');
   }
   const adapterIdentity = normalizeIdentity(rawIdentity);
-  const legacyProjectionAdoption = normalizeLegacyProjectionAdoption(
-    rawLegacyProjectionAdoption,
-  );
-
-  async function authorizeLegacyProjection(current, effect, identity) {
-    if (legacyProjectionAdoption === null) {
-      assertNoIdentityConflict(current, identity);
-    }
-    if (current.coreTaskVersion > effect.coreVersion) {
-      throw domainError(
-        'LEGACY_PROJECTION_VERSION_CONFLICT',
-        `legacy native Task projection is newer than TaskEffect: ${current.guid}`,
-      );
-    }
-    const decision = await legacyProjectionAdoption.authorize(Object.freeze({
-      remote: Object.freeze(structuredClone(current)),
-      effect: Object.freeze(structuredClone(effect)),
-      identity,
-    }));
-    if (decision?.authorized !== true
-        || typeof decision.adoptionId !== 'string'
-        || decision.adoptionId.trim() === '') {
-      throw domainError(
-        'LEGACY_PROJECTION_ADOPTION_DENIED',
-        `legacy native Task projection adoption was not authorized: ${current.guid}`,
-      );
-    }
-  }
 
   async function find(effect) {
     const candidates = await remote.findTasksByCoreTaskId(effect.taskId);
@@ -248,21 +212,6 @@ export function createFeishuTaskEffectAdapter({
     const identity = effectIdentity(effect, adapterIdentity);
     const current = await find(effect);
     if (current === null) return Object.freeze({ outcome: 'not_delivered', ...identity });
-    if (isLegacyProjection(current)) {
-      if (legacyProjectionAdoption === null) assertNoIdentityConflict(current, identity);
-      if (current.coreTaskVersion > effect.coreVersion) {
-        throw domainError(
-          'LEGACY_PROJECTION_VERSION_CONFLICT',
-          `legacy native Task projection is newer than TaskEffect: ${current.guid}`,
-        );
-      }
-      return Object.freeze({
-        outcome: 'not_delivered',
-        ...identity,
-        externalTaskId: current.guid,
-        externalVersion: current.coreTaskVersion,
-      });
-    }
     assertNoIdentityConflict(current, identity);
     if (current.effectId === identity.effectId) {
       return receipt('reconciled', claim, current);
@@ -292,11 +241,7 @@ export function createFeishuTaskEffectAdapter({
       }
       const current = await find(claim.effect);
       if (current !== null) {
-        if (isLegacyProjection(current)) {
-          await authorizeLegacyProjection(current, claim.effect, identity);
-        } else {
-          assertNoIdentityConflict(current, identity);
-        }
+        assertNoIdentityConflict(current, identity);
         if (current.effectId === identity.effectId) {
           return receipt('reconciled', claim, current);
         }

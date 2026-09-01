@@ -70,7 +70,7 @@ function harness() {
   return { adapter, calls, get remote() { return remote; }, set remote(value) { remote = value; } };
 }
 
-test('legacy Task marker requires an explicit adoption strategy', async () => {
+test('legacy Task marker requires a separate durable adoption transaction', async () => {
   const state = harness();
   state.remote = {
     guid: 'guid-task-1',
@@ -93,7 +93,7 @@ test('legacy Task marker requires an explicit adoption strategy', async () => {
   assert.equal(state.calls.some(([name]) => name === 'update'), false);
 });
 
-test('an explicitly authorized legacy Task marker is adopted with exact effect identity', async () => {
+test('legacy Task marker cannot be adopted concurrently through the TaskEffect adapter', async () => {
   const state = harness();
   state.remote = {
     guid: 'guid-task-1',
@@ -105,29 +105,100 @@ test('an explicitly authorized legacy Task marker is adopted with exact effect i
     effectId: null,
     payloadHash: null,
   };
-  const decisions = [];
+  let authorizations = 0;
+  const options = {
+    legacyProjectionAdoption: {
+      async authorize() {
+        authorizations += 1;
+        return { authorized: true, adoptionId: 'migration-legacy-task-1' };
+      },
+    },
+  };
+
+  const results = await Promise.allSettled([
+    state.adapter(options).apply({
+      effect: effect(1), attempt: 1, leaseEpoch: 1, workerId: 'worker-a', generation: 0,
+    }),
+    state.adapter(options).apply({
+      effect: effect(1), attempt: 2, leaseEpoch: 2, workerId: 'worker-b', generation: 1,
+    }),
+  ]);
+  assert.deepEqual(results.map(result => result.status), ['rejected', 'rejected']);
+  for (const result of results) {
+    assert.equal(result.reason?.code, 'LEGACY_PROJECTION_REQUIRES_ADOPTION');
+  }
+  assert.equal(authorizations, 0);
+  assert.equal(state.calls.filter(([name]) => name === 'update').length, 0);
+});
+
+test('removed legacy adoption option cannot authorize an update after restart or replay', async () => {
+  const state = harness();
+  state.remote = {
+    guid: 'guid-task-1',
+    url: 'https://example.invalid/task-1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 1,
+    tenantRef: null,
+    accountRef: null,
+    effectId: null,
+    payloadHash: null,
+  };
+  let authorizations = 0;
+  const options = {
+    legacyProjectionAdoption: {
+      async authorize() {
+        authorizations += 1;
+        return { authorized: true, adoptionId: 'migration-legacy-task-1' };
+      },
+    },
+  };
+
+  for (const [index, adapter] of [state.adapter(options), state.adapter(options)].entries()) {
+    await assert.rejects(
+      () => adapter.apply({
+        effect: effect(1),
+        attempt: index + 1,
+        leaseEpoch: index + 1,
+        workerId: `worker-${index + 1}`,
+        generation: index,
+      }),
+      error => error?.code === 'LEGACY_PROJECTION_REQUIRES_ADOPTION',
+    );
+  }
+  assert.equal(authorizations, 0);
+  assert.equal(state.calls.filter(([name]) => name === 'update').length, 0);
+});
+
+test('legacy marker for another Core task cannot be adopted by a permissive old strategy', async () => {
+  const state = harness();
+  state.remote = {
+    guid: 'guid-other-task',
+    url: 'https://example.invalid/other-task',
+    coreTaskId: 'task-other',
+    coreTaskVersion: 1,
+    tenantRef: null,
+    accountRef: null,
+    effectId: null,
+    payloadHash: null,
+  };
+  let authorizations = 0;
   const adapter = state.adapter({
     legacyProjectionAdoption: {
-      async authorize(request) {
-        decisions.push(request);
-        return { authorized: true, adoptionId: 'migration-legacy-task-1' };
+      async authorize() {
+        authorizations += 1;
+        return { authorized: true, adoptionId: 'wrong-core-adoption' };
       },
     },
   });
 
-  const result = await adapter.apply({
-    effect: effect(1), attempt: 1, leaseEpoch: 1, workerId: 'worker-a', generation: 0,
-  });
-  assert.equal(result.outcome, 'platform_accepted');
-  assert.equal(decisions.length, 1);
-  assert.equal(decisions[0].remote.guid, 'guid-task-1');
-  assert.equal(decisions[0].effect.effectId, effect(1).effectId);
-  assert.equal(decisions[0].identity.coreTaskId, 'task-1');
-  assert.equal(state.calls.filter(([name]) => name === 'update').length, 1);
-  assert.equal(state.remote.tenantRef, 'tenant-1');
-  assert.equal(state.remote.accountRef, 'acct-1');
-  assert.equal(state.remote.effectId, effect(1).effectId);
-  assert.match(state.remote.payloadHash, /^sha256:[a-f0-9]{64}$/);
+  await assert.rejects(
+    () => adapter.apply({
+      effect: effect(1), attempt: 1, leaseEpoch: 1, workerId: 'worker-a', generation: 0,
+    }),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT' && error?.retryable === false,
+  );
+  assert.equal(authorizations, 0);
+  assert.equal(state.calls.filter(([name]) => name === 'update').length, 0);
 });
 
 test('TaskEffect create/update/replay use stable identity and never regress out of order', async () => {
