@@ -962,6 +962,7 @@ test('database fencing blocks a rolling legacy writer from splitting a namespace
   const eventId = 'evt_rolling_fence';
   const messageId = 'om_rolling_fence';
   try {
+    const oldConnection = new Database(dbPath);
     const inbox = openInboundEventInbox({ dbPath, clock: () => 9, maxAttempts: 3 });
     const created = inbox.receive({
       adapterId: 'feishu',
@@ -974,40 +975,120 @@ test('database fencing blocks a rolling legacy writer from splitting a namespace
       sourceOrder: null,
     });
     assert.equal(created.created, true);
-
-    const legacyPayload = JSON.stringify({
-      message: { message_id: messageId, content: JSON.stringify({ text: 'old writer row' }) },
-      sender: { sender_id: { open_id: 'ou_rolling' } },
-      _timestamp: '1787900000000',
+    const [newWriterLease] = inbox.claim({
+      workerId: 'new-writer-processing',
+      leaseMs: 5_000,
+      limit: 1,
     });
-    const oldConnection = new Database(dbPath);
-    const oldWriterReceive = oldConnection.transaction(() => {
+    assert.equal(newWriterLease.id, created.entry.id);
+
+    const oldWriterReceive = oldConnection.transaction((legacyEventId, legacyMessageId, payload) => {
+      const payloadJson = JSON.stringify(payload);
       const inserted = oldConnection.prepare(`
         INSERT INTO feishu_inbound_inbox (
           event_id, message_id, request_fingerprint, payload_json, status,
           available_at, received_at, updated_at
         ) VALUES (?, ?, ?, ?, 'received', 9, 9, 9)
       `).run(
-        eventId,
-        messageId,
-        createHash('sha256').update(legacyPayload).digest('hex'),
-        legacyPayload,
+        legacyEventId,
+        legacyMessageId,
+        createHash('sha256').update(payloadJson).digest('hex'),
+        payloadJson,
       );
       const legacyId = Number(inserted.lastInsertRowid);
       oldConnection.prepare(`
         INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, ?)
-      `).run('event', eventId, legacyId);
+      `).run('event', legacyEventId, legacyId);
       oldConnection.prepare(`
         INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, ?)
-      `).run('message', messageId, legacyId);
+      `).run('message', legacyMessageId, legacyId);
+      return legacyId;
     });
-    assert.throws(oldWriterReceive, /split inbound identity/i);
+    const conflictingPayload = (text) => ({
+      message: {
+        message_id: messageId,
+        chat_id: 'oc_rolling',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text }),
+      },
+      sender: { sender_id: { open_id: 'ou_rolling' }, tenant_key: 'tenant_rolling' },
+      _timestamp: '1787900000000',
+    });
+    assert.throws(
+      () => oldWriterReceive(eventId, messageId, conflictingPayload('new writer row')),
+      /split inbound identity/i,
+    );
+    assert.throws(
+      () => oldWriterReceive(eventId, messageId, conflictingPayload('payload drift')),
+      /split inbound identity/i,
+    );
     assert.equal(
       oldConnection.prepare('SELECT COUNT(*) AS count FROM feishu_inbound_inbox').get().count,
       1,
     );
+    inbox.commit({ receipt: newWriterLease.receipt, result: { accepted: 'new writer' } });
+
+    const healthyRaw = {
+      event_id: 'evt_rolling_healthy',
+      create_time: '1787900000001',
+      message: {
+        message_id: 'om_rolling_healthy',
+        chat_id: 'oc_rolling_healthy',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: 'healthy old writer row' }),
+      },
+      sender: {
+        sender_id: { open_id: 'ou_rolling_healthy' },
+        tenant_key: 'tenant_rolling',
+      },
+    };
+    const healthyEnvelope = normalizeInboundMessageEvent(healthyRaw);
+    const healthyLegacyId = oldWriterReceive(
+      healthyEnvelope.eventId,
+      healthyEnvelope.messageId,
+      healthyEnvelope.payload,
+    );
+    const healthy = normalizeFeishuInboundMessage(healthyRaw, { accountRef: 'cli_app_a' });
+    const bridgedHealthy = inbox.receive({
+      adapterId: healthy.adapterId,
+      accountRef: healthy.accountRef,
+      eventType: healthy.eventType,
+      eventId: healthy.eventId,
+      messageId: healthy.messageId,
+      payload: healthy.message,
+      payloadHash: healthy.payloadHash,
+      conversationLaneKey: healthy.conversationLaneKey,
+      sourceOrder: healthy.sourceOrder,
+    });
+    assert.equal(bridgedHealthy.created, false);
+    assert.equal(bridgedHealthy.entry.id, healthyLegacyId);
+    const [healthyLease] = inbox.claim({
+      workerId: 'new-writer-healthy',
+      leaseMs: 5_000,
+      limit: 1,
+    });
+    assert.equal(healthyLease.id, healthyLegacyId);
+    inbox.commit({ receipt: healthyLease.receipt, result: { accepted: 'healthy legacy' } });
+
     oldConnection.close();
     inbox.close();
+
+    const reopened = openInboundEventInbox({ dbPath, clock: () => 10, maxAttempts: 3 });
+    assert.equal(reopened.query({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      messageId,
+    }).status, 'committed');
+    assert.equal(reopened.query({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      messageId: healthy.messageId,
+    }).status, 'committed');
+    reopened.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
