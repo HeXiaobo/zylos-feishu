@@ -127,6 +127,10 @@ function fingerprint(json) {
 
 function normalizeHandle(input) {
   const value = requireRecord(input, 'reply handle');
+  // ingressId is the stable, durable logical-ingress handoff owned by WT03-F;
+  // requestId is the accepted Core identity. sourceMessageId is only the
+  // opaque Feishu resource targeted by Reply Presence and is deliberately not
+  // a presentation dedupe key by itself.
   const expected = [
     'ingressId',
     'requestId',
@@ -260,6 +264,7 @@ function initializeSchema(database) {
       source_sequence INTEGER NOT NULL,
       event_hash TEXT NOT NULL,
       event_json TEXT NOT NULL,
+      projectable INTEGER NOT NULL DEFAULT 1 CHECK (projectable IN (0, 1)),
       received_at INTEGER NOT NULL,
       PRIMARY KEY (request_id, presentation_id, source_sequence),
       FOREIGN KEY (request_id, presentation_id)
@@ -271,6 +276,16 @@ function initializeSchema(database) {
         operation_status, available_at, lease_until, due_at, request_id, presentation_id
       );
   `);
+
+  const projectionEventColumns = database
+    .pragma('table_info(feishu_projection_events)')
+    .map((column) => column.name);
+  if (!projectionEventColumns.includes('projectable')) {
+    database.exec(`
+      ALTER TABLE feishu_projection_events
+      ADD COLUMN projectable INTEGER NOT NULL DEFAULT 1 CHECK (projectable IN (0, 1));
+    `);
+  }
 }
 
 function handleView(row) {
@@ -664,6 +679,7 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
       return {
         accepted: false,
         replayed: true,
+        dropped: existing.projectable === 0,
         flushDue: projection.due_at !== null && projection.due_at <= now,
         projection: projectionView(projection),
       };
@@ -692,31 +708,38 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
       );
     }
 
+    const projectable = event.sequence > projection.high_watermark ? 1 : 0;
     database.prepare(`
       INSERT INTO feishu_projection_events (
-        request_id, presentation_id, source_sequence, event_hash, event_json, received_at
-      ) VALUES (?, ?, ?, ?, ?, ?)
+        request_id, presentation_id, source_sequence, event_hash, event_json,
+        projectable, received_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
       event.requestId,
       event.presentationId,
       event.sequence,
       event.eventHash,
       event.eventJson,
+      projectable,
       now,
     );
 
-    let highWatermark = projection.high_watermark;
-    while (selectProjectionEvent.get(event.requestId, event.presentationId, highWatermark + 1)) {
-      highWatermark += 1;
-    }
+    // Core's sequence spans the complete Run stream. Feishu subscribes only
+    // to projection events, so its durable consumer checkpoint is the greatest
+    // Core sequence observed, not a synthetic contiguous sequence beginning at
+    // one. Missing RunAccepted/RunQueued/RunStarted events are not projection
+    // gaps and must never block visible progress or a final barrier.
+    const highWatermark = Math.max(projection.high_watermark, event.sequence);
     const terminalSequence = event.terminal ? event.sequence : projection.terminal_sequence;
-    const dueAt = coalescer.dueAt({
-      now,
-      currentDueAt: projection.due_at,
-      highWatermark,
-      lastAppliedSequence: projection.last_applied_sequence,
-      terminalSequence,
-    });
+    const dueAt = projectable === 1
+      ? coalescer.dueAt({
+        now,
+        currentDueAt: projection.due_at,
+        highWatermark,
+        lastAppliedSequence: projection.last_applied_sequence,
+        terminalSequence,
+      })
+      : projection.due_at;
     database.prepare(`
       UPDATE feishu_progress_projections
       SET high_watermark = ?, terminal_sequence = ?, due_at = ?,
@@ -732,8 +755,9 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
     );
     projection = selectProjection.get(event.requestId, event.presentationId);
     return {
-      accepted: true,
+      accepted: projectable === 1,
       replayed: false,
+      dropped: projectable === 0,
       flushDue: projection.due_at !== null && projection.due_at <= now,
       projection: projectionView(projection),
     };
@@ -765,7 +789,11 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
             AND high_watermark > last_applied_sequence
           )
         )
-      ORDER BY COALESCE(due_at, available_at), request_id, presentation_id
+      ORDER BY
+        CASE WHEN terminal_sequence IS NOT NULL THEN 0 ELSE 1 END,
+        COALESCE(due_at, available_at),
+        request_id,
+        presentation_id
       LIMIT ?
     `).all(now, now, now, limit);
     const claims = [];
@@ -777,6 +805,7 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
           SELECT event_json
           FROM feishu_projection_events
           WHERE request_id = ? AND presentation_id = ?
+            AND projectable = 1
             AND source_sequence > ? AND source_sequence <= ?
           ORDER BY source_sequence
         `).all(
@@ -791,19 +820,22 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
           throw domainError('CARDKIT_SEQUENCE_EXHAUSTED', 'CardKit sequence exceeded 32-bit range');
         }
         let kind;
-        if (row.terminal_sequence !== null && row.terminal_sequence <= row.high_watermark) {
+        if (!row.card_id) {
+          kind = 'open';
+        } else if (row.terminal_sequence !== null && row.terminal_sequence <= row.high_watermark) {
           kind = 'finalize';
         } else if (events.some((event) => event.type === 'FallbackRequested')) {
           kind = 'fallback';
         } else {
-          kind = row.card_id ? 'update' : 'open';
+          kind = 'update';
         }
-        const operationId = [
-          'projection',
+        const operationTuple = serialize([
+          'feishu-projection-operation/v1',
           row.request_id,
           row.presentation_id,
           nextCardKitSequence,
-        ].join(':');
+        ], 'projection operation identity');
+        const operationId = `projection:sha256:${fingerprint(operationTuple)}`;
         const reserved = database.prepare(`
           UPDATE feishu_progress_projections
           SET operation_id = ?, operation_kind = ?, operation_status = 'pending',
@@ -901,7 +933,16 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
   const completeProjection = database.transaction(({ receipt, cardId = null }) => {
     const row = leasedProjection(receipt);
     const now = requireNow(clock);
-    const appliedSequence = row.operation_source_watermark;
+    const opensBeforeTerminal = row.operation_kind === 'open'
+      && row.terminal_sequence !== null
+      && row.terminal_sequence <= row.operation_source_watermark;
+    // CardKit has no create-and-finalize operation in the Phase A port. When
+    // terminal is the first visible event, the open ACK binds the external
+    // card identity but deliberately leaves the terminal consumer checkpoint
+    // pending so the next, higher CardKit sequence can finalize that card.
+    const appliedSequence = opensBeforeTerminal
+      ? row.last_applied_sequence
+      : row.operation_source_watermark;
     const terminal = row.terminal_sequence !== null && row.terminal_sequence <= appliedSequence;
     const dueAt = coalescer.dueAt({
       now,
