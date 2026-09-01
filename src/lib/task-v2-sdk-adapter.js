@@ -37,11 +37,38 @@ function optionalNonNegativeInteger(value, field) {
   return value;
 }
 
-function taskMarker(task) {
+function normalizeEffectIdentity(value, task) {
+  if (value === undefined || value === null) return null;
+  const identity = requireRecord(value, 'effectIdentity');
+  const allowed = new Set([
+    'tenantRef', 'accountRef', 'effectId', 'payloadHash', 'coreTaskId', 'coreTaskVersion',
+  ]);
+  const unknown = Object.keys(identity).find(key => !allowed.has(key));
+  if (unknown || Object.keys(identity).length !== allowed.size) {
+    throw new TypeError('effectIdentity contains unsupported or missing fields');
+  }
+  if (identity.coreTaskId !== task.id || identity.coreTaskVersion !== task.version) {
+    throw new TypeError('effectIdentity does not match task identity/version');
+  }
+  const payloadHash = requireText(identity.payloadHash, 'effectIdentity.payloadHash');
+  if (!/^sha256:[a-f0-9]{64}$/.test(payloadHash)) {
+    throw new TypeError('effectIdentity.payloadHash must be a sha256 digest');
+  }
+  return {
+    tenantRef: requireText(identity.tenantRef, 'effectIdentity.tenantRef'),
+    accountRef: requireText(identity.accountRef, 'effectIdentity.accountRef'),
+    effectId: requireText(identity.effectId, 'effectIdentity.effectId'),
+    payloadHash,
+  };
+}
+
+function taskMarker(task, rawEffectIdentity) {
+  const identity = normalizeEffectIdentity(rawEffectIdentity, task);
   return JSON.stringify({
     schema: MARKER_SCHEMA,
     coreTaskId: requireText(task.id, 'task.id'),
     coreTaskVersion: task.version,
+    ...(identity ?? {}),
   });
 }
 
@@ -160,6 +187,10 @@ function taskFromResponse(response, operation) {
     completedAt: optionalText(task.completed_at, 'Feishu Task v2 completed_at') ?? '0',
     coreTaskId: marker?.coreTaskId ?? null,
     coreTaskVersion: marker?.coreTaskVersion ?? null,
+    tenantRef: marker?.tenantRef ?? null,
+    accountRef: marker?.accountRef ?? null,
+    effectId: marker?.effectId ?? null,
+    payloadHash: marker?.payloadHash ?? null,
   });
 }
 
@@ -174,7 +205,7 @@ function wrapSdkFailure(operation, error) {
   });
 }
 
-function createPayload(task, members, clientToken) {
+function createPayload(task, members, clientToken, effectIdentity) {
   const due = dueFromTask(task);
   return {
     summary: requireText(task.title, 'task.title'),
@@ -183,14 +214,20 @@ function createPayload(task, members, clientToken) {
     completed_at: completionFromTask(task),
     members: normalizeMembers(members),
     client_token: requireText(clientToken, 'clientToken'),
-    extra: taskMarker(task),
+    extra: taskMarker(task, effectIdentity),
     origin: {
       platform_i18n_name: { zh_cn: 'Zylos 任务', en_us: 'Zylos Task' },
     },
   };
 }
 
-function patchPayload(task, current) {
+function patchPayload(task, current, effectIdentity) {
+  if ((effectIdentity === undefined || effectIdentity === null) && current.effectId !== null) {
+    throw new FeishuTaskV2Error(
+      'Task v2 update requires the current TaskEffect identity; refusing a legacy writer',
+      { retryable: false },
+    );
+  }
   const patch = {};
   const updateFields = [];
   const summary = requireText(task.title, 'task.title');
@@ -216,8 +253,14 @@ function patchPayload(task, current) {
     patch.completed_at = completedAt;
     updateFields.push('completed_at');
   }
-  if (current.coreTaskId !== task.id || current.coreTaskVersion !== task.version) {
-    patch.extra = taskMarker(task);
+  const desiredMarker = JSON.parse(taskMarker(task, effectIdentity));
+  if (current.coreTaskId !== desiredMarker.coreTaskId
+      || current.coreTaskVersion !== desiredMarker.coreTaskVersion
+      || current.tenantRef !== (desiredMarker.tenantRef ?? null)
+      || current.accountRef !== (desiredMarker.accountRef ?? null)
+      || current.effectId !== (desiredMarker.effectId ?? null)
+      || current.payloadHash !== (desiredMarker.payloadHash ?? null)) {
+    patch.extra = JSON.stringify(desiredMarker);
     updateFields.push('extra');
   }
   return { task: patch, update_fields: updateFields };
@@ -378,12 +421,12 @@ export function createSdkTaskV2Gateway({ client } = {}) {
   }
 
   return Object.freeze({
-    async createTask({ task, members, clientToken } = {}) {
+    async createTask({ task, members, clientToken, effectIdentity } = {}) {
       try {
         const normalizedTask = requireRecord(task, 'task');
         const created = taskFromResponse(await taskApi.create({
           params: { user_id_type: USER_ID_TYPE },
-          data: createPayload(normalizedTask, members, clientToken),
+          data: createPayload(normalizedTask, members, clientToken, effectIdentity),
         }), 'create');
         const reminderMinutesBeforeDue = reminderFromTask(normalizedTask);
         if (reminderMinutesBeforeDue === null) return created;
@@ -404,13 +447,13 @@ export function createSdkTaskV2Gateway({ client } = {}) {
       }
     },
 
-    async updateTask({ taskGuid, task, members, clientToken } = {}) {
+    async updateTask({ taskGuid, task, members, clientToken, effectIdentity } = {}) {
       const guid = requireText(taskGuid, 'taskGuid');
       const desiredMembers = normalizeMembers(members);
       try {
         const current = await getTask(guid);
         const normalizedTask = requireRecord(task, 'task');
-        const patch = patchPayload(normalizedTask, current);
+        const patch = patchPayload(normalizedTask, current, effectIdentity);
         const desiredReminder = reminderFromTask(normalizedTask);
         const normalizedClientToken = requireText(clientToken, 'clientToken');
         // A reminder update is a separate native API operation. Complete the

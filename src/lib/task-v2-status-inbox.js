@@ -5,7 +5,12 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 const REQUIRED_EVENT_FIELDS = Object.freeze(['event_id', 'task_id', 'app_id']);
-const OPTIONAL_EVENT_FIELDS = Object.freeze(['event_types']);
+const OPTIONAL_EVENT_FIELDS = Object.freeze([
+  'event_types',
+  'logical_key',
+  'payload_hash',
+  'payload',
+]);
 const MAX_EVENT_ID_LENGTH = 512;
 const MAX_JSON_BYTES = 1024 * 1024;
 const LEGACY_MIGRATION_KEY = 'legacy-ndjson-v1';
@@ -93,6 +98,15 @@ function fingerprint(serialized) {
   return createHash('sha256').update(serialized).digest('hex');
 }
 
+function redactedError(error) {
+  return JSON.stringify({
+    code: typeof error?.code === 'string' && error.code.trim() !== ''
+      ? error.code.slice(0, 128)
+      : 'TASK_STATUS_FAILED',
+    retryable: error?.retryable !== false,
+  });
+}
+
 function legacyFileStamp(filePath) {
   try {
     const stat = fs.statSync(filePath);
@@ -126,11 +140,32 @@ function normalizeEvent(value) {
       throw new TypeError('status event.event_types must not contain duplicates');
     }
   }
+  const hasLogicalIdentity = event.logical_key !== undefined
+    || event.payload_hash !== undefined
+    || event.payload !== undefined;
+  let logicalIdentity = {};
+  if (hasLogicalIdentity) {
+    if (event.logical_key === undefined
+        || event.payload_hash === undefined
+        || event.payload === undefined) {
+      throw new TypeError('status event logical identity fields must be provided together');
+    }
+    const payloadHash = requireText(event.payload_hash, 'status event.payload_hash');
+    if (!/^sha256:[a-f0-9]{64}$/.test(payloadHash)) {
+      throw new TypeError('status event.payload_hash must be a sha256 digest');
+    }
+    logicalIdentity = {
+      logical_key: requireText(event.logical_key, 'status event.logical_key'),
+      payload_hash: payloadHash,
+      payload: structuredClone(requireRecord(event.payload, 'status event.payload')),
+    };
+  }
   return {
     event_id: requireText(event.event_id, 'status event.event_id'),
     task_id: requireText(event.task_id, 'status event.task_id'),
     app_id: requireText(event.app_id, 'status event.app_id'),
     ...(eventTypes === undefined ? {} : { event_types: eventTypes }),
+    ...logicalIdentity,
   };
 }
 
@@ -198,6 +233,9 @@ function initializeSchema(database) {
       task_id TEXT NOT NULL,
       app_id TEXT NOT NULL,
       event_types_json TEXT,
+      event_json TEXT,
+      logical_key TEXT,
+      payload_hash TEXT,
       request_fingerprint TEXT NOT NULL,
       status TEXT NOT NULL CHECK (status IN ('pending', 'acknowledged', 'dead_letter')),
       attempt INTEGER NOT NULL DEFAULT 0,
@@ -252,6 +290,20 @@ function initializeSchema(database) {
     if (!statusColumns.has('lease_until')) {
       database.exec('ALTER TABLE task_v2_status_events ADD COLUMN lease_until INTEGER');
     }
+    if (!statusColumns.has('event_json')) {
+      database.exec('ALTER TABLE task_v2_status_events ADD COLUMN event_json TEXT');
+    }
+    if (!statusColumns.has('logical_key')) {
+      database.exec('ALTER TABLE task_v2_status_events ADD COLUMN logical_key TEXT');
+    }
+    if (!statusColumns.has('payload_hash')) {
+      database.exec('ALTER TABLE task_v2_status_events ADD COLUMN payload_hash TEXT');
+    }
+    database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_task_v2_status_logical_identity
+      ON task_v2_status_events(logical_key)
+      WHERE logical_key IS NOT NULL
+    `);
     const reconciliationColumns = new Set(database.prepare(
       'PRAGMA table_info(task_v2_status_reconciliations)',
     ).all().map(column => column.name));
@@ -440,7 +492,9 @@ function migrateLegacyEvidence(database, directory) {
         failures.length,
         latest?.type === 'fail' && !deadLettered ? latest.nextAttemptAt : updatedAt,
         latest?.type === 'fail' ? latest.nextAttemptAt : null,
-        latest?.type === 'fail' ? String(latest.error ?? 'unknown error').slice(0, 4_096) : null,
+        latest?.type === 'fail'
+          ? redactedError({ code: 'LEGACY_FAILURE', retryable: !latest.deadLettered })
+          : null,
         acknowledged ? serializeJson(latest.result ?? null, 'legacy status result') : null,
         enqueuedAt,
         updatedAt,
@@ -460,6 +514,9 @@ function migrateLegacyEvidence(database, directory) {
 }
 
 function eventFromRow(row) {
+  if (row.event_json !== undefined && row.event_json !== null) {
+    return JSON.parse(row.event_json);
+  }
   return {
     event_id: row.event_id,
     task_id: row.task_id,
@@ -496,6 +553,9 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
 
   const selectEvent = database.prepare(`
     SELECT * FROM task_v2_status_events WHERE event_id = ?
+  `);
+  const selectLogicalEvent = database.prepare(`
+    SELECT * FROM task_v2_status_events WHERE logical_key = ?
   `);
   const selectReconciliation = database.prepare(`
     SELECT * FROM task_v2_status_reconciliations WHERE event_id = ?
@@ -568,21 +628,40 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     const existing = selectEvent.get(event.event_id);
     if (existing) {
       if (existing.request_fingerprint !== requestFingerprint) {
-        throw new TypeError(`status event identity conflict: ${event.event_id}`);
+        throw domainError(
+          'IDEMPOTENCY_CONFLICT',
+          `status event identity conflict: ${event.event_id}`,
+        );
       }
       return { created: false, event };
+    }
+    if (event.logical_key !== undefined) {
+      const logical = selectLogicalEvent.get(event.logical_key);
+      if (logical) {
+        if (logical.payload_hash !== event.payload_hash) {
+          throw domainError(
+            'IDEMPOTENCY_CONFLICT',
+            `status event logical identity conflict: ${event.logical_key}`,
+          );
+        }
+        return { created: false, event: eventFromRow(logical) };
+      }
     }
     const timestamp = now();
     database.prepare(`
       INSERT INTO task_v2_status_events (
-        event_id, task_id, app_id, event_types_json, request_fingerprint,
+        event_id, task_id, app_id, event_types_json, event_json,
+        logical_key, payload_hash, request_fingerprint,
         status, available_at, enqueued_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
     `).run(
       event.event_id,
       event.task_id,
       event.app_id,
       event.event_types === undefined ? null : serializeJson(event.event_types, 'event types'),
+      serializeJson(event, 'status event'),
+      event.logical_key ?? null,
+      event.payload_hash ?? null,
       requestFingerprint,
       timestamp,
       timestamp,
@@ -715,7 +794,7 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     const attempts = current.attempt + 1;
     const deadLettered = attempts >= maxAttempts || error?.retryable === false;
     const nextAttemptAt = timestamp + retryAfterMs;
-    const detail = [...(error?.stack || error?.message || String(error))].slice(0, 4_096).join('');
+    const detail = redactedError(error);
     database.prepare(`
       UPDATE task_v2_status_events
       SET status = ?, attempt = ?, available_at = ?, next_attempt_at = ?,
@@ -798,7 +877,7 @@ export function createTaskV2StatusInbox({ directory, clock = Date.now } = {}) {
     const attempts = current.attempt + 1;
     const deadLettered = attempts >= maxAttempts || error?.retryable === false;
     const nextAttemptAt = timestamp + retryAfterMs;
-    const detail = [...(error?.stack || error?.message || String(error))].slice(0, 4_096).join('');
+    const detail = redactedError(error);
     database.prepare(`
       UPDATE task_v2_status_reconciliations
       SET status = ?, attempt = ?, available_at = ?, next_attempt_at = ?,
