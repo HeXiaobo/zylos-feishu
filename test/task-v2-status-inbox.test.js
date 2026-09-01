@@ -52,6 +52,29 @@ test('status inbox rejects a reused logical hash for different canonical payload
   }
 });
 
+test('status inbox rejects a whitespace-padded supplied hash before persistence', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-hash-whitespace-'));
+  const payload = { action: 'SubmitForReview', expectedVersion: 7 };
+  try {
+    const inbox = createTaskV2StatusInbox({ directory, clock: () => 1_787_900_000_000 });
+    assert.throws(
+      () => inbox.enqueue({
+        event_id: 'evt-whitespace-hash',
+        task_id: 'guid-whitespace-hash',
+        app_id: 'cli_app',
+        logical_key: 'acct-1:guid-whitespace-hash:SubmitForReview:v7',
+        payload_hash: ` ${payloadHash(payload)}`,
+        payload,
+      }),
+      /canonical sha256/,
+    );
+    assert.deepEqual(inbox.pending({ limit: 10 }), []);
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('status inbox deduplicates transport and logical native task identities independently', () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-v2-dual-identity-'));
   const payload = {

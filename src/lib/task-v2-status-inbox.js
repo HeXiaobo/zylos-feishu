@@ -4,6 +4,8 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import { parseCanonicalSha256 } from './canonical-sha256.js';
+
 const REQUIRED_EVENT_FIELDS = Object.freeze(['event_id', 'task_id', 'app_id']);
 const OPTIONAL_EVENT_FIELDS = Object.freeze([
   'event_types',
@@ -160,10 +162,10 @@ function normalizeEvent(value) {
         || event.payload === undefined) {
       throw new TypeError('status event logical identity fields must be provided together');
     }
-    const payloadHash = requireText(event.payload_hash, 'status event.payload_hash');
-    if (!/^sha256:[a-f0-9]{64}$/.test(payloadHash)) {
-      throw new TypeError('status event.payload_hash must be a sha256 digest');
-    }
+    const payloadHash = parseCanonicalSha256(
+      event.payload_hash,
+      'status event.payload_hash',
+    );
     const payload = structuredClone(requireRecord(event.payload, 'status event.payload'));
     if (payloadHash !== canonicalPayloadHash(payload)) {
       throw domainError(

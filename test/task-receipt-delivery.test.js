@@ -196,3 +196,30 @@ test('a settlement with mismatched effect content or lease fence cannot manufact
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('a whitespace-padded settlement hash cannot enter the durable receipt outbox', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-task-receipt-hash-whitespace-'));
+  try {
+    const delivery = createTaskReceiptDelivery({
+      outboxPath: path.join(directory, 'task-receipts.json'),
+      clock: () => 1_788_000_000_000,
+      resolveTarget: () => ({ kind: 'chat', id: 'oc-chat-1' }),
+      deliver: async () => ({ success: true }),
+      reconcile: async () => ({ outcome: 'not_delivered' }),
+    });
+    const taskEffect = effect();
+    assert.throws(
+      () => delivery.prepare({
+        effect: taskEffect,
+        settlement: settlement(taskEffect, {
+          payloadHash: ` ${taskEffectPayloadHash(taskEffect)}`,
+        }),
+        route: { adapterId: 'feishu', targetRef: 'opaque:chat-1' },
+      }),
+      /verified TaskEffect settlement/,
+    );
+    assert.deepEqual(delivery.pending(), []);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

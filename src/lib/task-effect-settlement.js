@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 
+import { parseCanonicalSha256 } from './canonical-sha256.js';
+
 const SETTLED_OUTCOMES = new Set(['platform_accepted', 'reconciled', 'suppressed']);
 
 function requireRecord(value, field) {
@@ -51,7 +53,10 @@ export function verifyTaskEffectSettlement({ effect: rawEffect, settlement: rawS
   const effectId = requireText(effect.effectId, 'TaskEffect.effectId');
   const payloadHash = taskEffectPayloadHash(effect);
   if (requireText(settlement.effectId, 'TaskEffect settlement.effectId') !== effectId
-      || requireText(settlement.payloadHash, 'TaskEffect settlement.payloadHash') !== payloadHash) {
+      || parseCanonicalSha256(
+        settlement.payloadHash,
+        'TaskEffect settlement.payloadHash',
+      ) !== payloadHash) {
     throw conflict('verified TaskEffect settlement identity conflict');
   }
   const externalTaskId = requireText(

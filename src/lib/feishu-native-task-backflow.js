@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 
+import { parseCanonicalSha256 } from './canonical-sha256.js';
+
 const INPUT_FIELDS = new Set([
   'eventId',
   'appId',
@@ -94,11 +96,11 @@ function normalizeInput(value) {
     action: requireText(input.action, 'native task event.action'),
     externalVersion: requireVersion(input.externalVersion, 'native task event.externalVersion'),
     effectId: requireText(input.effectId, 'native task event.effectId'),
-    payloadHash: requireText(input.payloadHash, 'native task event.payloadHash'),
+    payloadHash: parseCanonicalSha256(
+      input.payloadHash,
+      'native task event.payloadHash',
+    ),
   };
-  if (!/^sha256:[a-f0-9]{64}$/.test(normalized.payloadHash)) {
-    throw new TypeError('native task event.payloadHash must be a sha256 digest');
-  }
   if (input.reminderMinutesBeforeDue !== undefined) {
     if (!Number.isSafeInteger(input.reminderMinutesBeforeDue)
         || input.reminderMinutesBeforeDue < 0) {

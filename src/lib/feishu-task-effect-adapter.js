@@ -4,6 +4,7 @@ import {
   createVerifiedTaskEffectSettlement,
   taskEffectPayloadHash,
 } from './task-effect-settlement.js';
+import { parseCanonicalSha256 } from './canonical-sha256.js';
 
 const CLAIM_FIELDS = new Set([
   'effect',
@@ -146,12 +147,20 @@ function assertNoIdentityConflict(remote, identity) {
       `legacy native Task projection requires explicit adoption: ${remote.guid}`,
     );
   }
+  let markerHashCanonical = false;
+  try {
+    parseCanonicalSha256(remote.payloadHash, 'native Task projection.payloadHash');
+    markerHashCanonical = true;
+  } catch {
+    // Classification below converts malformed readback into a permanent
+    // external identity conflict rather than normalizing it.
+  }
   const markerComplete = [
     remote.tenantRef,
     remote.accountRef,
     remote.effectId,
-    remote.payloadHash,
-  ].every(value => typeof value === 'string' && value.trim() !== '');
+  ].every(value => typeof value === 'string' && value.trim() !== '')
+    && markerHashCanonical;
   if (!markerComplete
       || remote.coreTaskId !== identity.coreTaskId
       || remote.tenantRef !== identity.tenantRef

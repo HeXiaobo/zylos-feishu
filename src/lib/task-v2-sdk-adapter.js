@@ -1,3 +1,5 @@
+import { parseCanonicalSha256 } from './canonical-sha256.js';
+
 const USER_ID_TYPE = 'open_id';
 const MARKER_SCHEMA = 'zylos.task-v2-projection/v1';
 const PERMANENT_FEISHU_CODES = new Set([99992402]);
@@ -50,10 +52,10 @@ function normalizeEffectIdentity(value, task) {
   if (identity.coreTaskId !== task.id || identity.coreTaskVersion !== task.version) {
     throw new TypeError('effectIdentity does not match task identity/version');
   }
-  const payloadHash = requireText(identity.payloadHash, 'effectIdentity.payloadHash');
-  if (!/^sha256:[a-f0-9]{64}$/.test(payloadHash)) {
-    throw new TypeError('effectIdentity.payloadHash must be a sha256 digest');
-  }
+  const payloadHash = parseCanonicalSha256(
+    identity.payloadHash,
+    'effectIdentity.payloadHash',
+  );
   return {
     tenantRef: requireText(identity.tenantRef, 'effectIdentity.tenantRef'),
     accountRef: requireText(identity.accountRef, 'effectIdentity.accountRef'),
@@ -171,6 +173,20 @@ function taskFromResponse(response, operation) {
     throw new FeishuTaskV2Error(`Feishu Task v2 ${operation} returned no task`);
   }
   const marker = parseTaskMarker(task.extra);
+  let markerPayloadHash = null;
+  if (marker?.payloadHash !== undefined && marker?.payloadHash !== null) {
+    try {
+      markerPayloadHash = parseCanonicalSha256(
+        marker.payloadHash,
+        'Task v2 marker.payloadHash',
+      );
+    } catch (cause) {
+      throw new FeishuTaskV2Error(
+        'Task v2 marker payload hash is not canonical',
+        { code: 'EXTERNAL_IDENTITY_CONFLICT', retryable: false, cause },
+      );
+    }
+  }
   const reminder = normalizeReminder(
     task.reminders ?? [],
     'Feishu Task v2 reminders',
@@ -190,7 +206,7 @@ function taskFromResponse(response, operation) {
     tenantRef: marker?.tenantRef ?? null,
     accountRef: marker?.accountRef ?? null,
     effectId: marker?.effectId ?? null,
-    payloadHash: marker?.payloadHash ?? null,
+    payloadHash: markerPayloadHash,
   });
 }
 
