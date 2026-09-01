@@ -56,6 +56,18 @@ export function createProgressCardProjection({
           retryAfterMs: retryDelayMs,
         });
       }
+      if (
+        claim.operation.cardId !== null
+        && cardId !== null
+        && cardId !== claim.operation.cardId
+      ) {
+        return store.deferProjection({
+          receipt: claim.receipt,
+          outcome: 'unknown',
+          error: 'CardKit result conflicts with the bound card identity',
+          retryAfterMs: retryDelayMs,
+        });
+      }
       return store.completeProjection({
         receipt: claim.receipt,
         cardId,

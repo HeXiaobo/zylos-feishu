@@ -17,6 +17,19 @@ const PRESENCE_OBSERVATIONS = new Set([
   'fallback',
   'elapsed_over_120_seconds',
 ]);
+const NON_TERMINAL_PROJECTION_EVENT_TYPES = new Set([
+  'RunAccepted',
+  'RunQueued',
+  'RunStarted',
+  'ProgressUpdated',
+  'OutputDelta',
+  'FallbackRequested',
+]);
+const TERMINAL_PROJECTION_EVENT_TYPES = new Set([
+  'RunCompleted',
+  'RunFailed',
+  'RunCancelled',
+]);
 
 function domainError(code, message) {
   const error = new Error(message);
@@ -174,11 +187,22 @@ function normalizeProgressEvent(input) {
   if (typeof value.terminal !== 'boolean') {
     throw new TypeError('progress projection event.terminal must be a boolean');
   }
+  const type = requireText(value.type, 'progress projection event.type', 128);
+  if (
+    !NON_TERMINAL_PROJECTION_EVENT_TYPES.has(type)
+    && !TERMINAL_PROJECTION_EVENT_TYPES.has(type)
+  ) {
+    throw new TypeError('progress projection event.type is unsupported');
+  }
+  const expectedTerminal = TERMINAL_PROJECTION_EVENT_TYPES.has(type);
+  if (value.terminal !== expectedTerminal) {
+    throw new TypeError('progress projection event.type conflicts with terminal');
+  }
   const normalized = {
     requestId: requireText(value.requestId, 'progress projection event.requestId'),
     presentationId: requireText(value.presentationId, 'progress projection event.presentationId'),
     sequence: value.sequence,
-    type: requireText(value.type, 'progress projection event.type', 128),
+    type,
     payload: canonicalize(requireRecord(value.payload, 'progress projection event.payload')),
     terminal: value.terminal,
   };
@@ -631,6 +655,16 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
     if (outcome !== 'unknown' && outcome !== 'rejected') {
       throw new TypeError('presence deferred outcome is unsupported');
     }
+    if (row.operation === 'add' && row.finish_requested === 1 && outcome === 'rejected') {
+      database.prepare(`
+        UPDATE feishu_presence_effects
+        SET status = 'finished', operation = NULL, operation_status = NULL,
+            lease_owner = NULL, lease_until = NULL, last_error = NULL,
+            updated_at = ?, finished_at = ?, version = version + 1
+        WHERE request_id = ?
+      `).run(now, now, row.request_id);
+      return presenceView(selectPresence.get(row.request_id));
+    }
     const message = String(error ?? outcome).slice(0, 4_096);
     const status = row.operation === 'remove' && outcome !== 'unknown'
       ? 'orphaned'
@@ -941,6 +975,14 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
 
   const completeProjection = database.transaction(({ receipt, cardId = null }) => {
     const { row, now } = leasedProjection(receipt);
+    const returnedCardId = cardId === null ? null : requireText(cardId, 'projection cardId');
+    if (row.card_id !== null && returnedCardId !== null && returnedCardId !== row.card_id) {
+      throw domainError(
+        'PROJECTION_IDENTITY_CONFLICT',
+        'projection result conflicts with the bound card identity',
+      );
+    }
+    const cardIdToBind = row.card_id === null ? returnedCardId : null;
     const opensBeforeTerminal = row.operation_kind === 'open'
       && row.terminal_sequence !== null
       && row.terminal_sequence <= row.operation_source_watermark;
@@ -969,7 +1011,7 @@ export function openReplyPresentationStore({ dbPath, clock = Date.now, coalesceM
     `).run(
       terminal ? 'terminal' : 'active',
       appliedSequence,
-      cardId,
+      cardIdToBind,
       dueAt,
       now,
       row.request_id,

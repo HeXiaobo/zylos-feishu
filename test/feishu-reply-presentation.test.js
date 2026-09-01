@@ -846,6 +846,97 @@ test('a settlement racing an in-flight reaction add is serialized into one event
   }
 });
 
+test('a deterministically rejected in-flight add after settlement finishes absent without adding again', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-rejected-race-'));
+  const calls = [];
+  let releaseAdd;
+  const addResult = new Promise((resolve) => {
+    releaseAdd = resolve;
+  });
+  try {
+    const reactionPort = createReactionPort(calls);
+    reactionPort.add = async (effect) => {
+      calls.push({ operation: 'add', effect: structuredClone(effect) });
+      return addResult;
+    };
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort,
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_000_000,
+      workerId: 'worker-a',
+    });
+
+    await presentation.accept(acceptedMessage());
+    const accepting = presentation.reconcile();
+    while (calls.length === 0) await new Promise((resolve) => setImmediate(resolve));
+    const settling = await presentation.settlePresence({
+      requestId: 'req-41',
+      signal: deliverySettlement(),
+    });
+    assert.equal(settling.status, 'finishing');
+    assert.equal(settling.operation, 'add');
+    assert.equal(settling.operationStatus, 'inflight');
+
+    releaseAdd({ outcome: 'rejected', errorCode: 'REACTION_NOT_ADDED' });
+    await accepting;
+    const finished = presentation.inspect('req-41').presence;
+    assert.equal(finished.status, 'finished');
+    assert.equal(finished.operation, null);
+    assert.equal(finished.operationStatus, null);
+    assert.equal(finished.reactionId, null);
+
+    await presentation.reconcile();
+    assert.deepEqual(calls.map(({ operation }) => operation), ['add']);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a thrown deterministic add rejection after settlement also finishes absent without retry', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-thrown-race-'));
+  const calls = [];
+  let rejectAdd;
+  const addResult = new Promise((resolve, reject) => {
+    rejectAdd = reject;
+  });
+  try {
+    const reactionPort = createReactionPort(calls);
+    reactionPort.add = async (effect) => {
+      calls.push({ operation: 'add', effect: structuredClone(effect) });
+      return addResult;
+    };
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort,
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_000_000,
+      workerId: 'worker-a',
+    });
+
+    await presentation.accept(acceptedMessage());
+    const accepting = presentation.reconcile();
+    while (calls.length === 0) await new Promise((resolve) => setImmediate(resolve));
+    await presentation.settlePresence({ requestId: 'req-41', signal: deliverySettlement() });
+
+    const rejected = new Error('Feishu rejected reaction add');
+    rejected.outcome = 'rejected';
+    rejectAdd(rejected);
+    await accepting;
+    const finished = presentation.inspect('req-41').presence;
+    assert.equal(finished.status, 'finished');
+    assert.equal(finished.operation, null);
+    assert.equal(finished.reactionId, null);
+
+    await presentation.reconcile();
+    assert.deepEqual(calls.map(({ operation }) => operation), ['add']);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('an unknown add reconciled as absent after settlement finishes without creating a late reaction', async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-presence-absent-'));
   const calls = [];
@@ -962,7 +1053,7 @@ test('progress is durably coalesced with a Core consumer checkpoint and an immed
       requestId: 'req-41',
       presentationId: 'presentation:req-41',
       sequence: 6,
-      type: 'ProjectionTerminal',
+      type: 'RunCompleted',
       payload: { stage: 'complete' },
       terminal: true,
     });
@@ -1012,7 +1103,7 @@ test('a late terminal barrier fails closed when higher sequences were already ob
         requestId: 'req-41',
         presentationId: 'presentation:req-41',
         sequence: 3,
-        type: 'ProjectionTerminal',
+        type: 'RunCompleted',
         payload: { stage: 'complete' },
         terminal: true,
       }),
@@ -1021,6 +1112,88 @@ test('a late terminal barrier fails closed when higher sequences were already ob
     const checkpoint = presentation.inspect('req-41').projection;
     assert.equal(checkpoint.terminalSequence, null);
     assert.equal(checkpoint.highWatermark, 5);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a non-terminal frozen event cannot declare itself terminal and poison the checkpoint', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-terminal-spoof-'));
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort([]),
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_000_000,
+      workerId: 'worker-a',
+    });
+    await acceptAndBegin(presentation);
+
+    assert.throws(
+      () => presentation.recordProgress({
+        requestId: 'req-41',
+        presentationId: 'presentation:req-41',
+        sequence: 1,
+        type: 'ProgressUpdated',
+        payload: { stage: 'working' },
+        terminal: true,
+      }),
+      TypeError,
+    );
+    assert.equal(presentation.inspect('req-41').projection, null);
+
+    const realTerminal = presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 2,
+      type: 'RunCompleted',
+      payload: { output: 'done' },
+      terminal: true,
+    });
+    assert.equal(realTerminal.accepted, true);
+    assert.equal(realTerminal.projection.terminalSequence, 2);
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a frozen terminal event cannot opt out of terminal semantics and unknown types fail closed', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-terminal-omission-'));
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort([]),
+      cardPort: createCardPort(),
+      clock: () => 1_788_000_000_000,
+      workerId: 'worker-a',
+    });
+    await acceptAndBegin(presentation);
+
+    assert.throws(
+      () => presentation.recordProgress({
+        requestId: 'req-41',
+        presentationId: 'presentation:req-41',
+        sequence: 1,
+        type: 'RunCompleted',
+        payload: { output: 'done' },
+        terminal: false,
+      }),
+      TypeError,
+    );
+    assert.throws(
+      () => presentation.recordProgress({
+        requestId: 'req-41',
+        presentationId: 'presentation:req-41',
+        sequence: 2,
+        type: 'ProjectionTerminal',
+        payload: { output: 'invented terminal' },
+        terminal: true,
+      }),
+      TypeError,
+    );
+    assert.equal(presentation.inspect('req-41').projection, null);
     presentation.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -1303,6 +1476,233 @@ test('an accepted card create without a valid identity remains unknown until rec
   }
 });
 
+test('an update ACK cannot replace an already-bound CardKit identity', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-update-identity-'));
+  const calls = [];
+  let now = 1_788_000_000_000;
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort([]),
+      cardPort: {
+        async apply(operation) {
+          calls.push({ operation: 'apply', input: structuredClone(operation) });
+          if (operation.kind === 'open') {
+            return { outcome: 'platform_accepted', cardId: 'card-A' };
+          }
+          return { outcome: 'platform_accepted', cardId: 'card-B' };
+        },
+        async reconcile(operation) {
+          calls.push({ operation: 'reconcile', input: structuredClone(operation) });
+          return { outcome: 'reconciled' };
+        },
+      },
+      clock: () => now,
+      workerId: 'worker-a',
+      coalesceMs: 500,
+      retryDelayMs: 1_000,
+    });
+    await acceptAndBegin(presentation);
+    presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 1,
+      type: 'ProgressUpdated',
+      payload: { stage: 'one' },
+      terminal: false,
+    });
+    now += 500;
+    await presentation.flushDue();
+    assert.equal(presentation.inspect('req-41').projection.cardId, 'card-A');
+
+    presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 2,
+      type: 'ProgressUpdated',
+      payload: { stage: 'two' },
+      terminal: false,
+    });
+    now += 500;
+    const conflicted = await presentation.flushDue();
+    assert.deepEqual(conflicted.projection, { attempted: 1, applied: 0, pending: 1 });
+    let checkpoint = presentation.inspect('req-41').projection;
+    assert.equal(checkpoint.cardId, 'card-A');
+    assert.equal(checkpoint.lastAppliedSequence, 1);
+    assert.equal(checkpoint.operationStatus, 'unknown');
+
+    now += 1_000;
+    await presentation.flushDue();
+    checkpoint = presentation.inspect('req-41').projection;
+    assert.equal(checkpoint.cardId, 'card-A');
+    assert.equal(checkpoint.lastAppliedSequence, 2);
+    assert.equal(checkpoint.operationStatus, null);
+    assert.deepEqual(
+      calls.map(({ operation, input }) => `${operation}:${input.kind}`),
+      ['apply:open', 'apply:update', 'reconcile:update'],
+    );
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a finalize identity conflict survives restart and reconciles on the original card', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-finalize-identity-'));
+  const dbPath = path.join(directory, 'presentation.db');
+  const calls = [];
+  let now = 1_788_000_000_000;
+  let first;
+  let reopened;
+  try {
+    first = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: createReactionPort([]),
+      cardPort: {
+        async apply(operation) {
+          calls.push({ operation: 'apply', input: structuredClone(operation) });
+          if (operation.kind === 'open') {
+            return { outcome: 'platform_accepted', cardId: 'card-A' };
+          }
+          return { outcome: 'platform_accepted', cardId: 'card-B' };
+        },
+        async reconcile() {
+          return { outcome: 'unknown' };
+        },
+      },
+      clock: () => now,
+      workerId: 'worker-a',
+      coalesceMs: 500,
+      retryDelayMs: 1_000,
+    });
+    await acceptAndBegin(first);
+    first.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 1,
+      type: 'ProgressUpdated',
+      payload: { stage: 'working' },
+      terminal: false,
+    });
+    now += 500;
+    await first.flushDue();
+    first.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 2,
+      type: 'RunCompleted',
+      payload: { output: 'done' },
+      terminal: true,
+    });
+    assert.equal((await first.flushDue()).projection.pending, 1);
+    const conflicted = first.inspect('req-41').projection;
+    assert.equal(conflicted.status, 'degraded');
+    assert.equal(conflicted.cardId, 'card-A');
+    assert.equal(conflicted.lastAppliedSequence, 1);
+    assert.equal(conflicted.operationStatus, 'unknown');
+    first.close();
+    first = null;
+
+    now += 1_000;
+    reopened = openFeishuReplyPresentation({
+      dbPath,
+      reactionPort: createReactionPort([]),
+      cardPort: {
+        async apply() {
+          throw new Error('conflicted finalize must reconcile before retry');
+        },
+        async reconcile(operation) {
+          calls.push({ operation: 'reconcile', input: structuredClone(operation) });
+          return { outcome: 'reconciled' };
+        },
+      },
+      clock: () => now,
+      workerId: 'worker-b',
+      coalesceMs: 500,
+      retryDelayMs: 1_000,
+    });
+    await reopened.reconcile();
+    const terminal = reopened.inspect('req-41').projection;
+    assert.equal(terminal.status, 'terminal');
+    assert.equal(terminal.cardId, 'card-A');
+    assert.equal(terminal.lastAppliedSequence, 2);
+    assert.deepEqual(
+      calls.map(({ operation, input }) => `${operation}:${input.kind}:${input.cardId}`),
+      ['apply:open:null', 'apply:finalize:card-A', 'reconcile:finalize:card-A'],
+    );
+  } finally {
+    first?.close();
+    reopened?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a fallback ACK cannot replace an already-bound CardKit identity', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-fallback-identity-'));
+  const calls = [];
+  let now = 1_788_000_000_000;
+  try {
+    const presentation = openFeishuReplyPresentation({
+      dbPath: path.join(directory, 'presentation.db'),
+      reactionPort: createReactionPort([]),
+      cardPort: {
+        async apply(operation) {
+          calls.push({ operation: 'apply', input: structuredClone(operation) });
+          if (operation.kind === 'open') {
+            return { outcome: 'platform_accepted', cardId: 'card-A' };
+          }
+          return { outcome: 'platform_accepted', externalRef: 'card-B' };
+        },
+        async reconcile(operation) {
+          calls.push({ operation: 'reconcile', input: structuredClone(operation) });
+          return { outcome: 'reconciled', cardId: 'card-A' };
+        },
+      },
+      clock: () => now,
+      workerId: 'worker-a',
+      coalesceMs: 500,
+      retryDelayMs: 1_000,
+    });
+    await acceptAndBegin(presentation);
+    presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 1,
+      type: 'ProgressUpdated',
+      payload: { stage: 'working' },
+      terminal: false,
+    });
+    now += 500;
+    await presentation.flushDue();
+    presentation.recordProgress({
+      requestId: 'req-41',
+      presentationId: 'presentation:req-41',
+      sequence: 2,
+      type: 'FallbackRequested',
+      payload: { reason: 'unsupported_content' },
+      terminal: false,
+    });
+    now += 500;
+    assert.equal((await presentation.flushDue()).projection.pending, 1);
+    assert.equal(presentation.inspect('req-41').projection.cardId, 'card-A');
+    assert.equal(presentation.inspect('req-41').projection.operationStatus, 'unknown');
+
+    now += 1_000;
+    await presentation.flushDue();
+    const recovered = presentation.inspect('req-41').projection;
+    assert.equal(recovered.status, 'active');
+    assert.equal(recovered.cardId, 'card-A');
+    assert.equal(recovered.lastAppliedSequence, 2);
+    assert.deepEqual(
+      calls.map(({ operation, input }) => `${operation}:${input.kind}`),
+      ['apply:open', 'apply:fallback', 'reconcile:fallback'],
+    );
+    presentation.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('CardKit rate limits degrade only projection and never block final settlement', async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-projection-isolation-'));
   const reactionCalls = [];
@@ -1478,7 +1878,7 @@ test('a terminal-only projection opens a card before finalizing it with a higher
       requestId: 'req-41',
       presentationId: 'presentation:req-41',
       sequence: 6,
-      type: 'ProjectionTerminal',
+      type: 'RunCompleted',
       payload: { stage: 'complete' },
       terminal: true,
     });
@@ -1596,7 +1996,7 @@ test('out-of-order Core progress cannot regress a terminal checkpoint across res
     first.recordProgress({
       ...progress,
       sequence: 6,
-      type: 'ProjectionTerminal',
+      type: 'RunCompleted',
       payload: { stage: 'complete' },
       terminal: true,
     });
@@ -1736,7 +2136,7 @@ test('terminal card creation with an ambiguous ACK reconciles after restart with
       requestId: 'req-41',
       presentationId: 'presentation:req-41',
       sequence: 6,
-      type: 'ProjectionTerminal',
+      type: 'RunCompleted',
       payload: { stage: 'complete' },
       terminal: true,
     });
@@ -1848,7 +2248,7 @@ test('a terminal barrier is claimed before older due progress from another prese
       requestId: 'req-z-terminal',
       presentationId: 'presentation:req-z-terminal',
       sequence: 6,
-      type: 'ProjectionTerminal',
+      type: 'RunCompleted',
       payload: { stage: 'complete' },
       terminal: true,
     });
