@@ -1367,9 +1367,9 @@ export function createConversationResponseStream({
         let containsDelta = false;
         for (const event of events) {
           if (event.sequence <= state.lastEventSequence) continue;
-          if (event.sequence !== state.lastEventSequence + 1) {
-            throw new Error(`assistant response event gap: expected ${state.lastEventSequence + 1}, received ${event.sequence}`);
-          }
+          // Core sequence spans the whole Run stream while this compatibility
+          // projection receives only visible events. Missing sequence numbers
+          // therefore mean another consumer owned those events, not data loss.
           const phase = phaseForEvent(event);
           appendProgress(state, progressForEvent(event));
           if (event.type === 'PublicReasoningDelta') {

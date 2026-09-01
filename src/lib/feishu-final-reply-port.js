@@ -20,6 +20,10 @@ function requireText(value, field) {
   return value;
 }
 
+function hasVisibleText(value) {
+  return value.replace(/[\s\u200B-\u200D\u2060\uFEFF]/gu, '') !== '';
+}
+
 function requireExactFields(value, fields, field) {
   const keys = Object.keys(value);
   if (keys.length !== fields.length || !fields.every(key => Object.hasOwn(value, key))) {
@@ -91,7 +95,7 @@ function normalizeIntent(rawIntent) {
   if (payload.format !== 'text' || typeof payload.text !== 'string') {
     throw new TypeError('ReplyIntent.payload must contain text');
   }
-  if (payload.text.trim() === '') {
+  if (!hasVisibleText(payload.text)) {
     throw domainError('MISSING_OUTPUT', 'visible ReplyIntent output is blank');
   }
   if (intent.contentHash !== sha256(canonicalJson(payload))) {

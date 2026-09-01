@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import { createFeishuFinalReplyPort } from '../src/lib/feishu-final-reply-port.js';
 import { createTaskReceiptDelivery } from '../src/lib/task-receipt-delivery.js';
 import { taskEffectPayloadHash } from '../src/lib/task-effect-settlement.js';
 
@@ -75,9 +76,31 @@ test('task receipt is an independent durable ReplyIntent bound to an applied Tas
     assert.equal(attempts[0].deliveryUuid, attempts[1].deliveryUuid);
     assert.equal(attempts[0].intent.disposition, 'task_receipt');
     assert.equal(attempts[0].intent.cause.kind, 'task_effect');
-    assert.equal(attempts[0].intent.cause.effectId, effect().effectId);
+    assert.equal(attempts[0].intent.cause.eventId, effect().eventId);
+    assert.deepEqual(Object.keys(attempts[0].intent.cause).sort(), ['eventId', 'kind']);
     assert.equal(Object.hasOwn(attempts[0].intent, 'outcomeId'), false);
     assert.match(attempts[0].intent.route.targetRef, /^opaque:/);
+    const finalReply = createFeishuFinalReplyPort({
+      delivery: {
+        send: async () => ({ outcome: 'platform_accepted', externalRef: 'om-task-receipt' }),
+        reconcile: async () => ({ outcome: 'reconciled', externalRef: 'om-task-receipt' }),
+      },
+      presentation: { settlePresence() {} },
+      clock: () => 1_788_000_002_000,
+    });
+    const intent = attempts[0].intent;
+    const receipt = await finalReply.deliver({
+      replayed: false,
+      action: 'send',
+      intent,
+      deliveryId: `delivery:${intent.intentId}`,
+      attemptId: `attempt:${intent.intentId}:1`,
+      claimEpoch: 1,
+      leaseOwner: 'core-task-receipt',
+      leaseToken: 'lease-task-receipt-1',
+      leaseExpiresAt: 1_788_000_032_000,
+    });
+    assert.equal(receipt.outcome, 'platform_accepted');
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

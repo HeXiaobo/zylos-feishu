@@ -148,6 +148,22 @@ test('opens once, coalesces real deltas, keeps sequence monotonic, and closes th
   assert.equal(cardElement(finalCard, 'zylos_answer').element_id.length <= 20, true);
 }));
 
+test('visible Core events may start late and keep their original non-contiguous sequence', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(5, 'ProgressUpdated', { stage: 'reading' })],
+  });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(9, 'RunCompleted', { output: '完成' })],
+  });
+  assert.equal(calls.filter(([name]) => name === 'update').length, 2);
+  assert.equal(calls.filter(([name]) => name === 'close').length, 1);
+}));
+
 for (const conversion of [true, false]) {
   const mode = conversion ? 'CardKit' : 'ordinary-card fallback';
   test(`keeps interleaved requests and a background completion on separate cards in ${mode}`, () => withState(async stateDirectory => {

@@ -12,6 +12,10 @@ function requireText(value, field) {
   return value;
 }
 
+function hasVisibleText(value) {
+  return value.replace(/[\s\u200B-\u200D\u2060\uFEFF]/gu, '') !== '';
+}
+
 function normalizeClaim(rawClaim, expectedAction) {
   const claim = requireRecord(rawClaim, 'delivery claim');
   if (claim.action !== expectedAction) {
@@ -29,7 +33,7 @@ function normalizeClaim(rawClaim, expectedAction) {
   if (intent.payload?.format !== 'text' || typeof intent.payload.text !== 'string') {
     throw new TypeError('ReplyIntent payload must be text');
   }
-  if (intent.payload.text.trim() === '') {
+  if (!hasVisibleText(intent.payload.text)) {
     const error = new Error('visible ReplyIntent output is blank');
     error.code = 'MISSING_OUTPUT';
     throw error;

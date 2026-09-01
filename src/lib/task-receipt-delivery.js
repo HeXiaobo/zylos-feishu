@@ -98,7 +98,6 @@ function buildIntent(effect, route) {
     cause: Object.freeze({
       kind: 'task_effect',
       eventId: effect.eventId,
-      effectId: effect.effectId,
     }),
     route: Object.freeze(route),
     disposition: 'task_receipt',

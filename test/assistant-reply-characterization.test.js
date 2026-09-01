@@ -55,14 +55,14 @@ test('Inbox, response/CardKit, WorkIntake, and Task v2 assets are fork-only exte
   ));
 });
 
-test('current history key has the recorded root fallback and topic_group gaps', () => {
+test('legacy history key remains available while composition closes the topic_group gap', () => {
   const fixture = loadContractFixture('current-behavior.json');
   const source = fs.readFileSync(path.join(REPO_ROOT, 'src/index.js'), 'utf8');
   assert.match(
     source,
     /function getHistoryKey\(chatId, threadId = null\) \{\s*return threadId \? `\$\{chatId\}:\$\{threadId\}` : chatId;\s*\}/,
   );
-  assert.equal(source.includes('topic_group'), false);
+  assert.equal(source.includes("['group', 'topic_group']"), true);
   const rootGap = fixture.observations.find((entry) => entry.name === 'history-key-thread-only');
   assert.match(rootGap.gap, /root_id/);
   const topicGap = fixture.observations.find((entry) => entry.name === 'topic-group-compatibility');
