@@ -48,6 +48,13 @@ import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { createTaskActionContextSigner } from './lib/task-action-context.js';
 import { getClient } from './lib/client.js';
 import { createConversationResponseStream } from './lib/conversation-response-stream.js';
+import { createConversationResponseFinalReplyCompatibility } from './lib/conversation-response-final-reply-compatibility.js';
+import { createCoreMessageIntakeAdapter } from './lib/core-message-intake-port.js';
+import {
+  openFeishuReplyComposition,
+  replyRefactorEnabled,
+  resolveFeishuRouteTarget,
+} from './lib/feishu-reply-composition.js';
 import { isRetryableC4Failure } from './lib/c4-retry-policy.js';
 import { resolveZylosCli } from './lib/zylos-cli-resolver.js';
 import {
@@ -154,12 +161,15 @@ let taskCommentEventHandlers = Object.freeze({});
 let inboundEventInbox = null;
 let inboundDrainPromise = null;
 let inboundDrainInterval = null;
+let replyComposition = null;
+let replyMaintenanceInterval = null;
 
 // Initialize
 let config = getConfig();
 const connectionMode = config.connection_mode || 'websocket';
 const INTERNAL_SECRET = crypto.randomUUID();
 const taskV2Enabled = isTaskV2Enabled(process.env);
+const replyRefactorV1Enabled = replyRefactorEnabled(process.env);
 // Persist token to file so send.js (spawned by C4 in a separate process tree) can read it
 const TOKEN_FILE = path.join(DATA_DIR, '.internal-token');
 try {
@@ -883,6 +893,7 @@ function getConversationResponseStream() {
 }
 
 const conversationResponseTimeoutSweep = setInterval(() => {
+  if (replyRefactorV1Enabled) return;
   getConversationResponseStream().sweepExpired().then(result => {
     if (result.expired > 0) {
       console.warn(`[feishu] Expired ${result.expired} stalled response stream(s)`);
@@ -898,10 +909,11 @@ function assistantRequestId(messageId) {
   return `assistant.feishu.${digest}`;
 }
 
-function buildAssistantRequest(messageId) {
+function buildAssistantRequest(messageId, { requireIdle } = {}) {
   return Object.freeze({
     requestId: assistantRequestId(messageId),
     sourceId: String(messageId),
+    ...(requireIdle === undefined ? {} : { requireIdle }),
   });
 }
 
@@ -941,6 +953,210 @@ function failConversationResponse(request) {
       console.warn(`[feishu] Failed to close response card after C4 rejection: ${error.message}`);
       return false;
     });
+}
+
+function responseProjectionEvent(event, operationId) {
+  const payload = event.type === 'OutputDelta' && typeof event.payload?.delta !== 'string'
+    ? { ...event.payload, delta: String(event.payload?.text ?? '') }
+    : event.payload;
+  return {
+    schemaVersion: 1,
+    eventId: `${operationId}:${event.sequence}`,
+    requestId: event.requestId,
+    sequence: event.sequence,
+    type: event.type,
+    occurredAt: new Date().toISOString(),
+    payload,
+  };
+}
+
+function createConversationResponseProjectionPort() {
+  const stream = getConversationResponseStream();
+
+  async function apply(operation, outcome) {
+    const snapshot = replyComposition?.inspect(operation.requestId);
+    if (!snapshot?.handle) {
+      const error = new Error('reply presentation handle is unavailable');
+      error.code = 'PRESENTATION_NOT_FOUND';
+      throw error;
+    }
+    let cardId = operation.cardId;
+    if (operation.kind === 'open') {
+      const opened = await stream.open({
+        requestId: operation.requestId,
+        target: resolveFeishuRouteTarget(snapshot.handle.route.targetRef),
+      });
+      cardId = opened.messageId;
+    }
+    const events = operation.events
+      .filter(event => !['FallbackRequested', 'RunCancelled'].includes(event.type))
+      .map(event => responseProjectionEvent(event, operation.operationId));
+    if (events.length > 0) {
+      const projected = await stream.apply({ requestId: operation.requestId, events });
+      if (projected?.handled !== true) {
+        return {
+          outcome: 'rejected',
+          errorCode: projected?.reason || 'CARD_PROJECTION_REJECTED',
+          retryable: true,
+        };
+      }
+    }
+    return { outcome, cardId };
+  }
+
+  return Object.freeze({
+    apply(operation) { return apply(operation, 'platform_accepted'); },
+    reconcile(operation) { return apply(operation, 'reconciled'); },
+  });
+}
+
+function createReplyReactionPort() {
+  return Object.freeze({
+    async add(effect) {
+      const result = await addReaction(effect.sourceMessageId, TYPING_EMOJI);
+      return result.success && result.reactionId
+        ? { outcome: 'platform_accepted', reactionId: result.reactionId }
+        : { outcome: 'unknown', message: result.message };
+    },
+    async remove(effect) {
+      const result = await removeReaction(effect.sourceMessageId, effect.reactionId);
+      return result.success
+        ? { outcome: 'platform_accepted' }
+        : { outcome: 'unknown', message: result.message };
+    },
+    async reconcile(effect) {
+      let response;
+      try {
+        response = await getClient().im.messageReaction.list({
+          path: { message_id: effect.sourceMessageId },
+          params: { reaction_type: TYPING_EMOJI, page_size: 50 },
+        });
+      } catch (error) {
+        return { outcome: 'unknown', message: error.message };
+      }
+      if (response?.code !== 0 || !Array.isArray(response.data?.items)) {
+        return { outcome: 'unknown', message: response?.msg };
+      }
+      const owned = response.data.items.find((item) => {
+        if (effect.reactionId && item.reaction_id === effect.reactionId) return true;
+        const operatorId = item.operator?.operator_id;
+        return item.operator?.operator_type === 'app'
+          && [botAppId, botOpenId].filter(Boolean).includes(operatorId);
+      });
+      if (effect.operation === 'add') {
+        return owned?.reaction_id
+          ? { outcome: 'reconciled', reactionId: owned.reaction_id }
+          : { outcome: 'not_found' };
+      }
+      return owned ? { outcome: 'rejected' } : { outcome: 'not_found' };
+    },
+  });
+}
+
+async function authorizeReplyRefactorMessage(rawEvent) {
+  const data = rawEvent?.event ?? rawEvent;
+  const message = data?.message;
+  const sender = data?.sender;
+  if (!message || !sender) return false;
+  const senderId = sender.sender_id?.open_id
+    || sender.sender_id?.app_id
+    || sender.sender_id?.user_id
+    || '';
+  if (senderId && [botAppId, botOpenId, config.app_id, config.bot_open_id]
+    .filter(Boolean)
+    .some(value => String(value) === String(senderId))) return false;
+  const senderUserId = sender.sender_id?.user_id;
+  const senderOpenId = sender.sender_id?.open_id;
+  const chatType = message.chat_type;
+  if (chatType === 'p2p') {
+    return isDmAllowed(senderUserId, senderOpenId, sender);
+  }
+  if (!['group', 'topic_group'].includes(chatType)) return false;
+  const mentioned = hasExactBotMention(message.mentions, { botOpenId, botAppId });
+  const activation = decideGroupActivation({
+    chatType: 'group',
+    mentionedBot: mentioned,
+    smartMode: isSmartGroup(message.chat_id),
+  });
+  if (!activation.process) return false;
+  const senderIsOwner = isOwner(senderUserId, senderOpenId);
+  const groupPolicy = config.groupPolicy || 'allowlist';
+  const groupConfigured = hasExplicitGroupConfig(message.chat_id);
+  const groupAllowed = isGroupAllowed(message.chat_id);
+  const senderAllowedByGroup = isSenderAllowedInGroup(
+    message.chat_id,
+    senderUserId,
+    senderOpenId,
+  );
+  const memberAccess = groupPolicy !== 'disabled'
+    && groupAllowed
+    && !groupConfigured
+    && !senderIsOwner
+    ? await authorizeConfiguredMemberAccess(senderUserId, senderOpenId, sender)
+    : null;
+  return decideGroupAccess({
+    groupPolicy,
+    groupAllowed,
+    groupConfigured,
+    senderIsOwner,
+    senderAllowedByGroup,
+    memberAccessAllowed: memberAccess,
+    explicitActivation: mentioned,
+  }).allowed;
+}
+
+async function acceptReplyRefactorMessage(command, acceptance) {
+  const target = resolveFeishuRouteTarget(command.source.targetRef);
+  const assistantRequest = buildAssistantRequest(command.source.messageId, { requireIdle: false });
+  const endpoint = buildEndpoint(target.chatId, {
+    chatType: target.chatType,
+    messageId: command.source.messageId,
+    parentId: target.replyToMessageId,
+  });
+  const response = await sendToC4(
+    'feishu',
+    endpoint,
+    command.content.text,
+    null,
+    { assistantRequest },
+  );
+  const requestId = response?.assistantResponse?.requestId || assistantRequest.requestId;
+  return Object.freeze({
+    schemaVersion: 1,
+    type: 'MessageAccepted',
+    requestId,
+    traceId: command.traceId,
+    conversationLaneKey: acceptance.conversationLaneKey,
+    laneSequence: acceptance.laneSequence,
+    orderingMode: 'acceptance',
+    sourceOrder: acceptance.sourceOrder ?? null,
+  });
+}
+
+function initializeReplyRefactorComposition(creds) {
+  const stream = getConversationResponseStream();
+  const delivery = createConversationResponseFinalReplyCompatibility({
+    stream,
+    resolveTarget: resolveFeishuRouteTarget,
+  });
+  const coreIntake = createCoreMessageIntakeAdapter({ accept: acceptReplyRefactorMessage });
+  return openFeishuReplyComposition({
+    inboundDbPath: path.join(DATA_DIR, 'inbound-events.db'),
+    presentationDbPath: path.join(DATA_DIR, 'reply-presentation.db'),
+    accountRef: creds.app_id,
+    coreIntake,
+    authorize: authorizeReplyRefactorMessage,
+    reactionPort: createReplyReactionPort(),
+    cardPort: createConversationResponseProjectionPort(),
+    delivery,
+    workerId: `zylos-feishu:${process.pid}`,
+    concurrency: 4,
+    leaseMs: 300_000,
+    maxAttempts: 5,
+    pollIntervalMs: 10,
+    baseRetryDelayMs: 2_000,
+    maxRetryDelayMs: 60_000,
+  });
 }
 
 /**
@@ -2365,6 +2581,17 @@ function drainInboundMessages() {
   return inboundDrainPromise;
 }
 
+async function ingestInboundMessage(data, eventId = null, eventType = 'im.message.receive_v1') {
+  if (replyComposition?.enabled) {
+    return replyComposition.acceptMessage(data, { eventId, eventType, priority: 2 });
+  }
+  const received = persistInboundMessage(data, eventId);
+  void drainInboundMessages().catch((error) => {
+    console.error(`[feishu] Inbound inbox drain failed: ${error.message}`);
+  });
+  return received;
+}
+
 // ============================================================
 // Transport: WebSocket mode (Feishu SDK WSClient)
 // ============================================================
@@ -2383,10 +2610,16 @@ function startWebSocket(creds) {
   wsClient.start({
     eventDispatcher: new Lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data) => {
-        persistInboundMessage(data, data.event_id || data.header?.event_id || null);
-        void drainInboundMessages().catch((err) => {
-          console.error(`[feishu] Inbound inbox drain failed: ${err.message}`);
-        });
+        try {
+          await ingestInboundMessage(
+            data,
+            data.event_id || data.header?.event_id || null,
+            data.header?.event_type || 'im.message.receive_v1',
+          );
+        } catch (error) {
+          console.error(`[feishu] Inbound message intake failed: ${error.message}`);
+          throw error;
+        }
       },
       ...taskV2EventHandlers,
       ...taskCardEventHandlers,
@@ -2475,15 +2708,16 @@ function startWebhook(creds) {
         _timestamp: event.header.create_time,
       };
       try {
-        persistInboundMessage(data, event.header?.event_id || null);
+        await ingestInboundMessage(
+          data,
+          event.header?.event_id || null,
+          eventType,
+        );
       } catch (error) {
         console.error(`[feishu] Inbound inbox write failed: ${error.message}`);
         return res.status(503).json({ error: 'Inbound message intake unavailable' });
       }
       res.status(200).json({ code: 0 });
-      void drainInboundMessages().catch((error) => {
-        console.error(`[feishu] Inbound inbox drain failed: ${error.message}`);
-      });
       return;
     }
     let callback;
@@ -2580,6 +2814,8 @@ function shutdown() {
   console.log(`[feishu] Shutting down...`);
 
   if (inboundDrainInterval) clearInterval(inboundDrainInterval);
+  if (replyMaintenanceInterval) clearInterval(replyMaintenanceInterval);
+  clearInterval(conversationResponseTimeoutSweep);
   clearInterval(typingCheckInterval);
   clearInterval(userCachePersistInterval);
   clearInterval(workIntakeConfirmationRetryInterval);
@@ -2603,11 +2839,18 @@ function shutdown() {
   const finalizeExit = () => {
     if (finalized) return;
     finalized = true;
-    Promise.resolve(inboundDrainPromise).catch((error) => {
-      console.error(`[feishu] Inbound drain did not finish cleanly: ${error.message}`);
-    }).finally(() => {
+    Promise.allSettled([
+      Promise.resolve(inboundDrainPromise),
+      replyComposition?.close() ?? Promise.resolve(),
+    ]).then((settlements) => {
+      for (const settlement of settlements) {
+        if (settlement.status === 'rejected') {
+          console.error(`[feishu] Inbound drain did not finish cleanly: ${settlement.reason?.message || settlement.reason}`);
+        }
+      }
       inboundEventInbox?.close();
       inboundEventInbox = null;
+      replyComposition = null;
       taskCommentStore?.close();
       taskCommentStore = null;
       process.exit(0);
@@ -2635,10 +2878,16 @@ if (!creds.app_id || !creds.app_secret) {
 // Fetch bot identity, then start the selected transport
 (async () => {
   try {
-    inboundEventInbox = openInboundEventInbox({
-      dbPath: path.join(DATA_DIR, 'inbound-events.db'),
-      maxAttempts: 5,
-    });
+    if (replyRefactorV1Enabled) {
+      replyComposition = initializeReplyRefactorComposition(creds);
+      console.log('[feishu] Reply refactor v1 composition: enabled');
+    } else {
+      inboundEventInbox = openInboundEventInbox({
+        dbPath: path.join(DATA_DIR, 'inbound-events.db'),
+        maxAttempts: 5,
+      });
+      console.log('[feishu] Reply refactor v1 composition: legacy rollback path');
+    }
   } catch (err) {
     console.error(`[feishu] Inbound inbox failed to initialize: ${err.message}`);
     process.exitCode = 1;
@@ -2694,17 +2943,28 @@ if (!creds.app_id || !creds.app_secret) {
   } catch {}
 
   try {
-    await drainInboundMessages();
-    inboundDrainInterval = setInterval(() => {
-      void drainInboundMessages().catch((error) => {
-        console.error(`[feishu] Inbound inbox drain failed: ${error.message}`);
-      });
-    }, 1_000);
+    if (replyComposition?.enabled) {
+      await replyComposition.recover();
+      replyMaintenanceInterval = setInterval(() => {
+        void replyComposition?.maintain().catch((error) => {
+          console.error(`[feishu] Reply presentation reconcile failed: ${error.message}`);
+        });
+      }, 1_000);
+    } else {
+      await drainInboundMessages();
+      inboundDrainInterval = setInterval(() => {
+        void drainInboundMessages().catch((error) => {
+          console.error(`[feishu] Inbound inbox drain failed: ${error.message}`);
+        });
+      }, 1_000);
+    }
   } catch (err) {
     console.error(`[feishu] Inbound inbox recovery failed: ${err.message}`);
     process.exitCode = 1;
     inboundEventInbox?.close();
     inboundEventInbox = null;
+    await replyComposition?.close().catch(() => {});
+    replyComposition = null;
     return;
   }
 

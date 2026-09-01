@@ -4,6 +4,9 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import { createConversationLaneCoordinator } from './conversation-lane-coordinator.js';
+import { normalizeFeishuInboundMessage } from './feishu-inbound-normalizer.js';
+
 const MAX_ID_LENGTH = 512;
 const MAX_PAYLOAD_BYTES = 1024 * 1024;
 const MAX_ERROR_LENGTH = 4_096;
@@ -78,17 +81,124 @@ function fingerprint(serialized) {
   return createHash('sha256').update(serialized).digest('hex');
 }
 
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]),
+  );
+}
+
+function legacySemanticFingerprint(serialized) {
+  let payload;
+  try {
+    payload = JSON.parse(serialized);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+    || !payload.message || !payload.sender) return null;
+  return fingerprint(JSON.stringify(canonicalize({
+    message: payload.message,
+    sender: payload.sender,
+  })));
+}
+
+function canonicalPayloadFingerprint(payload) {
+  let stablePayload = payload;
+  if (payload?.schemaVersion === 1 && payload.type === 'AcceptMessage'
+    && payload.source && typeof payload.source === 'object') {
+    const {
+      idempotencyKey: _idempotencyKey,
+      causationId: _causationId,
+      issuedAt: _issuedAt,
+      ...stableCommand
+    } = payload;
+    const { eventId: _eventId, ...stableSource } = payload.source;
+    stablePayload = { ...stableCommand, source: stableSource };
+  }
+  return fingerprint(JSON.stringify(canonicalize(stablePayload)));
+}
+
 function normalizeInbound(input) {
   const request = requireRecord(input, 'inbound event');
   const keys = Object.keys(request);
-  if (keys.length !== 3 || !['eventId', 'messageId', 'payload'].every((key) => keys.includes(key))) {
+  const legacy = keys.length === 3
+    && ['eventId', 'messageId', 'payload'].every((key) => keys.includes(key));
+  const allowed = new Set([
+    'adapterId',
+    'accountRef',
+    'eventType',
+    'eventId',
+    'messageId',
+    'payload',
+    'payloadHash',
+    'legacyPayload',
+    'conversationLaneKey',
+    'sourceOrder',
+  ]);
+  const required = ['adapterId', 'accountRef', 'eventType', 'eventId', 'messageId', 'payload', 'conversationLaneKey'];
+  if (!legacy && (keys.some((key) => !allowed.has(key))
+    || required.some((key) => !keys.includes(key)))) {
     throw new TypeError('inbound event contains unsupported or missing fields');
   }
   const eventId = optionalText(request.eventId, 'inbound event.eventId');
   const messageId = optionalText(request.messageId, 'inbound event.messageId');
   if (!eventId && !messageId) throw new TypeError('inbound event requires eventId or messageId');
   const payloadJson = serializeJson(requireRecord(request.payload, 'inbound event.payload'), 'inbound event.payload');
-  return { eventId, messageId, payloadJson, requestFingerprint: fingerprint(payloadJson) };
+  const computedFingerprint = fingerprint(payloadJson);
+  const suppliedLegacyPayloadJson = request.legacyPayload === undefined
+    ? null
+    : serializeJson(
+      requireRecord(request.legacyPayload, 'inbound event.legacyPayload'),
+      'inbound event.legacyPayload',
+    );
+  const legacyPayloadJson = legacy ? payloadJson : suppliedLegacyPayloadJson;
+  const payloadHash = request.payloadHash === undefined
+    ? `sha256:${computedFingerprint}`
+    : requireText(request.payloadHash, 'inbound event.payloadHash');
+  if (!/^sha256:[a-f0-9]{64}$/.test(payloadHash)) {
+    throw new TypeError('inbound event.payloadHash must be a sha256 digest');
+  }
+  if (!legacy && request.payloadHash !== undefined) {
+    const source = request.payload?.source;
+    if (request.payload?.schemaVersion !== 1
+      || request.payload?.type !== 'AcceptMessage'
+      || !source || typeof source !== 'object'
+      || source.adapterId !== request.adapterId
+      || source.accountRef !== request.accountRef
+      || source.eventType !== request.eventType
+      || source.eventId !== eventId
+      || source.messageId !== messageId
+      || source.payloadHash !== payloadHash) {
+      throw domainError(
+        'INVALID_PAYLOAD_HASH',
+        'explicit inbound payloadHash must be bound to the matching v1 AcceptMessage source',
+      );
+    }
+  }
+  return {
+    legacy,
+    writerProvenance: legacy ? 'legacy-v0' : 'namespaced-v1',
+    adapterId: legacy ? null : requireText(request.adapterId, 'inbound event.adapterId'),
+    accountRef: legacy ? null : requireText(request.accountRef, 'inbound event.accountRef'),
+    eventType: legacy ? null : requireText(request.eventType, 'inbound event.eventType'),
+    eventId,
+    messageId,
+    payloadJson,
+    payloadHash,
+    legacyPayloadJson,
+    legacyRequestFingerprint: legacyPayloadJson === null ? null : fingerprint(legacyPayloadJson),
+    legacySemanticFingerprint: legacyPayloadJson === null
+      ? null
+      : legacySemanticFingerprint(legacyPayloadJson),
+    requestFingerprint: computedFingerprint,
+    canonicalPayloadFingerprint: canonicalPayloadFingerprint(request.payload),
+    conversationLaneKey: legacy
+      ? null
+      : requireText(request.conversationLaneKey, 'inbound event.conversationLaneKey', 2_048),
+    sourceOrderJson: serializeJson(request.sourceOrder ?? null, 'inbound event.sourceOrder', 16_384),
+  };
 }
 
 function identityPairs({ eventId, messageId }) {
@@ -133,6 +243,16 @@ function initializeSchema(database) {
       updated_at INTEGER NOT NULL,
       committed_at INTEGER,
       dead_lettered_at INTEGER,
+      adapter_id TEXT,
+      account_ref TEXT,
+      event_type TEXT,
+      payload_hash TEXT,
+      conversation_lane_key TEXT,
+      lane_sequence INTEGER,
+      source_order_json TEXT,
+      normalized_payload_json TEXT,
+      writer_provenance TEXT,
+      legacy_payload_json TEXT,
       CHECK (event_id IS NOT NULL OR message_id IS NOT NULL)
     );
 
@@ -147,15 +267,189 @@ function initializeSchema(database) {
     CREATE INDEX IF NOT EXISTS idx_feishu_inbound_claim
       ON feishu_inbound_inbox(status, available_at, lease_until, id);
   `);
+
+  const columns = new Set(database.prepare(
+    'PRAGMA table_info(feishu_inbound_inbox)',
+  ).all().map((column) => column.name));
+  const additiveColumns = [
+    ['adapter_id', 'TEXT'],
+    ['account_ref', 'TEXT'],
+    ['event_type', 'TEXT'],
+    ['payload_hash', 'TEXT'],
+    ['conversation_lane_key', 'TEXT'],
+    ['lane_sequence', 'INTEGER'],
+    ['source_order_json', 'TEXT'],
+    ['normalized_payload_json', 'TEXT'],
+    ['writer_provenance', 'TEXT'],
+    ['legacy_payload_json', 'TEXT'],
+  ];
+  for (const [name, type] of additiveColumns) {
+    if (!columns.has(name)) {
+      database.exec(`ALTER TABLE feishu_inbound_inbox ADD COLUMN ${name} ${type}`);
+    }
+  }
+
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS feishu_inbound_source_identities (
+      adapter_id TEXT NOT NULL,
+      account_ref TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('event', 'message')),
+      value TEXT NOT NULL,
+      inbox_id INTEGER NOT NULL,
+      PRIMARY KEY (adapter_id, account_ref, event_type, kind, value),
+      FOREIGN KEY (inbox_id) REFERENCES feishu_inbound_inbox(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS feishu_conversation_lanes (
+      conversation_lane_key TEXT PRIMARY KEY,
+      last_sequence INTEGER NOT NULL CHECK (last_sequence > 0)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_feishu_inbound_lane_claim
+      ON feishu_inbound_inbox(conversation_lane_key, lane_sequence, status);
+  `);
+
+  const sourceRows = database.prepare(`
+    SELECT id, adapter_id, account_ref, event_type, event_id, message_id
+    FROM feishu_inbound_inbox
+    WHERE adapter_id IS NOT NULL
+      AND account_ref IS NOT NULL
+      AND event_type IS NOT NULL
+  `).all();
+  const selectBinding = database.prepare(`
+    SELECT inbox_id
+    FROM feishu_inbound_source_identities
+    WHERE adapter_id = ? AND account_ref = ? AND event_type = ?
+      AND kind = ? AND value = ?
+  `);
+  const insertBinding = database.prepare(`
+    INSERT OR IGNORE INTO feishu_inbound_source_identities (
+      adapter_id, account_ref, event_type, kind, value, inbox_id
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const desiredBindings = new Map();
+  for (const row of sourceRows) {
+    for (const field of ['adapter_id', 'account_ref', 'event_type']) {
+      if (typeof row[field] !== 'string' || row[field].trim() === '') {
+        throw domainError(
+          'IDENTITY_CONFLICT',
+          'namespaced inbox row has an invalid source namespace',
+        );
+      }
+    }
+    const pairs = [
+      row.event_id ? { kind: 'event', value: row.event_id } : null,
+      row.message_id ? { kind: 'message', value: row.message_id } : null,
+    ].filter(Boolean);
+    for (const pair of pairs) {
+      const key = JSON.stringify([
+        row.adapter_id,
+        row.account_ref,
+        row.event_type,
+        pair.kind,
+        pair.value,
+      ]);
+      const desiredInboxId = desiredBindings.get(key);
+      if (desiredInboxId !== undefined && desiredInboxId !== row.id) {
+        throw domainError(
+          'IDENTITY_CONFLICT',
+          'multiple namespaced inbox rows claim the same source identity',
+        );
+      }
+      const existing = selectBinding.get(
+        row.adapter_id,
+        row.account_ref,
+        row.event_type,
+        pair.kind,
+        pair.value,
+      );
+      if (existing && existing.inbox_id !== row.id) {
+        throw domainError(
+          'IDENTITY_CONFLICT',
+          'source identity binding conflicts with its namespaced inbox row',
+        );
+      }
+      desiredBindings.set(key, row.id);
+      insertBinding.run(
+        row.adapter_id,
+        row.account_ref,
+        row.event_type,
+        pair.kind,
+        pair.value,
+        row.id,
+      );
+    }
+  }
+  const splitIdentity = database.prepare(`
+    SELECT source.kind, source.value,
+           source.inbox_id AS source_inbox_id,
+           legacy.inbox_id AS legacy_inbox_id
+    FROM feishu_inbound_source_identities source
+    JOIN feishu_inbound_identities legacy
+      ON legacy.kind = source.kind AND legacy.value = source.value
+    WHERE source.inbox_id <> legacy.inbox_id
+    LIMIT 1
+  `).get();
+  if (splitIdentity) {
+    throw domainError(
+      'IDENTITY_CONFLICT',
+      'legacy and namespaced identities split the same source identity across inbox rows',
+    );
+  }
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_feishu_legacy_identity_no_split
+    BEFORE INSERT ON feishu_inbound_identities
+    WHEN EXISTS (
+      SELECT 1
+      FROM feishu_inbound_source_identities source
+      WHERE source.kind = NEW.kind
+        AND source.value = NEW.value
+        AND source.inbox_id <> NEW.inbox_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'split inbound identity across legacy and source indexes');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_feishu_source_identity_no_split
+    BEFORE INSERT ON feishu_inbound_source_identities
+    WHEN EXISTS (
+      SELECT 1
+      FROM feishu_inbound_identities legacy
+      WHERE legacy.kind = NEW.kind
+        AND legacy.value = NEW.value
+        AND legacy.inbox_id <> NEW.inbox_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'split inbound identity across source and legacy indexes');
+    END;
+  `);
 }
 
 function toView(row) {
   if (!row) return null;
+  let payload;
+  try {
+    payload = JSON.parse(row.normalized_payload_json ?? row.payload_json);
+  } catch (error) {
+    if (row.status !== 'dead_letter') throw error;
+    payload = Object.freeze({
+      quarantined: true,
+      reason: 'invalid stored payload JSON',
+    });
+  }
   return {
     id: row.id,
     eventId: row.event_id,
     messageId: row.message_id,
-    payload: JSON.parse(row.payload_json),
+    adapterId: row.adapter_id,
+    accountRef: row.account_ref,
+    eventType: row.event_type,
+    payloadHash: row.payload_hash ?? `sha256:${row.request_fingerprint}`,
+    conversationLaneKey: row.conversation_lane_key,
+    laneSequence: row.lane_sequence,
+    sourceOrder: row.source_order_json === null ? null : JSON.parse(row.source_order_json),
+    payload,
     status: row.status,
     attempt: row.attempt,
     version: row.version,
@@ -200,7 +494,12 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
   database.pragma('journal_mode = WAL');
   database.pragma('synchronous = FULL');
   database.pragma('foreign_keys = ON');
-  initializeSchema(database);
+  try {
+    database.transaction(() => initializeSchema(database)).immediate();
+  } catch (error) {
+    database.close();
+    throw error;
+  }
 
   const selectById = database.prepare('SELECT * FROM feishu_inbound_inbox WHERE id = ?');
   const selectIdentity = database.prepare(`
@@ -212,38 +511,340 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
   const insertIdentity = database.prepare(`
     INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, ?)
   `);
+  const selectSourceIdentity = database.prepare(`
+    SELECT i.*
+    FROM feishu_inbound_source_identities x
+    JOIN feishu_inbound_inbox i ON i.id = x.inbox_id
+    WHERE x.adapter_id = ? AND x.account_ref = ? AND x.event_type = ?
+      AND x.kind = ? AND x.value = ?
+  `);
+  const selectSourceIdentityAcrossNamespaces = database.prepare(`
+    SELECT i.*
+    FROM feishu_inbound_source_identities x
+    JOIN feishu_inbound_inbox i ON i.id = x.inbox_id
+    WHERE x.kind = ? AND x.value = ?
+  `);
+  const insertSourceIdentity = database.prepare(`
+    INSERT INTO feishu_inbound_source_identities (
+      adapter_id, account_ref, event_type, kind, value, inbox_id
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const selectLegacyIdentitiesForInbox = database.prepare(`
+    SELECT kind, value FROM feishu_inbound_identities WHERE inbox_id = ?
+  `);
 
-  function rowsForIdentities(pairs) {
-    const rows = pairs.map(({ kind, value }) => selectIdentity.get(kind, value)).filter(Boolean);
+  function rowsForIdentities(pairs, namespace = null) {
+    const rows = pairs.map(({ kind, value }) => (
+      namespace
+        ? selectSourceIdentity.get(
+          namespace.adapterId,
+          namespace.accountRef,
+          namespace.eventType,
+          kind,
+          value,
+        )
+        : selectIdentity.get(kind, value)
+    )).filter(Boolean);
     return [...new Map(rows.map((row) => [row.id, row])).values()];
+  }
+
+  function rowsForSourceIdentitiesAcrossNamespaces(pairs) {
+    const rows = pairs.flatMap(({ kind, value }) => (
+      selectSourceIdentityAcrossNamespaces.all(kind, value)
+    ));
+    return [...new Map(rows.map((row) => [row.id, row])).values()];
+  }
+
+  function ensureLegacyIdentity(pair, inboxId) {
+    const existing = selectIdentity.get(pair.kind, pair.value);
+    if (existing && existing.id !== inboxId) {
+      throw domainError('IDENTITY_CONFLICT', 'legacy inbound identity belongs to another inbox entry');
+    }
+    if (!existing) insertIdentity.run(pair.kind, pair.value, inboxId);
+  }
+
+  function ensureSourceIdentity(namespace, pair, inboxId) {
+    const existing = selectSourceIdentity.get(
+      namespace.adapterId,
+      namespace.accountRef,
+      namespace.eventType,
+      pair.kind,
+      pair.value,
+    );
+    if (existing && existing.id !== inboxId) {
+      throw domainError('IDENTITY_CONFLICT', 'namespaced inbound identity belongs to another inbox entry');
+    }
+    if (!existing) {
+      insertSourceIdentity.run(
+        namespace.adapterId,
+        namespace.accountRef,
+        namespace.eventType,
+        pair.kind,
+        pair.value,
+        inboxId,
+      );
+    }
+  }
+
+  function allocateLaneSequence(conversationLaneKey) {
+    const current = database.prepare(`
+      SELECT last_sequence FROM feishu_conversation_lanes WHERE conversation_lane_key = ?
+    `).get(conversationLaneKey);
+    if (!current) {
+      database.prepare(`
+        INSERT INTO feishu_conversation_lanes (conversation_lane_key, last_sequence)
+        VALUES (?, 1)
+      `).run(conversationLaneKey);
+      return 1;
+    }
+    const next = current.last_sequence + 1;
+    database.prepare(`
+      UPDATE feishu_conversation_lanes SET last_sequence = ? WHERE conversation_lane_key = ?
+    `).run(next, conversationLaneKey);
+    return next;
+  }
+
+  function isVerifiedLegacyWriter(row) {
+    if (row.writer_provenance === 'legacy-v0') return true;
+    return row.writer_provenance === null
+      && row.adapter_id === null
+      && (row.payload_hash === null
+        || row.payload_hash === `sha256:${row.request_fingerprint}`);
+  }
+
+  function legacyPayloadMatches(row, candidatePayloadJson) {
+    const storedPayloadJson = row.legacy_payload_json
+      ?? (isVerifiedLegacyWriter(row) ? row.payload_json : null);
+    if (storedPayloadJson !== null) {
+      if (fingerprint(storedPayloadJson) === fingerprint(candidatePayloadJson)) return true;
+      const storedSemantic = legacySemanticFingerprint(storedPayloadJson);
+      const candidateSemantic = legacySemanticFingerprint(candidatePayloadJson);
+      if (storedSemantic !== null
+        && candidateSemantic !== null
+        && storedSemantic === candidateSemantic) return true;
+    }
+    const derivedPayloadHash = deriveLegacyPayloadHash(row, candidatePayloadJson);
+    return derivedPayloadHash !== null
+      && row.payload_hash !== null
+      && derivedPayloadHash === row.payload_hash;
+  }
+
+  function deriveLegacyPayloadHash(namespace, legacyPayloadJson) {
+    if (namespace.adapter_id !== 'feishu' || !namespace.account_ref || !namespace.event_type) {
+      return null;
+    }
+    let legacyPayload;
+    try {
+      legacyPayload = JSON.parse(legacyPayloadJson);
+      const normalized = normalizeFeishuInboundMessage({
+        event_id: namespace.event_id ?? `legacy-message:${namespace.message_id}`,
+        create_time: legacyPayload._timestamp,
+        message: legacyPayload.message,
+        sender: legacyPayload.sender,
+      }, {
+        accountRef: namespace.account_ref,
+        eventType: namespace.event_type,
+      });
+      return normalized.payloadHash;
+    } catch {
+      return null;
+    }
   }
 
   const receiveTransaction = database.transaction((input) => {
     const normalized = normalizeInbound(input);
+    if (!normalized.legacy && normalized.legacyPayloadJson !== null) {
+      const derivedPayloadHash = deriveLegacyPayloadHash({
+        adapter_id: normalized.adapterId,
+        account_ref: normalized.accountRef,
+        event_type: normalized.eventType,
+        event_id: normalized.eventId,
+        message_id: normalized.messageId,
+      }, normalized.legacyPayloadJson);
+      if (derivedPayloadHash !== normalized.payloadHash) {
+        throw domainError(
+          'INVALID_PAYLOAD_HASH',
+          'inbound payloadHash does not match canonical Feishu platform facts',
+        );
+      }
+    }
     const pairs = identityPairs(normalized);
-    const existingRows = rowsForIdentities(pairs);
+    const namespace = normalized.legacy ? null : normalized;
+    const sourceRowsForCollision = normalized.legacy
+      ? rowsForSourceIdentitiesAcrossNamespaces(pairs)
+      : rowsForIdentities(pairs, namespace);
+    const legacyRowsForCollision = rowsForIdentities(pairs);
+    if (sourceRowsForCollision.length > 0 && legacyRowsForCollision.length > 0) {
+      const collisionRows = [...new Map([
+        ...sourceRowsForCollision,
+        ...legacyRowsForCollision,
+      ].map((row) => [row.id, row])).values()];
+      if (collisionRows.length > 1) {
+        throw domainError(
+          'IDENTITY_CONFLICT',
+          'legacy and namespaced identities split the inbound identity across rows',
+        );
+      }
+    }
+    let existingRows = normalized.legacy
+      ? legacyRowsForCollision
+      : sourceRowsForCollision;
+    let bridgeLegacyIdentities = false;
+    if (existingRows.length === 0 && normalized.legacy) {
+      const sourceRows = rowsForSourceIdentitiesAcrossNamespaces(pairs);
+      if (sourceRows.length > 1) {
+        throw domainError('IDENTITY_CONFLICT', 'legacy identity is ambiguous across source namespaces');
+      }
+      if (sourceRows.length === 1) {
+        const existing = sourceRows[0];
+        if (!legacyPayloadMatches(existing, normalized.payloadJson)) {
+          throw domainError('IDEMPOTENCY_CONFLICT', 'legacy inbound identity belongs to different payload');
+        }
+        database.prepare(`
+          UPDATE feishu_inbound_inbox
+          SET legacy_payload_json = COALESCE(legacy_payload_json, ?)
+          WHERE id = ?
+        `).run(normalized.payloadJson, existing.id);
+        for (const pair of pairs) ensureLegacyIdentity(pair, existing.id);
+        return { created: false, entry: toView(selectById.get(existing.id)) };
+      }
+    }
+    if (existingRows.length === 0 && !normalized.legacy) {
+      const legacyRows = rowsForIdentities(pairs).filter((row) => (
+        row.adapter_id === null
+        || (row.adapter_id === normalized.adapterId
+          && row.account_ref === normalized.accountRef
+          && row.event_type === normalized.eventType)
+      ));
+      if (legacyRows.length > 1) {
+        throw domainError('IDENTITY_CONFLICT', 'legacy eventId and messageId belong to different inbox entries');
+      }
+      if (legacyRows.length === 1) {
+        existingRows = legacyRows;
+        bridgeLegacyIdentities = true;
+      }
+    }
     if (existingRows.length > 1) {
       throw domainError('IDENTITY_CONFLICT', 'eventId and messageId belong to different inbox entries');
     }
     if (existingRows.length === 1) {
       const existing = existingRows[0];
-      if (existing.request_fingerprint !== normalized.requestFingerprint) {
+      if (bridgeLegacyIdentities) {
+        const legacyPayloadIntegrity = fingerprint(existing.payload_json)
+          === existing.request_fingerprint;
+        const existingSemanticFingerprint = legacySemanticFingerprint(existing.payload_json);
+        const legacyFingerprintMatches = isVerifiedLegacyWriter(existing)
+          && legacyPayloadIntegrity
+          && (existing.request_fingerprint === normalized.legacyRequestFingerprint
+            || (existingSemanticFingerprint !== null
+              && normalized.legacySemanticFingerprint !== null
+              && existingSemanticFingerprint === normalized.legacySemanticFingerprint));
+        const namespacedHashMatches = existing.payload_hash === normalized.payloadHash;
+        const derivedLegacyHashMatches = deriveLegacyPayloadHash({
+          ...existing,
+          adapter_id: normalized.adapterId,
+          account_ref: normalized.accountRef,
+          event_type: normalized.eventType,
+        }, existing.payload_json) === normalized.payloadHash;
+        if ((!legacyFingerprintMatches && !namespacedHashMatches && !derivedLegacyHashMatches)
+          || (existing.conversation_lane_key !== null
+            && existing.conversation_lane_key !== normalized.conversationLaneKey)) {
+          throw domainError('IDEMPOTENCY_CONFLICT', 'legacy inbound identity belongs to different payload');
+        }
+        const laneSequence = existing.lane_sequence
+          ?? allocateLaneSequence(normalized.conversationLaneKey);
+        const now = requireNow(clock);
+        database.prepare(`
+          UPDATE feishu_inbound_inbox
+          SET adapter_id = ?, account_ref = ?, event_type = ?, payload_hash = ?,
+              conversation_lane_key = ?, lane_sequence = ?, source_order_json = ?,
+              normalized_payload_json = ?, writer_provenance = 'namespaced-v1',
+              legacy_payload_json = COALESCE(legacy_payload_json, ?),
+              version = version + 1, updated_at = ?
+          WHERE id = ?
+        `).run(
+          normalized.adapterId,
+          normalized.accountRef,
+          normalized.eventType,
+          normalized.payloadHash,
+          normalized.conversationLaneKey,
+          laneSequence,
+          normalized.sourceOrderJson,
+          normalized.payloadJson,
+          normalized.legacyPayloadJson ?? existing.payload_json,
+          now,
+          existing.id,
+        );
+        const bridgedPairs = [
+          ...selectLegacyIdentitiesForInbox.all(existing.id),
+          ...pairs,
+        ];
+        const uniquePairs = [...new Map(
+          bridgedPairs.map((pair) => [`${pair.kind}\u0000${pair.value}`, pair]),
+        ).values()];
+        for (const pair of uniquePairs) ensureSourceIdentity(normalized, pair, existing.id);
+        return { created: false, entry: toView(selectById.get(existing.id)) };
+      }
+      if (normalized.legacy) {
+        if (!legacyPayloadMatches(existing, normalized.payloadJson)) {
+          throw domainError('IDEMPOTENCY_CONFLICT', 'legacy inbound identity belongs to different payload');
+        }
+        database.prepare(`
+          UPDATE feishu_inbound_inbox
+          SET legacy_payload_json = COALESCE(legacy_payload_json, ?)
+          WHERE id = ?
+        `).run(normalized.payloadJson, existing.id);
+        for (const pair of pairs) ensureLegacyIdentity(pair, existing.id);
+        return { created: false, entry: toView(selectById.get(existing.id)) };
+      }
+      const existingPayloadHash = existing.payload_hash ?? `sha256:${existing.request_fingerprint}`;
+      const existingPayloadJson = existing.normalized_payload_json ?? existing.payload_json;
+      const existingCanonicalFingerprint = canonicalPayloadFingerprint(
+        JSON.parse(existingPayloadJson),
+      );
+      const eventBinding = normalized.legacy || !normalized.eventId ? null : selectSourceIdentity.get(
+        normalized.adapterId,
+        normalized.accountRef,
+        normalized.eventType,
+        'event',
+        normalized.eventId,
+      );
+      const messageBinding = normalized.legacy || !normalized.messageId ? null : selectSourceIdentity.get(
+        normalized.adapterId,
+        normalized.accountRef,
+        normalized.eventType,
+        'message',
+        normalized.messageId,
+      );
+      if (existingPayloadHash !== normalized.payloadHash
+        || existingCanonicalFingerprint !== normalized.canonicalPayloadFingerprint
+        || (normalized.conversationLaneKey !== null
+          && existing.conversation_lane_key !== normalized.conversationLaneKey)
+        || (eventBinding && !messageBinding)) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'inbound identity belongs to different payload');
       }
       for (const pair of pairs) {
-        if (!selectIdentity.get(pair.kind, pair.value)) {
-          insertIdentity.run(pair.kind, pair.value, existing.id);
-        }
+        if (normalized.legacy) {
+          if (!selectIdentity.get(pair.kind, pair.value)) {
+            insertIdentity.run(pair.kind, pair.value, existing.id);
+          }
+        } else ensureSourceIdentity(normalized, pair, existing.id);
       }
       return { created: false, entry: toView(existing) };
     }
 
     const now = requireNow(clock);
+    const laneSequence = normalized.conversationLaneKey === null
+      ? null
+      : allocateLaneSequence(normalized.conversationLaneKey);
     const inserted = database.prepare(`
       INSERT INTO feishu_inbound_inbox (
         event_id, message_id, request_fingerprint, payload_json, status,
-        available_at, received_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'received', ?, ?, ?)
+        available_at, received_at, updated_at,
+        adapter_id, account_ref, event_type, payload_hash,
+        conversation_lane_key, lane_sequence, source_order_json,
+        writer_provenance, legacy_payload_json
+      ) VALUES (?, ?, ?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       normalized.eventId,
       normalized.messageId,
@@ -252,9 +853,21 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
       now,
       now,
       now,
+      normalized.adapterId,
+      normalized.accountRef,
+      normalized.eventType,
+      normalized.legacy ? null : normalized.payloadHash,
+      normalized.conversationLaneKey,
+      laneSequence,
+      normalized.sourceOrderJson,
+      normalized.writerProvenance,
+      normalized.legacyPayloadJson,
     );
     const id = Number(inserted.lastInsertRowid);
-    for (const pair of pairs) insertIdentity.run(pair.kind, pair.value, id);
+    for (const pair of pairs) {
+      if (normalized.legacy) ensureLegacyIdentity(pair, id);
+      else ensureSourceIdentity(normalized, pair, id);
+    }
     return { created: true, entry: toView(selectById.get(id)) };
   });
 
@@ -273,13 +886,22 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
       WHERE status = 'processing' AND lease_until <= ? AND attempt >= ?
     `).run(now, now, now, maxAttempts);
     const candidates = database.prepare(`
-      SELECT id, version
-      FROM feishu_inbound_inbox
-      WHERE attempt < ? AND (
-        (status IN ('received', 'failed') AND available_at <= ?)
-        OR (status = 'processing' AND lease_until <= ?)
+      SELECT candidate.id, candidate.version
+      FROM feishu_inbound_inbox candidate
+      WHERE candidate.attempt < ? AND (
+        (candidate.status IN ('received', 'failed') AND candidate.available_at <= ?)
+        OR (candidate.status = 'processing' AND candidate.lease_until <= ?)
+      ) AND (
+        candidate.conversation_lane_key IS NULL
+        OR NOT EXISTS (
+          SELECT 1
+          FROM feishu_inbound_inbox predecessor
+          WHERE predecessor.conversation_lane_key = candidate.conversation_lane_key
+            AND predecessor.lane_sequence < candidate.lane_sequence
+            AND predecessor.status NOT IN ('committed', 'dead_letter')
+        )
       )
-      ORDER BY available_at, id
+      ORDER BY candidate.available_at, candidate.id
       LIMIT ?
     `).all(maxAttempts, now, now, limit);
     const update = database.prepare(`
@@ -368,6 +990,33 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
     return toView(selectById.get(normalizedReceipt.id));
   });
 
+  const quarantineLegacyTransaction = database.transaction(({ id, error }) => {
+    const inboxId = requirePositiveInteger(id, 'legacy quarantine inbox id');
+    const failure = normalizeFailure(error);
+    const message = Array.from(`legacy upgrade: ${failure.message}`)
+      .slice(0, MAX_ERROR_LENGTH)
+      .join('');
+    const now = requireNow(clock);
+    const current = selectById.get(inboxId);
+    if (!current) throw domainError('INBOX_NOT_FOUND', 'legacy quarantine entry does not exist');
+    if (current.adapter_id !== null) {
+      throw domainError('LEGACY_QUARANTINE_CONFLICT', 'legacy quarantine entry was already upgraded');
+    }
+    if (current.status === 'dead_letter') return toView(current);
+    if (!['received', 'failed', 'processing'].includes(current.status)) {
+      throw domainError('LEGACY_QUARANTINE_CONFLICT', 'legacy quarantine entry is already terminal');
+    }
+    database.prepare(`
+      UPDATE feishu_inbound_inbox
+      SET status = 'dead_letter', version = version + 1,
+          available_at = ?, lease_owner = NULL, lease_until = NULL,
+          last_error = ?, dead_lettered_at = ?, updated_at = ?
+      WHERE id = ? AND adapter_id IS NULL
+        AND status IN ('received', 'failed', 'processing')
+    `).run(now, message, now, now, inboxId);
+    return toView(selectById.get(inboxId));
+  });
+
   return Object.freeze({
     receive(input) {
       return receiveTransaction.immediate(input);
@@ -376,7 +1025,17 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
       const request = requireRecord(identity, 'inbound identity');
       const eventId = optionalText(request.eventId, 'inbound identity.eventId');
       const messageId = optionalText(request.messageId, 'inbound identity.messageId');
-      const rows = rowsForIdentities(identityPairs({ eventId, messageId }));
+      const namespaceFields = ['adapterId', 'accountRef', 'eventType'];
+      const hasNamespace = namespaceFields.some((field) => request[field] !== undefined);
+      if (hasNamespace && namespaceFields.some((field) => request[field] === undefined)) {
+        throw new TypeError('inbound identity namespace must include adapterId, accountRef, and eventType');
+      }
+      const namespace = hasNamespace ? {
+        adapterId: requireText(request.adapterId, 'inbound identity.adapterId'),
+        accountRef: requireText(request.accountRef, 'inbound identity.accountRef'),
+        eventType: requireText(request.eventType, 'inbound identity.eventType'),
+      } : null;
+      const rows = rowsForIdentities(identityPairs({ eventId, messageId }), namespace);
       if (rows.length > 1) throw domainError('IDENTITY_CONFLICT', 'identities belong to different inbox entries');
       return toView(rows[0]);
     },
@@ -388,6 +1047,33 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
     },
     fail(input) {
       return failTransaction.immediate(requireRecord(input, 'inbound failure'));
+    },
+    pendingLegacy() {
+      const entries = [];
+      let deadLettered = 0;
+      const rows = database.prepare(`
+        SELECT * FROM feishu_inbound_inbox
+        WHERE adapter_id IS NULL
+          AND status IN ('received', 'failed', 'processing')
+        ORDER BY id
+      `).all();
+      for (const row of rows) {
+        try {
+          entries.push(toView(row));
+        } catch (error) {
+          quarantineLegacyTransaction.immediate({ id: row.id, error });
+          deadLettered += 1;
+        }
+      }
+      return Object.freeze({
+        entries: Object.freeze(entries),
+        deadLettered,
+      });
+    },
+    quarantineLegacy(input) {
+      return quarantineLegacyTransaction.immediate(
+        requireRecord(input, 'legacy quarantine'),
+      );
     },
     close() {
       database.close();
@@ -403,6 +1089,8 @@ export async function processInboundEventInboxOnce({
   inbox,
   handleMessage,
   workerId,
+  coordinator = null,
+  concurrency = 1,
   leaseMs = 30_000,
   limit = 25,
   baseRetryDelayMs = 1_000,
@@ -416,6 +1104,7 @@ export async function processInboundEventInboxOnce({
   if (typeof handleMessage !== 'function') throw new TypeError('handleMessage must be a function');
   requirePositiveInteger(leaseMs, 'inbound leaseMs', 24 * 60 * 60_000);
   requirePositiveInteger(limit, 'inbound claim limit', 100);
+  requirePositiveInteger(concurrency, 'inbound concurrency', 100);
   requirePositiveInteger(baseRetryDelayMs, 'baseRetryDelayMs', 24 * 60 * 60_000);
   requirePositiveInteger(maxRetryDelayMs, 'maxRetryDelayMs', 24 * 60 * 60_000);
   if (maxRetryDelayMs < baseRetryDelayMs) {
@@ -424,27 +1113,59 @@ export async function processInboundEventInboxOnce({
 
   const claimed = inbox.claim({ workerId: worker, leaseMs, limit });
   const summary = { claimed: claimed.length, committed: 0, failed: 0, deadLettered: 0 };
-  for (const entry of claimed) {
-    let result;
-    try {
-      result = await handleMessage(entry.payload, Object.freeze({
-        inboxId: entry.id,
-        eventId: entry.eventId,
-        messageId: entry.messageId,
-        attempt: entry.attempt,
-      }));
-    } catch (error) {
-      const retryAfterMs = Math.min(
-        maxRetryDelayMs,
-        baseRetryDelayMs * (2 ** Math.min(entry.attempt - 1, 30)),
-      );
-      const settled = inbox.fail({ receipt: entry.receipt, error, retryAfterMs });
-      if (settled.status === 'dead_letter') summary.deadLettered += 1;
-      else summary.failed += 1;
-      continue;
-    }
-    inbox.commit({ receipt: entry.receipt, result });
-    summary.committed += 1;
+  const laneCoordinator = coordinator ?? createConversationLaneCoordinator({ concurrency });
+  if (!laneCoordinator || typeof laneCoordinator.submit !== 'function') {
+    throw new TypeError('coordinator must provide a submit function');
   }
+  let firstFailure = null;
+  const submissions = claimed.map((entry) => {
+    try {
+      return laneCoordinator.submit({
+        conversationLaneKey: entry.conversationLaneKey ?? `legacy-inbox:${entry.id}`,
+        laneSequence: entry.laneSequence ?? 1,
+      }, async () => {
+        let result;
+        try {
+          const metadata = {
+            inboxId: entry.id,
+            eventId: entry.eventId,
+            messageId: entry.messageId,
+            attempt: entry.attempt,
+          };
+          if (entry.conversationLaneKey !== null) {
+            Object.assign(metadata, {
+              adapterId: entry.adapterId,
+              accountRef: entry.accountRef,
+              eventType: entry.eventType,
+              payloadHash: entry.payloadHash,
+              conversationLaneKey: entry.conversationLaneKey,
+              laneSequence: entry.laneSequence,
+              sourceOrder: entry.sourceOrder,
+            });
+          }
+          result = await handleMessage(entry.payload, Object.freeze(metadata));
+        } catch (error) {
+          const retryAfterMs = Math.min(
+            maxRetryDelayMs,
+            baseRetryDelayMs * (2 ** Math.min(entry.attempt - 1, 30)),
+          );
+          const settled = inbox.fail({ receipt: entry.receipt, error, retryAfterMs });
+          if (settled.status === 'dead_letter') summary.deadLettered += 1;
+          else summary.failed += 1;
+          return;
+        }
+        inbox.commit({ receipt: entry.receipt, result });
+        summary.committed += 1;
+      }).catch((error) => {
+        if (firstFailure === null) firstFailure = error;
+        throw error;
+      });
+    } catch (error) {
+      if (firstFailure === null) firstFailure = error;
+      return Promise.reject(error);
+    }
+  });
+  await Promise.allSettled(submissions);
+  if (firstFailure) throw firstFailure;
   return Object.freeze(summary);
 }

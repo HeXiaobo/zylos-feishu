@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "contract": "FeishuReplyAdapter",
+  "commonContractRef": {
+    "file": "common-contract-vectors.json",
+    "pointer": "replyIntents"
+  },
+  "bindings": [
+    {
+      "name": "answer",
+      "commonIntent": "answer",
+      "targetRef": "feishu-route:v1:opaque-group-reply",
+      "presentation": "card"
+    },
+    {
+      "name": "failure-notice",
+      "commonIntent": "failureNotice",
+      "targetRef": "feishu-route:v1:opaque-group-reply",
+      "presentation": "failure_notice"
+    },
+    {
+      "name": "task-receipt",
+      "commonIntent": "taskReceipt",
+      "targetRef": "feishu-route:v1:opaque-task-receipt",
+      "presentation": "task_receipt"
+    }
+  ],
+  "silent": {
+    "commonOutcome": "silent",
+    "replyIntent": "none",
+    "presenceSettlement": "explicit_silent"
+  },
+  "invalid": [
+    {
+      "name": "empty-visible-answer",
+      "commonOutcome": "invalidEmptyAnswer",
+      "expectedError": "MISSING_OUTPUT"
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "contract": "FeishuCurrentBehaviorCharacterization",
+  "baselineSha": "3beabc63f0c83b1ef247e38c11b7bd4c13249dd4",
+  "observations": [
+    {
+      "name": "history-key-thread-only",
+      "path": "src/index.js",
+      "current": "getHistoryKey returns chatId:threadId when threadId exists and chatId otherwise",
+      "gap": "group replies without thread_id do not fall back to root_id",
+      "target": "thread_id first, then root_id, then chat_id"
+    },
+    {
+      "name": "topic-group-compatibility",
+      "path": "src/index.js",
+      "current": "message routing explicitly branches on p2p and group only",
+      "gap": "topic_group is not an explicit compatible group route",
+      "target": "topic_group uses thread_id-first lane and reply routing"
+    },
+    {
+      "name": "parent-root-reply-target",
+      "path": "src/lib/reply-target.js",
+      "current": "group replies use parent_id when present and root_id otherwise; p2p uses base send",
+      "gap": null,
+      "target": "parent_id changes only the reply target and never the lane"
+    },
+    {
+      "name": "reaction-card-open",
+      "path": "src/index.js",
+      "current": "successful immediate response-card open removes the typing reaction",
+      "gap": "card open is projection state, not delivery settlement",
+      "target": "presence remains active through card open and progress"
+    },
+    {
+      "name": "reaction-120-seconds",
+      "path": "src/index.js",
+      "current": "TYPING_TIMEOUT is 120 seconds and schedules removeTypingIndicator",
+      "gap": "elapsed time is used as a normal presence finish condition",
+      "target": "120 seconds triggers observability/reconciliation only"
+    },
+    {
+      "name": "projection-timeout-terminalization",
+      "path": "src/lib/conversation-response-stream.js",
+      "current": "queued/main projection timeouts set local state.status to failed and render retry text",
+      "gap": "local projection/observation state is presented as Runtime evidence",
+      "target": "projection timeout never generates RunFailed"
+    },
+    {
+      "name": "durable-inbound-dedupe",
+      "path": "src/lib/inbound-event-inbox.js",
+      "current": "event and message identities deduplicate durably and payload fingerprints are stored",
+      "gap": "identity values are not namespaced by adapter/account/eventType and no laneSequence is assigned",
+      "target": "namespaced dual identity and one post-dedupe laneSequence"
+    }
+  ],
+  "todoTests": [
+    "namespaced dual identity rejects a same-key/different-fingerprint replay",
+    "same logical message over WebSocket and Webhook creates one request/laneSequence/presentation/presence",
+    "getHistoryKey falls back to root_id when thread_id is absent",
+    "topic_group follows group access and thread routing semantics",
+    "card open and 120 seconds do not finish Reply Presence",
+    "projection queue/main timeout cannot synthesize RunFailed",
+    "unknown final delivery reconciles before retry and redrive reuses intentId",
+    "native task user edits enter a durable status inbox and execute an authorized versioned Core command"
+  ]
+}

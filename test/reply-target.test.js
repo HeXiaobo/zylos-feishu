@@ -69,6 +69,28 @@ test('plain group (no root, no msg) chooses base send (null)', () => {
   assert.equal(chooseReplyTarget({ type: 'group' }), null);
 });
 
+test('topic_group stays reply-capable and parent changes only its reply target', () => {
+  assert.equal(
+    chooseReplyTarget({
+      type: 'topic_group',
+      thread: 'omt_thread',
+      root: 'om_root',
+      parent: 'om_parent',
+      msg: 'om_msg',
+    }),
+    'om_parent',
+  );
+  assert.equal(
+    chooseReplyTarget({
+      type: 'topic_group',
+      thread: 'omt_thread',
+      root: 'om_root',
+      msg: 'om_msg',
+    }),
+    'om_root',
+  );
+});
+
 test('unknown/undefined chat type never replies (safe default = base send)', () => {
   assert.equal(chooseReplyTarget({ root: 'om_root', msg: 'om_msg' }), null);
   assert.equal(chooseReplyTarget({}), null);

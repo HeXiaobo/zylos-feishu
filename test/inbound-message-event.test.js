@@ -10,8 +10,9 @@ test('normalizes flat SDK and nested webhook metadata to one durable payload', (
     event_id: 'evt_1', create_time: '1787600000000', message, sender,
   });
   const webhook = normalizeInboundMessageEvent({
-    _timestamp: '1787600000000', message, sender,
-  }, 'evt_1');
+    header: { event_id: 'evt_1', create_time: '1787600000000' },
+    event: { message, sender },
+  });
 
   assert.deepEqual(sdk, webhook);
   assert.equal(sdk.eventId, 'evt_1');

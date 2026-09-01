@@ -145,6 +145,21 @@ test('recognizes only the explicit text protocol and leaves ordinary chat on the
   );
 });
 
+test('reply-refactor ordinary intake explicitly removes the legacy idle gate', () => {
+  const args = buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_chat|type:p2p|msg:om_concurrent',
+    content: 'ordinary concurrent chat',
+    assistantRequest: {
+      requestId: 'assistant.feishu.om_concurrent',
+      sourceId: 'om_concurrent',
+      requireIdle: false,
+    },
+  });
+  assert.equal(args.includes('--block-queue-until-idle'), false);
+});
+
 test('passes a channel-neutral WorkIntake envelope to C4 without a task envelope', () => {
   const workIntakeEnvelope = {
     source: {

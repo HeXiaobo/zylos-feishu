@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "contract": "FeishuIntakeLegacyProjection",
+  "adapterFixtureRef": {
+    "file": "accept-message.json",
+    "pointer": "FeishuIntakeAdapter"
+  },
+  "note": "Legacy fixture name retained for characterization tests; public identity, dedupe, lane, and context semantics live in accept-message.json and common-contract-vectors.json."
+}

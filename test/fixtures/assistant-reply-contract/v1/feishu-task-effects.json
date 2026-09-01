@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "contract": "FeishuTaskEffects",
+  "commonTaskRef": {
+    "file": "common-contract-vectors.json",
+    "pointer": "taskCommand"
+  },
+  "commonReceiptIntentRef": {
+    "file": "common-contract-vectors.json",
+    "pointer": "replyIntents.taskReceipt",
+    "cause": "task_effect"
+  },
+  "routes": [
+    {
+      "name": "chat_only",
+      "axis": "assistant_request",
+      "terminalOwner": "core-run-ledger"
+    },
+    {
+      "name": "create_task",
+      "axis": "task_effect",
+      "terminalOwner": "task-core"
+    },
+    {
+      "name": "confirmation",
+      "axis": "task_effect",
+      "terminalOwner": "task-core"
+    },
+    {
+      "name": "task_action",
+      "axis": "task_effect",
+      "terminalOwner": "task-core"
+    },
+    {
+      "name": "task_receipt",
+      "axis": "delivery",
+      "cause": "task_effect"
+    }
+  ],
+  "nativeTask": {
+    "sourceOfTruth": false,
+    "supportedUserChangeFirstDurableStep": "task-status-event-inbox",
+    "unsupportedOrUnauthorizedDrift": [
+      "reject",
+      "reproject"
+    ],
+    "completionMapsTo": "SubmitForReview",
+    "directDoneAllowed": false,
+    "loopFence": [
+      "effectId",
+      "externalTaskId",
+      "coreVersion",
+      "origin"
+    ]
+  },
+  "authorization": {
+    "owner": "task-core",
+    "assistantMayConstructActor": false,
+    "assistantMayWriteDatabase": false,
+    "required": [
+      "actor",
+      "source",
+      "capability",
+      "expectedVersion"
+    ],
+    "hiddenButtonIsSecurityBoundary": false
+  }
+}
