@@ -503,9 +503,11 @@ test('fast accept observes its own durable receipt while an older cross-lane bat
     pollIntervalMs: 1,
   });
   let fastAccept;
+  let recovering;
   try {
-    fastAccept = gateway.accept(fastRaw);
+    recovering = gateway.recover();
     await slowEntered.promise;
+    fastAccept = gateway.accept(fastRaw);
     const result = await Promise.race([
       fastAccept,
       new Promise((_, reject) => setTimeout(
@@ -516,11 +518,11 @@ test('fast accept observes its own durable receipt while an older cross-lane bat
     assert.equal(result.receipt.conversationLaneKey, 'feishu:cli_app_a:group:oc-new-fast:chat');
     assert.equal(durableCore.acceptedEffects().length, 1);
     releaseSlow.resolve();
-    await gateway.recover();
+    await recovering;
     assert.equal(durableCore.acceptedEffects().length, 2);
   } finally {
     releaseSlow.resolve();
-    await Promise.allSettled([fastAccept, gateway.close()].filter(Boolean));
+    await Promise.allSettled([fastAccept, recovering, gateway.close()].filter(Boolean));
     rmSync(directory, { recursive: true, force: true });
   }
 });

@@ -698,7 +698,6 @@ test('legacy and namespaced writers converge atomically in both arrival orders',
       messageId: normalized.messageId,
       payload: normalized.message,
       payloadHash: normalized.payloadHash,
-      legacyPayload: normalizeInboundMessageEvent(source).payload,
       conversationLaneKey: normalized.conversationLaneKey,
       sourceOrder: normalized.sourceOrder,
     });
@@ -726,6 +725,20 @@ test('legacy and namespaced writers converge atomically in both arrival orders',
     previousWriter.close();
     inbox = openInboundEventInbox({ dbPath, clock: () => 3, maxAttempts: 3 });
 
+    assert.throws(
+      () => inbox.receive({
+        eventId: legacyEnvelope.eventId,
+        messageId: legacyEnvelope.messageId,
+        payload: {
+          ...legacyEnvelope.payload,
+          message: {
+            ...legacyEnvelope.payload.message,
+            content: JSON.stringify({ text: 'legacy-only payload drift' }),
+          },
+        },
+      }),
+      (error) => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
     const legacyBridged = receiveV1(inbox, legacyFirstRaw);
     assert.equal(legacyBridged.created, false);
     assert.equal(legacyBridged.entry.id, legacyFirst.entry.id);

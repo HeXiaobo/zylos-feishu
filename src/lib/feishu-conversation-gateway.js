@@ -81,7 +81,7 @@ export function createFeishuConversationGateway({
   let resolveDrain = null;
   let closePromise = null;
   let drainFailure = null;
-  let globalDrain = null;
+  const drainCycles = new Set();
 
   function recordDrainFailure(error) {
     if (lifecycle === 'draining' && drainFailure === null) drainFailure = error;
@@ -219,22 +219,45 @@ export function createFeishuConversationGateway({
     return summary;
   }
 
-  function ensureGlobalDrain() {
-    if (globalDrain) return globalDrain;
-    const operation = trackStartedOperation('drain', async () => {
-      const total = { claimed: 0, committed: 0, failed: 0, deadLettered: 0 };
-      for (;;) {
-        const summary = await processCycle(concurrency);
-        for (const key of Object.keys(total)) total[key] += summary[key];
-        if (summary.claimed === 0) return Object.freeze(total);
-      }
-    });
-    const shared = operation.finally(() => {
-      if (globalDrain === shared) globalDrain = null;
-    });
+  function startDrainCycle() {
+    if (drainCycles.size >= concurrency) return null;
+    const operation = trackStartedOperation('drain', () => processCycle(1));
+    const shared = operation.finally(() => drainCycles.delete(shared));
     shared.catch(() => {});
-    globalDrain = shared;
+    drainCycles.add(shared);
     return shared;
+  }
+
+  function fillDrainCapacity() {
+    const started = [];
+    while (drainCycles.size < concurrency) started.push(startDrainCycle());
+    return started;
+  }
+
+  async function drainUntilIdle() {
+    const total = { claimed: 0, committed: 0, failed: 0, deadLettered: 0 };
+    let firstFailure = null;
+    for (;;) {
+      if (firstFailure === null) fillDrainCapacity();
+      const snapshot = [...drainCycles];
+      if (snapshot.length === 0) {
+        if (firstFailure) throw firstFailure;
+        return Object.freeze(total);
+      }
+      const settlements = await Promise.allSettled(snapshot);
+      let claimed = 0;
+      for (const settlement of settlements) {
+        if (settlement.status === 'rejected') {
+          if (firstFailure === null) firstFailure = settlement.reason;
+          continue;
+        }
+        claimed += settlement.value.claimed;
+        for (const key of Object.keys(total)) total[key] += settlement.value[key];
+      }
+      if (drainCycles.size > 0) continue;
+      if (firstFailure) throw firstFailure;
+      if (claimed === 0) return Object.freeze(total);
+    }
   }
 
   async function settle(identity) {
@@ -243,11 +266,13 @@ export function createFeishuConversationGateway({
       if (!current) throw new Error('durably received Feishu message disappeared');
       if (current.status === 'committed') return current.result;
       if (current.status === 'dead_letter') throw deadLetterError(current);
+      fillDrainCapacity();
+      const watchedCycles = [...drainCycles].map((cyclePromise) => cyclePromise.then(
+        (summary) => ({ summary }),
+        (error) => ({ error }),
+      ));
       const outcome = await Promise.race([
-        ensureGlobalDrain().then(
-          (summary) => ({ summary }),
-          (error) => ({ error }),
-        ),
+        ...watchedCycles,
         delay(pollIntervalMs).then(() => ({ tick: true })),
       ]);
       const after = inbox.query(identity);
@@ -292,7 +317,7 @@ export function createFeishuConversationGateway({
           conversationLaneKey: normalized.conversationLaneKey,
           sourceOrder: normalized.sourceOrder,
         });
-        ensureGlobalDrain();
+        fillDrainCapacity();
         const receipt = await settleEntry(received.entry, identityFor(normalized));
         return Object.freeze({
           status: received.created ? 'accepted' : 'duplicate',
@@ -303,7 +328,7 @@ export function createFeishuConversationGateway({
     recover() {
       return runOperation('recover', async () => {
         upgradeLegacyPending();
-        return ensureGlobalDrain();
+        return drainUntilIdle();
       });
     },
     close: closeGateway,

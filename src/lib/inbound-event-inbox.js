@@ -5,6 +5,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 import { createConversationLaneCoordinator } from './conversation-lane-coordinator.js';
+import { normalizeFeishuInboundMessage } from './feishu-inbound-normalizer.js';
 
 const MAX_ID_LENGTH = 512;
 const MAX_PAYLOAD_BYTES = 1024 * 1024;
@@ -450,13 +451,40 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
   function legacyPayloadMatches(row, candidatePayloadJson) {
     const storedPayloadJson = row.legacy_payload_json
       ?? (isVerifiedLegacyWriter(row) ? row.payload_json : null);
-    if (storedPayloadJson === null) return false;
-    if (fingerprint(storedPayloadJson) === fingerprint(candidatePayloadJson)) return true;
-    const storedSemantic = legacySemanticFingerprint(storedPayloadJson);
-    const candidateSemantic = legacySemanticFingerprint(candidatePayloadJson);
-    return storedSemantic !== null
-      && candidateSemantic !== null
-      && storedSemantic === candidateSemantic;
+    if (storedPayloadJson !== null) {
+      if (fingerprint(storedPayloadJson) === fingerprint(candidatePayloadJson)) return true;
+      const storedSemantic = legacySemanticFingerprint(storedPayloadJson);
+      const candidateSemantic = legacySemanticFingerprint(candidatePayloadJson);
+      if (storedSemantic !== null
+        && candidateSemantic !== null
+        && storedSemantic === candidateSemantic) return true;
+    }
+    const derivedPayloadHash = deriveLegacyPayloadHash(row, candidatePayloadJson);
+    return derivedPayloadHash !== null
+      && row.payload_hash !== null
+      && derivedPayloadHash === row.payload_hash;
+  }
+
+  function deriveLegacyPayloadHash(namespace, legacyPayloadJson) {
+    if (namespace.adapter_id !== 'feishu' || !namespace.account_ref || !namespace.event_type) {
+      return null;
+    }
+    let legacyPayload;
+    try {
+      legacyPayload = JSON.parse(legacyPayloadJson);
+      const normalized = normalizeFeishuInboundMessage({
+        event_id: namespace.event_id ?? `legacy-message:${namespace.message_id}`,
+        create_time: legacyPayload._timestamp,
+        message: legacyPayload.message,
+        sender: legacyPayload.sender,
+      }, {
+        accountRef: namespace.account_ref,
+        eventType: namespace.event_type,
+      });
+      return normalized.payloadHash;
+    } catch {
+      return null;
+    }
   }
 
   const receiveTransaction = database.transaction((input) => {
@@ -475,12 +503,16 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
         if (!legacyPayloadMatches(existing, normalized.payloadJson)) {
           throw domainError('IDEMPOTENCY_CONFLICT', 'legacy inbound identity belongs to different payload');
         }
+        database.prepare(`
+          UPDATE feishu_inbound_inbox
+          SET legacy_payload_json = COALESCE(legacy_payload_json, ?)
+          WHERE id = ?
+        `).run(normalized.payloadJson, existing.id);
         for (const pair of pairs) ensureLegacyIdentity(pair, existing.id);
         return { created: false, entry: toView(selectById.get(existing.id)) };
       }
     }
-    if (existingRows.length === 0 && !normalized.legacy
-      && normalized.legacyRequestFingerprint !== null) {
+    if (existingRows.length === 0 && !normalized.legacy) {
       const legacyRows = rowsForIdentities(pairs).filter((row) => (
         row.adapter_id === null
         || (row.adapter_id === normalized.adapterId
@@ -511,7 +543,13 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
               && normalized.legacySemanticFingerprint !== null
               && existingSemanticFingerprint === normalized.legacySemanticFingerprint));
         const namespacedHashMatches = existing.payload_hash === normalized.payloadHash;
-        if ((!legacyFingerprintMatches && !namespacedHashMatches)
+        const derivedLegacyHashMatches = deriveLegacyPayloadHash({
+          ...existing,
+          adapter_id: normalized.adapterId,
+          account_ref: normalized.accountRef,
+          event_type: normalized.eventType,
+        }, existing.payload_json) === normalized.payloadHash;
+        if ((!legacyFingerprintMatches && !namespacedHashMatches && !derivedLegacyHashMatches)
           || (existing.conversation_lane_key !== null
             && existing.conversation_lane_key !== normalized.conversationLaneKey)) {
           throw domainError('IDEMPOTENCY_CONFLICT', 'legacy inbound identity belongs to different payload');
@@ -536,7 +574,7 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
           laneSequence,
           normalized.sourceOrderJson,
           normalized.payloadJson,
-          normalized.legacyPayloadJson,
+          normalized.legacyPayloadJson ?? existing.payload_json,
           now,
           existing.id,
         );
@@ -554,8 +592,13 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
         if (!legacyPayloadMatches(existing, normalized.payloadJson)) {
           throw domainError('IDEMPOTENCY_CONFLICT', 'legacy inbound identity belongs to different payload');
         }
+        database.prepare(`
+          UPDATE feishu_inbound_inbox
+          SET legacy_payload_json = COALESCE(legacy_payload_json, ?)
+          WHERE id = ?
+        `).run(normalized.payloadJson, existing.id);
         for (const pair of pairs) ensureLegacyIdentity(pair, existing.id);
-        return { created: false, entry: toView(existing) };
+        return { created: false, entry: toView(selectById.get(existing.id)) };
       }
       const existingPayloadHash = existing.payload_hash ?? `sha256:${existing.request_fingerprint}`;
       const eventBinding = normalized.legacy || !normalized.eventId ? null : selectSourceIdentity.get(
