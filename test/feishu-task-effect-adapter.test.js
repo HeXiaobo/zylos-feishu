@@ -5,6 +5,7 @@ import {
   createFeishuTaskEffectAdapter,
   processFeishuTaskEffectsOnce,
 } from '../src/lib/feishu-task-effect-adapter.js';
+import { taskEffectPayloadHash } from '../src/lib/task-effect-settlement.js';
 
 function effect(version, overrides = {}) {
   return {
@@ -69,6 +70,106 @@ function harness() {
   });
   return { adapter, calls, get remote() { return remote; }, set remote(value) { remote = value; } };
 }
+
+test('partial or mismatched native Task markers always fail closed before update', async () => {
+  const targetEffect = effect(2);
+  const exact = {
+    guid: 'guid-task-1',
+    url: 'https://example.invalid/task-1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 2,
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    effectId: targetEffect.effectId,
+    payloadHash: taskEffectPayloadHash(targetEffect),
+  };
+  const variants = [];
+  for (const field of [
+    'coreTaskId',
+    'coreTaskVersion',
+    'tenantRef',
+    'accountRef',
+    'effectId',
+    'payloadHash',
+  ]) {
+    variants.push({ name: `${field}=null`, remote: { ...exact, [field]: null } });
+    const missing = { ...exact };
+    delete missing[field];
+    variants.push({ name: `${field}=missing`, remote: missing });
+  }
+  variants.push(
+    { name: 'coreTaskId=different', remote: { ...exact, coreTaskId: 'task-other' } },
+    { name: 'coreTaskVersion=different', remote: { ...exact, coreTaskVersion: 3 } },
+    { name: 'tenantRef=different', remote: { ...exact, tenantRef: 'tenant-other' } },
+    { name: 'accountRef=different', remote: { ...exact, accountRef: 'acct-other' } },
+    { name: 'effectId=different', remote: { ...exact, effectId: 'effect-other' } },
+    {
+      name: 'payloadHash=different',
+      remote: {
+        ...exact,
+        payloadHash: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      },
+    },
+  );
+
+  for (const variant of variants) {
+    const state = harness();
+    state.remote = variant.remote;
+    await assert.rejects(
+      () => state.adapter().apply({
+        effect: targetEffect,
+        attempt: 1,
+        leaseEpoch: 1,
+        workerId: 'worker-a',
+        generation: 0,
+      }),
+      error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+        && error?.retryable === false,
+      variant.name,
+    );
+    assert.equal(
+      state.calls.filter(([name]) => name === 'update').length,
+      0,
+      variant.name,
+    );
+  }
+});
+
+test('partial marker stays fail-closed across concurrent apply and restart replay', async () => {
+  const state = harness();
+  state.remote = {
+    guid: 'guid-task-1',
+    url: 'https://example.invalid/task-1',
+    coreTaskId: 'task-1',
+    coreTaskVersion: 1,
+    tenantRef: 'tenant-1',
+    accountRef: 'acct-1',
+    effectId: null,
+    payloadHash: null,
+  };
+  const claim = (workerId, leaseEpoch, generation) => ({
+    effect: effect(1),
+    attempt: leaseEpoch,
+    leaseEpoch,
+    workerId,
+    generation,
+  });
+
+  const concurrent = await Promise.allSettled([
+    state.adapter().apply(claim('worker-a', 1, 0)),
+    state.adapter().apply(claim('worker-b', 2, 1)),
+  ]);
+  for (const result of concurrent) {
+    assert.equal(result.status, 'rejected');
+    assert.equal(result.reason?.code, 'EXTERNAL_IDENTITY_CONFLICT');
+  }
+  await assert.rejects(
+    () => state.adapter().apply(claim('worker-restarted', 3, 2)),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+      && error?.retryable === false,
+  );
+  assert.equal(state.calls.filter(([name]) => name === 'update').length, 0);
+});
 
 test('legacy Task marker requires a separate durable adoption transaction', async () => {
   const state = harness();
@@ -201,7 +302,7 @@ test('legacy marker for another Core task cannot be adopted by a permissive old 
   assert.equal(state.calls.filter(([name]) => name === 'update').length, 0);
 });
 
-test('TaskEffect create/update/replay use stable identity and never regress out of order', async () => {
+test('TaskEffect create/exact replay use stable identity and cross-effect overwrite fails closed', async () => {
   const state = harness();
   const adapter = state.adapter();
   const created = await adapter.apply({
@@ -212,25 +313,20 @@ test('TaskEffect create/update/replay use stable identity and never regress out 
   assert.equal(created.externalVersion, 1);
   assert.equal(created.effectId, 'effect-task-1-v1');
 
-  const updated = await adapter.apply({
-    effect: effect(2), attempt: 1, leaseEpoch: 1, workerId: 'worker-a', generation: 0,
-  });
-  assert.equal(updated.outcome, 'platform_accepted');
-  assert.equal(state.calls.filter(([name]) => name === 'update').length, 1);
-
   const restarted = state.adapter();
   const replay = await restarted.apply({
-    effect: effect(2), attempt: 2, leaseEpoch: 2, workerId: 'worker-b', generation: 0,
+    effect: effect(1), attempt: 2, leaseEpoch: 2, workerId: 'worker-b', generation: 0,
   });
   assert.equal(replay.outcome, 'reconciled');
-  assert.equal(state.calls.filter(([name]) => name === 'update').length, 1);
+  assert.equal(state.calls.filter(([name]) => name === 'update').length, 0);
 
-  const stale = await restarted.apply({
-    effect: effect(1), attempt: 3, leaseEpoch: 3, workerId: 'worker-c', generation: 0,
-  });
-  assert.equal(stale.outcome, 'suppressed');
-  assert.equal(stale.externalVersion, 2);
-  assert.equal(state.calls.filter(([name]) => name === 'update').length, 1);
+  await assert.rejects(
+    () => restarted.apply({
+      effect: effect(2), attempt: 1, leaseEpoch: 3, workerId: 'worker-c', generation: 0,
+    }),
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT' && error?.retryable === false,
+  );
+  assert.equal(state.calls.filter(([name]) => name === 'update').length, 0);
 });
 
 test('unknown retry reconciles exact effect before I/O and identity payload conflict fails closed', async () => {
@@ -250,7 +346,7 @@ test('unknown retry reconciles exact effect before I/O and identity payload conf
   state.remote.payloadHash = 'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
   await assert.rejects(
     () => state.adapter().reconcile(effect(1)),
-    error => error?.code === 'IDEMPOTENCY_CONFLICT' && error?.retryable === false,
+    error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT' && error?.retryable === false,
   );
 
   state.remote = {

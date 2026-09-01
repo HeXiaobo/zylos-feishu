@@ -118,8 +118,6 @@ function normalizeRemote(value) {
   return {
     ...remote,
     guid: requireText(remote.guid, 'native Task guid'),
-    coreTaskId: requireText(remote.coreTaskId, 'native Task coreTaskId'),
-    coreTaskVersion: requirePositive(remote.coreTaskVersion, 'native Task coreTaskVersion'),
   };
 }
 
@@ -133,8 +131,10 @@ function receipt(outcome, claim, remote) {
 }
 
 function isLegacyProjection(remote) {
-  return remote.coreTaskId !== null
-    && remote.coreTaskVersion !== null
+  return typeof remote.coreTaskId === 'string'
+    && remote.coreTaskId.trim() !== ''
+    && Number.isSafeInteger(remote.coreTaskVersion)
+    && remote.coreTaskVersion > 0
     && [remote.tenantRef, remote.accountRef, remote.effectId, remote.payloadHash]
       .every(value => value === null || value === undefined);
 }
@@ -146,23 +146,22 @@ function assertNoIdentityConflict(remote, identity) {
       `legacy native Task projection requires explicit adoption: ${remote.guid}`,
     );
   }
-  if (remote.coreTaskId !== identity.coreTaskId
-      || remote.tenantRef !== identity.tenantRef
-      || remote.accountRef !== identity.accountRef) {
-    throw domainError(
-      'EXTERNAL_IDENTITY_CONFLICT',
-      `native Task projection scope mismatch: ${remote.guid}`,
-    );
-  }
-  if (remote.effectId !== identity.effectId) return;
-  if (remote.payloadHash !== identity.payloadHash
+  const markerComplete = [
+    remote.tenantRef,
+    remote.accountRef,
+    remote.effectId,
+    remote.payloadHash,
+  ].every(value => typeof value === 'string' && value.trim() !== '');
+  if (!markerComplete
+      || remote.coreTaskId !== identity.coreTaskId
       || remote.tenantRef !== identity.tenantRef
       || remote.accountRef !== identity.accountRef
-      || remote.coreTaskId !== identity.coreTaskId
+      || remote.effectId !== identity.effectId
+      || remote.payloadHash !== identity.payloadHash
       || remote.coreTaskVersion !== identity.coreTaskVersion) {
     throw domainError(
-      'IDEMPOTENCY_CONFLICT',
-      `TaskEffect identity belongs to different projection content: ${identity.effectId}`,
+      'EXTERNAL_IDENTITY_CONFLICT',
+      `native Task projection identity mismatch: ${remote.guid}`,
     );
   }
 }
