@@ -775,3 +775,64 @@ test('legacy and namespaced writers converge atomically in both arrival orders',
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('namespaced payload hashes are controlled and canonical payload drift fails closed', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-hash-integrity-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  try {
+    const inbox = openInboundEventInbox({ dbPath, clock: () => 4, maxAttempts: 3 });
+    assert.throws(
+      () => inbox.receive({
+        adapterId: 'feishu',
+        accountRef: 'cli_app_a',
+        eventType: 'im.message.receive_v1',
+        eventId: 'evt_unbound_hash',
+        messageId: 'om_unbound_hash',
+        payload: { message: 'a' },
+        payloadHash: `sha256:${'a'.repeat(64)}`,
+        conversationLaneKey: 'feishu:cli_app_a:group:oc_hash:chat',
+        sourceOrder: null,
+      }),
+      (error) => error.code === 'INVALID_PAYLOAD_HASH',
+    );
+
+    const raw = {
+      event_id: 'evt_canonical_hash',
+      create_time: '1787900000000',
+      message: {
+        message_id: 'om_canonical_hash',
+        chat_id: 'oc_hash',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: 'canonical a' }),
+      },
+      sender: {
+        sender_id: { open_id: 'ou_hash_sender' },
+        tenant_key: 'tenant_hash',
+      },
+    };
+    const normalized = normalizeFeishuInboundMessage(raw, { accountRef: 'cli_app_a' });
+    const receive = (payload) => inbox.receive({
+      adapterId: normalized.adapterId,
+      accountRef: normalized.accountRef,
+      eventType: normalized.eventType,
+      eventId: normalized.eventId,
+      messageId: normalized.messageId,
+      payload,
+      payloadHash: normalized.payloadHash,
+      conversationLaneKey: normalized.conversationLaneKey,
+      sourceOrder: normalized.sourceOrder,
+    });
+    assert.equal(receive(normalized.message).created, true);
+    assert.throws(
+      () => receive({
+        ...normalized.message,
+        content: { kind: 'text', text: 'canonical b' },
+      }),
+      (error) => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

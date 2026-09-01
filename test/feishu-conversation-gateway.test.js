@@ -566,3 +566,64 @@ test('recover upgrades a legacy pending payload without waiting for a new platfo
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('recover quarantines one malformed legacy row and continues healthy legacy upgrade', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-gateway-legacy-quarantine-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const healthyRaw = event({
+    eventId: 'evt-legacy-healthy',
+    messageId: 'om-legacy-healthy',
+    chatId: 'oc-legacy-healthy',
+  });
+  const healthyEnvelope = normalizeInboundMessageEvent(healthyRaw);
+  const seed = openInboundEventInbox({ dbPath, clock: () => 1_788_220_800_000 });
+  seed.receive({
+    eventId: 'evt-legacy-malformed',
+    messageId: 'om-legacy-malformed',
+    payload: { garbage: true },
+  });
+  seed.receive({
+    eventId: healthyEnvelope.eventId,
+    messageId: healthyEnvelope.messageId,
+    payload: healthyEnvelope.payload,
+  });
+  seed.close();
+
+  const core = createInMemoryCoreMessageIntake();
+  const gateway = createFeishuConversationGateway({
+    dbPath,
+    accountRef: 'cli_app_a',
+    authorize: async () => true,
+    coreIntake: core,
+    workerId: 'gateway-legacy-quarantine',
+    clock: () => 1_788_220_800_001,
+    pollIntervalMs: 1,
+  });
+  try {
+    assert.deepEqual(await gateway.recover(), {
+      claimed: 1,
+      committed: 1,
+      failed: 0,
+      deadLettered: 1,
+    });
+    assert.equal(core.acceptedEffects().length, 1);
+  } finally {
+    await gateway.close();
+  }
+
+  const verify = openInboundEventInbox({ dbPath, clock: () => 1_788_220_800_002 });
+  try {
+    const malformed = verify.query({ eventId: 'evt-legacy-malformed' });
+    assert.equal(malformed.status, 'dead_letter');
+    assert.match(malformed.lastError, /legacy upgrade/i);
+    assert.equal(verify.query({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      messageId: healthyEnvelope.messageId,
+    }).status, 'committed');
+  } finally {
+    verify.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -104,6 +104,22 @@ function legacySemanticFingerprint(serialized) {
   })));
 }
 
+function canonicalPayloadFingerprint(payload) {
+  let stablePayload = payload;
+  if (payload?.schemaVersion === 1 && payload.type === 'AcceptMessage'
+    && payload.source && typeof payload.source === 'object') {
+    const {
+      idempotencyKey: _idempotencyKey,
+      causationId: _causationId,
+      issuedAt: _issuedAt,
+      ...stableCommand
+    } = payload;
+    const { eventId: _eventId, ...stableSource } = payload.source;
+    stablePayload = { ...stableCommand, source: stableSource };
+  }
+  return fingerprint(JSON.stringify(canonicalize(stablePayload)));
+}
+
 function normalizeInbound(input) {
   const request = requireRecord(input, 'inbound event');
   const keys = Object.keys(request);
@@ -144,6 +160,23 @@ function normalizeInbound(input) {
   if (!/^sha256:[a-f0-9]{64}$/.test(payloadHash)) {
     throw new TypeError('inbound event.payloadHash must be a sha256 digest');
   }
+  if (!legacy && request.payloadHash !== undefined) {
+    const source = request.payload?.source;
+    if (request.payload?.schemaVersion !== 1
+      || request.payload?.type !== 'AcceptMessage'
+      || !source || typeof source !== 'object'
+      || source.adapterId !== request.adapterId
+      || source.accountRef !== request.accountRef
+      || source.eventType !== request.eventType
+      || source.eventId !== eventId
+      || source.messageId !== messageId
+      || source.payloadHash !== payloadHash) {
+      throw domainError(
+        'INVALID_PAYLOAD_HASH',
+        'explicit inbound payloadHash must be bound to the matching v1 AcceptMessage source',
+      );
+    }
+  }
   return {
     legacy,
     writerProvenance: legacy ? 'legacy-v0' : 'namespaced-v1',
@@ -160,6 +193,7 @@ function normalizeInbound(input) {
       ? null
       : legacySemanticFingerprint(legacyPayloadJson),
     requestFingerprint: computedFingerprint,
+    canonicalPayloadFingerprint: canonicalPayloadFingerprint(request.payload),
     conversationLaneKey: legacy
       ? null
       : requireText(request.conversationLaneKey, 'inbound event.conversationLaneKey', 2_048),
@@ -489,6 +523,21 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
 
   const receiveTransaction = database.transaction((input) => {
     const normalized = normalizeInbound(input);
+    if (!normalized.legacy && normalized.legacyPayloadJson !== null) {
+      const derivedPayloadHash = deriveLegacyPayloadHash({
+        adapter_id: normalized.adapterId,
+        account_ref: normalized.accountRef,
+        event_type: normalized.eventType,
+        event_id: normalized.eventId,
+        message_id: normalized.messageId,
+      }, normalized.legacyPayloadJson);
+      if (derivedPayloadHash !== normalized.payloadHash) {
+        throw domainError(
+          'INVALID_PAYLOAD_HASH',
+          'inbound payloadHash does not match canonical Feishu platform facts',
+        );
+      }
+    }
     const pairs = identityPairs(normalized);
     const namespace = normalized.legacy ? null : normalized;
     let existingRows = rowsForIdentities(pairs, namespace);
@@ -601,6 +650,10 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
         return { created: false, entry: toView(selectById.get(existing.id)) };
       }
       const existingPayloadHash = existing.payload_hash ?? `sha256:${existing.request_fingerprint}`;
+      const existingPayloadJson = existing.normalized_payload_json ?? existing.payload_json;
+      const existingCanonicalFingerprint = canonicalPayloadFingerprint(
+        JSON.parse(existingPayloadJson),
+      );
       const eventBinding = normalized.legacy || !normalized.eventId ? null : selectSourceIdentity.get(
         normalized.adapterId,
         normalized.accountRef,
@@ -616,6 +669,7 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
         normalized.messageId,
       );
       if (existingPayloadHash !== normalized.payloadHash
+        || existingCanonicalFingerprint !== normalized.canonicalPayloadFingerprint
         || (normalized.conversationLaneKey !== null
           && existing.conversation_lane_key !== normalized.conversationLaneKey)
         || (eventBinding && !messageBinding)) {
@@ -788,6 +842,33 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
     return toView(selectById.get(normalizedReceipt.id));
   });
 
+  const quarantineLegacyTransaction = database.transaction(({ id, error }) => {
+    const inboxId = requirePositiveInteger(id, 'legacy quarantine inbox id');
+    const failure = normalizeFailure(error);
+    const message = Array.from(`legacy upgrade: ${failure.message}`)
+      .slice(0, MAX_ERROR_LENGTH)
+      .join('');
+    const now = requireNow(clock);
+    const current = selectById.get(inboxId);
+    if (!current) throw domainError('INBOX_NOT_FOUND', 'legacy quarantine entry does not exist');
+    if (current.adapter_id !== null) {
+      throw domainError('LEGACY_QUARANTINE_CONFLICT', 'legacy quarantine entry was already upgraded');
+    }
+    if (current.status === 'dead_letter') return toView(current);
+    if (!['received', 'failed', 'processing'].includes(current.status)) {
+      throw domainError('LEGACY_QUARANTINE_CONFLICT', 'legacy quarantine entry is already terminal');
+    }
+    database.prepare(`
+      UPDATE feishu_inbound_inbox
+      SET status = 'dead_letter', version = version + 1,
+          available_at = ?, lease_owner = NULL, lease_until = NULL,
+          last_error = ?, dead_lettered_at = ?, updated_at = ?
+      WHERE id = ? AND adapter_id IS NULL
+        AND status IN ('received', 'failed', 'processing')
+    `).run(now, message, now, now, inboxId);
+    return toView(selectById.get(inboxId));
+  });
+
   return Object.freeze({
     receive(input) {
       return receiveTransaction.immediate(input);
@@ -826,6 +907,11 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
           AND status IN ('received', 'failed', 'processing')
         ORDER BY id
       `).all().map(toView);
+    },
+    quarantineLegacy(input) {
+      return quarantineLegacyTransaction.immediate(
+        requireRecord(input, 'legacy quarantine'),
+      );
     },
     close() {
       database.close();

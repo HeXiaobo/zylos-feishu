@@ -40,6 +40,14 @@ function gatewayError(code, message, cause = undefined) {
   return error;
 }
 
+function isLegacyUpgradeDataError(error) {
+  return error instanceof TypeError || [
+    'IDENTITY_CONFLICT',
+    'IDEMPOTENCY_CONFLICT',
+    'INVALID_PAYLOAD_HASH',
+  ].includes(error?.code);
+}
+
 /**
  * Deep Feishu inbound Module. It owns authentication, normalization, durable
  * Inbox replay, dual dedupe, lane ordering, and bounded Core durable accept.
@@ -166,32 +174,40 @@ export function createFeishuConversationGateway({
   }
 
   function upgradeLegacyPending() {
+    let deadLettered = 0;
     for (const entry of inbox.pendingLegacy()) {
-      const legacyPayload = entry.payload;
-      const rawEvent = {
-        event_id: entry.eventId ?? `legacy-inbox:${entry.id}`,
-        create_time: legacyPayload._timestamp,
-        message: legacyPayload.message,
-        sender: legacyPayload.sender,
-      };
-      const normalized = normalizeFeishuInboundMessage(rawEvent, {
-        accountRef: normalizedAccountRef,
-        eventId: rawEvent.event_id,
-        clock,
-      });
-      inbox.receive({
-        adapterId: normalized.adapterId,
-        accountRef: normalized.accountRef,
-        eventType: normalized.eventType,
-        eventId: normalized.eventId,
-        messageId: normalized.messageId,
-        payload: normalized.message,
-        payloadHash: normalized.payloadHash,
-        legacyPayload,
-        conversationLaneKey: normalized.conversationLaneKey,
-        sourceOrder: normalized.sourceOrder,
-      });
+      try {
+        const legacyPayload = entry.payload;
+        const rawEvent = {
+          event_id: entry.eventId ?? `legacy-inbox:${entry.id}`,
+          create_time: legacyPayload._timestamp,
+          message: legacyPayload.message,
+          sender: legacyPayload.sender,
+        };
+        const normalized = normalizeFeishuInboundMessage(rawEvent, {
+          accountRef: normalizedAccountRef,
+          eventId: rawEvent.event_id,
+          clock,
+        });
+        inbox.receive({
+          adapterId: normalized.adapterId,
+          accountRef: normalized.accountRef,
+          eventType: normalized.eventType,
+          eventId: normalized.eventId,
+          messageId: normalized.messageId,
+          payload: normalized.message,
+          payloadHash: normalized.payloadHash,
+          legacyPayload,
+          conversationLaneKey: normalized.conversationLaneKey,
+          sourceOrder: normalized.sourceOrder,
+        });
+      } catch (error) {
+        if (!isLegacyUpgradeDataError(error)) throw error;
+        inbox.quarantineLegacy({ id: entry.id, error });
+        deadLettered += 1;
+      }
     }
+    return deadLettered;
   }
 
   async function processCycle(limit = concurrency) {
@@ -327,8 +343,12 @@ export function createFeishuConversationGateway({
     },
     recover() {
       return runOperation('recover', async () => {
-        upgradeLegacyPending();
-        return drainUntilIdle();
+        const migratedDeadLetters = upgradeLegacyPending();
+        const summary = await drainUntilIdle();
+        return Object.freeze({
+          ...summary,
+          deadLettered: summary.deadLettered + migratedDeadLetters,
+        });
       });
     },
     close: closeGateway,
