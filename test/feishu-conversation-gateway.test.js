@@ -8,6 +8,7 @@ import { createInMemoryCoreMessageIntake } from '../src/lib/core-message-intake-
 import { createFeishuConversationGateway } from '../src/lib/feishu-conversation-gateway.js';
 import { normalizeFeishuInboundMessage } from '../src/lib/feishu-inbound-normalizer.js';
 import { openInboundEventInbox } from '../src/lib/inbound-event-inbox.js';
+import { normalizeInboundMessageEvent } from '../src/lib/inbound-message-event.js';
 
 function deferred() {
   let resolve;
@@ -456,6 +457,110 @@ test('close reports a draining recover failure and restart safely retries ambigu
   } finally {
     releaseCore.resolve();
     await Promise.allSettled([recovering, closing, gateway.close()].filter(Boolean));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('fast accept observes its own durable receipt while an older cross-lane batch item is blocked', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-gateway-fast-handoff-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const slowRaw = event({ eventId: 'evt-seeded-slow', messageId: 'om-seeded-slow', chatId: 'oc-seeded-slow' });
+  const fastRaw = event({ eventId: 'evt-new-fast', messageId: 'om-new-fast', chatId: 'oc-new-fast' });
+  const slow = normalizeFeishuInboundMessage(slowRaw, { accountRef: 'cli_app_a' });
+  const seed = openInboundEventInbox({ dbPath, clock: () => 1_788_220_800_000 });
+  seed.receive({
+    adapterId: slow.adapterId,
+    accountRef: slow.accountRef,
+    eventType: slow.eventType,
+    eventId: slow.eventId,
+    messageId: slow.messageId,
+    payload: slow.message,
+    payloadHash: slow.payloadHash,
+    conversationLaneKey: slow.conversationLaneKey,
+    sourceOrder: slow.sourceOrder,
+  });
+  seed.close();
+
+  const slowEntered = deferred();
+  const releaseSlow = deferred();
+  const durableCore = createInMemoryCoreMessageIntake();
+  const gateway = createFeishuConversationGateway({
+    dbPath,
+    accountRef: 'cli_app_a',
+    authorize: async () => true,
+    coreIntake: {
+      async accept(message, acceptance) {
+        if (message.source.messageId === slow.messageId) {
+          slowEntered.resolve();
+          await releaseSlow.promise;
+        }
+        return durableCore.accept(message, acceptance);
+      },
+    },
+    workerId: 'gateway-fast-handoff',
+    concurrency: 2,
+    clock: () => 1_788_220_800_000,
+    pollIntervalMs: 1,
+  });
+  let fastAccept;
+  try {
+    fastAccept = gateway.accept(fastRaw);
+    await slowEntered.promise;
+    const result = await Promise.race([
+      fastAccept,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error('fast durable receipt waited for another lane batch item')),
+        500,
+      )),
+    ]);
+    assert.equal(result.receipt.conversationLaneKey, 'feishu:cli_app_a:group:oc-new-fast:chat');
+    assert.equal(durableCore.acceptedEffects().length, 1);
+    releaseSlow.resolve();
+    await gateway.recover();
+    assert.equal(durableCore.acceptedEffects().length, 2);
+  } finally {
+    releaseSlow.resolve();
+    await Promise.allSettled([fastAccept, gateway.close()].filter(Boolean));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('recover upgrades a legacy pending payload without waiting for a new platform replay', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-gateway-legacy-recover-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const raw = event({ eventId: 'evt-legacy-pending', messageId: 'om-legacy-pending' });
+  const legacyEnvelope = normalizeInboundMessageEvent(raw);
+  const seed = openInboundEventInbox({ dbPath, clock: () => 1_788_220_800_000 });
+  seed.receive({
+    eventId: legacyEnvelope.eventId,
+    messageId: legacyEnvelope.messageId,
+    payload: legacyEnvelope.payload,
+  });
+  seed.close();
+
+  const core = createInMemoryCoreMessageIntake();
+  const gateway = createFeishuConversationGateway({
+    dbPath,
+    accountRef: 'cli_app_a',
+    authorize: async () => true,
+    coreIntake: core,
+    workerId: 'gateway-legacy-recover',
+    clock: () => 1_788_220_800_001,
+    pollIntervalMs: 1,
+  });
+  try {
+    assert.deepEqual(await gateway.recover(), {
+      claimed: 1,
+      committed: 1,
+      failed: 0,
+      deadLettered: 0,
+    });
+    assert.equal(core.acceptedEffects().length, 1);
+    const replay = await gateway.accept(raw);
+    assert.equal(replay.status, 'duplicate');
+    assert.equal(core.acceptedEffects().length, 1);
+  } finally {
+    await gateway.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });

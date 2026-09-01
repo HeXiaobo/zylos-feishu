@@ -130,12 +130,13 @@ function normalizeInbound(input) {
   if (!eventId && !messageId) throw new TypeError('inbound event requires eventId or messageId');
   const payloadJson = serializeJson(requireRecord(request.payload, 'inbound event.payload'), 'inbound event.payload');
   const computedFingerprint = fingerprint(payloadJson);
-  const legacyPayloadJson = request.legacyPayload === undefined
+  const suppliedLegacyPayloadJson = request.legacyPayload === undefined
     ? null
     : serializeJson(
       requireRecord(request.legacyPayload, 'inbound event.legacyPayload'),
       'inbound event.legacyPayload',
     );
+  const legacyPayloadJson = legacy ? payloadJson : suppliedLegacyPayloadJson;
   const payloadHash = request.payloadHash === undefined
     ? `sha256:${computedFingerprint}`
     : requireText(request.payloadHash, 'inbound event.payloadHash');
@@ -144,6 +145,7 @@ function normalizeInbound(input) {
   }
   return {
     legacy,
+    writerProvenance: legacy ? 'legacy-v0' : 'namespaced-v1',
     adapterId: legacy ? null : requireText(request.adapterId, 'inbound event.adapterId'),
     accountRef: legacy ? null : requireText(request.accountRef, 'inbound event.accountRef'),
     eventType: legacy ? null : requireText(request.eventType, 'inbound event.eventType'),
@@ -214,6 +216,8 @@ function initializeSchema(database) {
       lane_sequence INTEGER,
       source_order_json TEXT,
       normalized_payload_json TEXT,
+      writer_provenance TEXT,
+      legacy_payload_json TEXT,
       CHECK (event_id IS NOT NULL OR message_id IS NOT NULL)
     );
 
@@ -241,6 +245,8 @@ function initializeSchema(database) {
     ['lane_sequence', 'INTEGER'],
     ['source_order_json', 'TEXT'],
     ['normalized_payload_json', 'TEXT'],
+    ['writer_provenance', 'TEXT'],
+    ['legacy_payload_json', 'TEXT'],
   ];
   for (const [name, type] of additiveColumns) {
     if (!columns.has(name)) {
@@ -347,6 +353,12 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
     WHERE x.adapter_id = ? AND x.account_ref = ? AND x.event_type = ?
       AND x.kind = ? AND x.value = ?
   `);
+  const selectSourceIdentityAcrossNamespaces = database.prepare(`
+    SELECT i.*
+    FROM feishu_inbound_source_identities x
+    JOIN feishu_inbound_inbox i ON i.id = x.inbox_id
+    WHERE x.kind = ? AND x.value = ?
+  `);
   const insertSourceIdentity = database.prepare(`
     INSERT INTO feishu_inbound_source_identities (
       adapter_id, account_ref, event_type, kind, value, inbox_id
@@ -369,6 +381,21 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
         : selectIdentity.get(kind, value)
     )).filter(Boolean);
     return [...new Map(rows.map((row) => [row.id, row])).values()];
+  }
+
+  function rowsForSourceIdentitiesAcrossNamespaces(pairs) {
+    const rows = pairs.flatMap(({ kind, value }) => (
+      selectSourceIdentityAcrossNamespaces.all(kind, value)
+    ));
+    return [...new Map(rows.map((row) => [row.id, row])).values()];
+  }
+
+  function ensureLegacyIdentity(pair, inboxId) {
+    const existing = selectIdentity.get(pair.kind, pair.value);
+    if (existing && existing.id !== inboxId) {
+      throw domainError('IDENTITY_CONFLICT', 'legacy inbound identity belongs to another inbox entry');
+    }
+    if (!existing) insertIdentity.run(pair.kind, pair.value, inboxId);
   }
 
   function ensureSourceIdentity(namespace, pair, inboxId) {
@@ -412,12 +439,46 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
     return next;
   }
 
+  function isVerifiedLegacyWriter(row) {
+    if (row.writer_provenance === 'legacy-v0') return true;
+    return row.writer_provenance === null
+      && row.adapter_id === null
+      && (row.payload_hash === null
+        || row.payload_hash === `sha256:${row.request_fingerprint}`);
+  }
+
+  function legacyPayloadMatches(row, candidatePayloadJson) {
+    const storedPayloadJson = row.legacy_payload_json
+      ?? (isVerifiedLegacyWriter(row) ? row.payload_json : null);
+    if (storedPayloadJson === null) return false;
+    if (fingerprint(storedPayloadJson) === fingerprint(candidatePayloadJson)) return true;
+    const storedSemantic = legacySemanticFingerprint(storedPayloadJson);
+    const candidateSemantic = legacySemanticFingerprint(candidatePayloadJson);
+    return storedSemantic !== null
+      && candidateSemantic !== null
+      && storedSemantic === candidateSemantic;
+  }
+
   const receiveTransaction = database.transaction((input) => {
     const normalized = normalizeInbound(input);
     const pairs = identityPairs(normalized);
     const namespace = normalized.legacy ? null : normalized;
     let existingRows = rowsForIdentities(pairs, namespace);
     let bridgeLegacyIdentities = false;
+    if (existingRows.length === 0 && normalized.legacy) {
+      const sourceRows = rowsForSourceIdentitiesAcrossNamespaces(pairs);
+      if (sourceRows.length > 1) {
+        throw domainError('IDENTITY_CONFLICT', 'legacy identity is ambiguous across source namespaces');
+      }
+      if (sourceRows.length === 1) {
+        const existing = sourceRows[0];
+        if (!legacyPayloadMatches(existing, normalized.payloadJson)) {
+          throw domainError('IDEMPOTENCY_CONFLICT', 'legacy inbound identity belongs to different payload');
+        }
+        for (const pair of pairs) ensureLegacyIdentity(pair, existing.id);
+        return { created: false, entry: toView(selectById.get(existing.id)) };
+      }
+    }
     if (existingRows.length === 0 && !normalized.legacy
       && normalized.legacyRequestFingerprint !== null) {
       const legacyRows = rowsForIdentities(pairs).filter((row) => (
@@ -443,7 +504,7 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
         const legacyPayloadIntegrity = fingerprint(existing.payload_json)
           === existing.request_fingerprint;
         const existingSemanticFingerprint = legacySemanticFingerprint(existing.payload_json);
-        const legacyFingerprintMatches = existing.payload_hash === null
+        const legacyFingerprintMatches = isVerifiedLegacyWriter(existing)
           && legacyPayloadIntegrity
           && (existing.request_fingerprint === normalized.legacyRequestFingerprint
             || (existingSemanticFingerprint !== null
@@ -462,7 +523,9 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
           UPDATE feishu_inbound_inbox
           SET adapter_id = ?, account_ref = ?, event_type = ?, payload_hash = ?,
               conversation_lane_key = ?, lane_sequence = ?, source_order_json = ?,
-              normalized_payload_json = ?, version = version + 1, updated_at = ?
+              normalized_payload_json = ?, writer_provenance = 'namespaced-v1',
+              legacy_payload_json = COALESCE(legacy_payload_json, ?),
+              version = version + 1, updated_at = ?
           WHERE id = ?
         `).run(
           normalized.adapterId,
@@ -473,6 +536,7 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
           laneSequence,
           normalized.sourceOrderJson,
           normalized.payloadJson,
+          normalized.legacyPayloadJson,
           now,
           existing.id,
         );
@@ -485,6 +549,13 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
         ).values()];
         for (const pair of uniquePairs) ensureSourceIdentity(normalized, pair, existing.id);
         return { created: false, entry: toView(selectById.get(existing.id)) };
+      }
+      if (normalized.legacy) {
+        if (!legacyPayloadMatches(existing, normalized.payloadJson)) {
+          throw domainError('IDEMPOTENCY_CONFLICT', 'legacy inbound identity belongs to different payload');
+        }
+        for (const pair of pairs) ensureLegacyIdentity(pair, existing.id);
+        return { created: false, entry: toView(existing) };
       }
       const existingPayloadHash = existing.payload_hash ?? `sha256:${existing.request_fingerprint}`;
       const eventBinding = normalized.legacy || !normalized.eventId ? null : selectSourceIdentity.get(
@@ -526,8 +597,9 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
         event_id, message_id, request_fingerprint, payload_json, status,
         available_at, received_at, updated_at,
         adapter_id, account_ref, event_type, payload_hash,
-        conversation_lane_key, lane_sequence, source_order_json
-      ) VALUES (?, ?, ?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        conversation_lane_key, lane_sequence, source_order_json,
+        writer_provenance, legacy_payload_json
+      ) VALUES (?, ?, ?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       normalized.eventId,
       normalized.messageId,
@@ -539,14 +611,16 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
       normalized.adapterId,
       normalized.accountRef,
       normalized.eventType,
-      normalized.payloadHash,
+      normalized.legacy ? null : normalized.payloadHash,
       normalized.conversationLaneKey,
       laneSequence,
       normalized.sourceOrderJson,
+      normalized.writerProvenance,
+      normalized.legacyPayloadJson,
     );
     const id = Number(inserted.lastInsertRowid);
     for (const pair of pairs) {
-      if (normalized.legacy) insertIdentity.run(pair.kind, pair.value, id);
+      if (normalized.legacy) ensureLegacyIdentity(pair, id);
       else ensureSourceIdentity(normalized, pair, id);
     }
     return { created: true, entry: toView(selectById.get(id)) };
@@ -702,6 +776,14 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
     fail(input) {
       return failTransaction.immediate(requireRecord(input, 'inbound failure'));
     },
+    pendingLegacy() {
+      return database.prepare(`
+        SELECT * FROM feishu_inbound_inbox
+        WHERE adapter_id IS NULL
+          AND status IN ('received', 'failed', 'processing')
+        ORDER BY id
+      `).all().map(toView);
+    },
     close() {
       database.close();
     },
@@ -744,42 +826,55 @@ export async function processInboundEventInboxOnce({
   if (!laneCoordinator || typeof laneCoordinator.submit !== 'function') {
     throw new TypeError('coordinator must provide a submit function');
   }
-  await Promise.all(claimed.map((entry) => laneCoordinator.submit({
-    conversationLaneKey: entry.conversationLaneKey ?? `legacy-inbox:${entry.id}`,
-    laneSequence: entry.laneSequence ?? 1,
-  }, async () => {
-    let result;
+  let firstFailure = null;
+  const submissions = claimed.map((entry) => {
     try {
-      const metadata = {
-        inboxId: entry.id,
-        eventId: entry.eventId,
-        messageId: entry.messageId,
-        attempt: entry.attempt,
-      };
-      if (entry.conversationLaneKey !== null) {
-        Object.assign(metadata, {
-          adapterId: entry.adapterId,
-          accountRef: entry.accountRef,
-          eventType: entry.eventType,
-          payloadHash: entry.payloadHash,
-          conversationLaneKey: entry.conversationLaneKey,
-          laneSequence: entry.laneSequence,
-          sourceOrder: entry.sourceOrder,
-        });
-      }
-      result = await handleMessage(entry.payload, Object.freeze(metadata));
+      return laneCoordinator.submit({
+        conversationLaneKey: entry.conversationLaneKey ?? `legacy-inbox:${entry.id}`,
+        laneSequence: entry.laneSequence ?? 1,
+      }, async () => {
+        let result;
+        try {
+          const metadata = {
+            inboxId: entry.id,
+            eventId: entry.eventId,
+            messageId: entry.messageId,
+            attempt: entry.attempt,
+          };
+          if (entry.conversationLaneKey !== null) {
+            Object.assign(metadata, {
+              adapterId: entry.adapterId,
+              accountRef: entry.accountRef,
+              eventType: entry.eventType,
+              payloadHash: entry.payloadHash,
+              conversationLaneKey: entry.conversationLaneKey,
+              laneSequence: entry.laneSequence,
+              sourceOrder: entry.sourceOrder,
+            });
+          }
+          result = await handleMessage(entry.payload, Object.freeze(metadata));
+        } catch (error) {
+          const retryAfterMs = Math.min(
+            maxRetryDelayMs,
+            baseRetryDelayMs * (2 ** Math.min(entry.attempt - 1, 30)),
+          );
+          const settled = inbox.fail({ receipt: entry.receipt, error, retryAfterMs });
+          if (settled.status === 'dead_letter') summary.deadLettered += 1;
+          else summary.failed += 1;
+          return;
+        }
+        inbox.commit({ receipt: entry.receipt, result });
+        summary.committed += 1;
+      }).catch((error) => {
+        if (firstFailure === null) firstFailure = error;
+        throw error;
+      });
     } catch (error) {
-      const retryAfterMs = Math.min(
-        maxRetryDelayMs,
-        baseRetryDelayMs * (2 ** Math.min(entry.attempt - 1, 30)),
-      );
-      const settled = inbox.fail({ receipt: entry.receipt, error, retryAfterMs });
-      if (settled.status === 'dead_letter') summary.deadLettered += 1;
-      else summary.failed += 1;
-      return;
+      if (firstFailure === null) firstFailure = error;
+      return Promise.reject(error);
     }
-    inbox.commit({ receipt: entry.receipt, result });
-    summary.committed += 1;
-  })));
+  });
+  await Promise.allSettled(submissions);
+  if (firstFailure) throw firstFailure;
   return Object.freeze(summary);
 }

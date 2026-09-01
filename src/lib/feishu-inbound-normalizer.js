@@ -102,8 +102,9 @@ function parseContent(message) {
   };
 }
 
-function normalizeIssuedAt(data, clock) {
-  const raw = data.create_time ?? data._timestamp ?? data.header?.create_time;
+function normalizeIssuedAt(input, event, clock) {
+  const raw = event.create_time ?? event._timestamp
+    ?? input.create_time ?? input._timestamp ?? input.header?.create_time;
   const milliseconds = raw === undefined || raw === null || raw === ''
     ? clock()
     : Number(raw);
@@ -132,8 +133,11 @@ export function normalizeFeishuInboundMessage(data, {
   priority = 2,
 } = {}) {
   const input = requireRecord(data, 'Feishu inbound message');
-  const message = requireRecord(input.message, 'Feishu inbound message.message');
-  const sender = requireRecord(input.sender, 'Feishu inbound message.sender');
+  const event = input.event === undefined
+    ? input
+    : requireRecord(input.event, 'Feishu inbound message.event');
+  const message = requireRecord(event.message, 'Feishu inbound message.message');
+  const sender = requireRecord(event.sender, 'Feishu inbound message.sender');
   const normalizedAccountRef = requireText(accountRef, 'Feishu accountRef');
   const eventId = requireText(
     explicitEventId || input.event_id || input.header?.event_id,
@@ -164,7 +168,9 @@ export function normalizeFeishuInboundMessage(data, {
   if (Array.from(text).length > MAX_TEXT_LENGTH) {
     throw new TypeError('Feishu inbound message content is too long');
   }
-  if (!Number.isSafeInteger(priority)) throw new TypeError('priority must be an integer');
+  if (![1, 2, 3].includes(priority)) {
+    throw new TypeError('priority must be one of 1, 2, or 3');
+  }
 
   const conversationLaneKey = laneKey({
     accountRef: normalizedAccountRef,
@@ -219,7 +225,7 @@ export function normalizeFeishuInboundMessage(data, {
       idempotencyKey: ['feishu', normalizedAccountRef, eventType, eventId].join(':'),
       traceId: stableId('trace:feishu', logicalFields),
       causationId: eventId,
-      issuedAt: normalizeIssuedAt(input, clock),
+      issuedAt: normalizeIssuedAt(input, event, clock),
       source: Object.freeze({
         adapterId: 'feishu',
         accountRef: normalizedAccountRef,

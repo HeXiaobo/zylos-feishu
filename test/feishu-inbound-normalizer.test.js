@@ -146,3 +146,34 @@ test('transport timestamps and event IDs do not masquerade as sourceOrder', () =
   assert.equal(sdk.sourceOrder, null);
   assert.equal(webhook.sourceOrder, null);
 });
+
+test('normalizes the real webhook event envelope and accepts only contract priorities', () => {
+  const flat = inboundMessage({}, { eventId: 'discarded-flat-event' });
+  const webhook = {
+    header: {
+      event_id: 'evt-real-webhook',
+      event_type: 'im.message.receive_v1',
+      create_time: '1788220800999',
+    },
+    event: {
+      message: flat.message,
+      sender: flat.sender,
+    },
+  };
+
+  for (const priority of [1, 2, 3]) {
+    const normalized = normalizeFeishuInboundMessage(webhook, {
+      accountRef: 'cli_app_a',
+      priority,
+    });
+    assert.equal(normalized.eventId, 'evt-real-webhook');
+    assert.equal(normalized.message.source.messageId, 'om-p2p-1');
+    assert.equal(normalized.message.policy.priority, priority);
+  }
+  for (const priority of [0, 4, 1.5]) {
+    assert.throws(
+      () => normalizeFeishuInboundMessage(webhook, { accountRef: 'cli_app_a', priority }),
+      /priority must be one of 1, 2, or 3/,
+    );
+  }
+});

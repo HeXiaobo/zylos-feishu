@@ -81,6 +81,7 @@ export function createFeishuConversationGateway({
   let resolveDrain = null;
   let closePromise = null;
   let drainFailure = null;
+  let globalDrain = null;
 
   function recordDrainFailure(error) {
     if (lifecycle === 'draining' && drainFailure === null) drainFailure = error;
@@ -95,13 +96,7 @@ export function createFeishuConversationGateway({
     }
   }
 
-  function runOperation(kind, execute) {
-    if (lifecycle !== 'open') {
-      return Promise.reject(gatewayError(
-        'GATEWAY_DRAINING',
-        'Feishu Conversation Gateway is draining',
-      ));
-    }
+  function trackStartedOperation(kind, execute) {
     activeOperations += 1;
     return Promise.resolve()
       .then(execute)
@@ -120,6 +115,16 @@ export function createFeishuConversationGateway({
         },
       )
       .finally(finishOperation);
+  }
+
+  function runOperation(kind, execute) {
+    if (lifecycle !== 'open') {
+      return Promise.reject(gatewayError(
+        'GATEWAY_DRAINING',
+        'Feishu Conversation Gateway is draining',
+      ));
+    }
+    return trackStartedOperation(kind, execute);
   }
 
   function waitForActiveOperations() {
@@ -160,6 +165,35 @@ export function createFeishuConversationGateway({
     };
   }
 
+  function upgradeLegacyPending() {
+    for (const entry of inbox.pendingLegacy()) {
+      const legacyPayload = entry.payload;
+      const rawEvent = {
+        event_id: entry.eventId ?? `legacy-inbox:${entry.id}`,
+        create_time: legacyPayload._timestamp,
+        message: legacyPayload.message,
+        sender: legacyPayload.sender,
+      };
+      const normalized = normalizeFeishuInboundMessage(rawEvent, {
+        accountRef: normalizedAccountRef,
+        eventId: rawEvent.event_id,
+        clock,
+      });
+      inbox.receive({
+        adapterId: normalized.adapterId,
+        accountRef: normalized.accountRef,
+        eventType: normalized.eventType,
+        eventId: normalized.eventId,
+        messageId: normalized.messageId,
+        payload: normalized.message,
+        payloadHash: normalized.payloadHash,
+        legacyPayload,
+        conversationLaneKey: normalized.conversationLaneKey,
+        sourceOrder: normalized.sourceOrder,
+      });
+    }
+  }
+
   async function processCycle(limit = concurrency) {
     cycle += 1;
     const summary = await processInboundEventInboxOnce({
@@ -185,17 +219,42 @@ export function createFeishuConversationGateway({
     return summary;
   }
 
+  function ensureGlobalDrain() {
+    if (globalDrain) return globalDrain;
+    const operation = trackStartedOperation('drain', async () => {
+      const total = { claimed: 0, committed: 0, failed: 0, deadLettered: 0 };
+      for (;;) {
+        const summary = await processCycle(concurrency);
+        for (const key of Object.keys(total)) total[key] += summary[key];
+        if (summary.claimed === 0) return Object.freeze(total);
+      }
+    });
+    const shared = operation.finally(() => {
+      if (globalDrain === shared) globalDrain = null;
+    });
+    shared.catch(() => {});
+    globalDrain = shared;
+    return shared;
+  }
+
   async function settle(identity) {
     for (;;) {
       const current = inbox.query(identity);
       if (!current) throw new Error('durably received Feishu message disappeared');
       if (current.status === 'committed') return current.result;
       if (current.status === 'dead_letter') throw deadLetterError(current);
-      const summary = await processCycle(concurrency);
+      const outcome = await Promise.race([
+        ensureGlobalDrain().then(
+          (summary) => ({ summary }),
+          (error) => ({ error }),
+        ),
+        delay(pollIntervalMs).then(() => ({ tick: true })),
+      ]);
       const after = inbox.query(identity);
       if (after.status === 'committed') return after.result;
       if (after.status === 'dead_letter') throw deadLetterError(after);
-      if (summary.claimed === 0) await delay(pollIntervalMs);
+      if (outcome.error) throw outcome.error;
+      if (outcome.summary?.claimed === 0) await delay(pollIntervalMs);
     }
   }
 
@@ -233,6 +292,7 @@ export function createFeishuConversationGateway({
           conversationLaneKey: normalized.conversationLaneKey,
           sourceOrder: normalized.sourceOrder,
         });
+        ensureGlobalDrain();
         const receipt = await settleEntry(received.entry, identityFor(normalized));
         return Object.freeze({
           status: received.created ? 'accepted' : 'duplicate',
@@ -242,12 +302,8 @@ export function createFeishuConversationGateway({
     },
     recover() {
       return runOperation('recover', async () => {
-        const total = { claimed: 0, committed: 0, failed: 0, deadLettered: 0 };
-        for (;;) {
-          const summary = await processCycle(concurrency);
-          for (const key of Object.keys(total)) total[key] += summary[key];
-          if (summary.claimed === 0) return Object.freeze(total);
-        }
+        upgradeLegacyPending();
+        return ensureGlobalDrain();
       });
     },
     close: closeGateway,

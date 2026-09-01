@@ -592,3 +592,173 @@ test('worker processes claimed payloads and independently settles poison events'
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('batch settlement waits for every started lane before surfacing the first lease error', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-settle-barrier-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const releaseHealthy = (() => {
+    let resolve;
+    const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
+    return { promise, resolve };
+  })();
+  const leaseFailureObserved = (() => {
+    let resolve;
+    const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
+    return { promise, resolve };
+  })();
+  try {
+    const durable = openInboundEventInbox({
+      dbPath,
+      clock: () => 1_787_900_000_000,
+      maxAttempts: 3,
+    });
+    for (const suffix of ['lease-lost', 'healthy']) {
+      durable.receive({
+        adapterId: 'feishu',
+        accountRef: 'cli_app_a',
+        eventType: 'im.message.receive_v1',
+        eventId: `evt_${suffix}`,
+        messageId: `om_${suffix}`,
+        payload: { kind: suffix },
+        conversationLaneKey: `feishu:cli_app_a:group:oc_${suffix}:chat`,
+        sourceOrder: null,
+      });
+    }
+    const inbox = {
+      claim: durable.claim,
+      fail: durable.fail,
+      commit(input) {
+        if (input.result.kind === 'lease-lost') {
+          const error = Object.assign(new Error('synthetic lease loss'), { code: 'LEASE_LOST' });
+          leaseFailureObserved.resolve();
+          throw error;
+        }
+        return durable.commit(input);
+      },
+    };
+    const processing = processInboundEventInboxOnce({
+      inbox,
+      workerId: 'worker-settle-barrier',
+      leaseMs: 5_000,
+      limit: 10,
+      concurrency: 2,
+      handleMessage: async (payload) => {
+        if (payload.kind === 'healthy') await releaseHealthy.promise;
+        return payload;
+      },
+    });
+
+    await leaseFailureObserved.promise;
+    const early = await Promise.race([
+      processing.then(() => 'settled', () => 'settled'),
+      new Promise((resolve) => setImmediate(() => resolve('pending'))),
+    ]);
+    assert.equal(early, 'pending');
+    releaseHealthy.resolve();
+    await assert.rejects(processing, (error) => error.code === 'LEASE_LOST');
+    assert.equal(durable.query({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      eventId: 'evt_healthy',
+    }).status, 'committed');
+    durable.close();
+  } finally {
+    releaseHealthy.resolve();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('legacy and namespaced writers converge atomically in both arrival orders', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-mixed-writers-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const raw = (suffix) => ({
+    event_id: `evt_mixed_${suffix}`,
+    create_time: '1787900000000',
+    message: {
+      message_id: `om_mixed_${suffix}`,
+      chat_id: `oc_mixed_${suffix}`,
+      chat_type: 'group',
+      message_type: 'text',
+      content: JSON.stringify({ text: `mixed ${suffix}` }),
+    },
+    sender: {
+      sender_id: { open_id: 'ou_mixed_sender' },
+      sender_type: 'user',
+      tenant_key: 'tenant_mixed',
+    },
+  });
+  const receiveV1 = (inbox, source) => {
+    const normalized = normalizeFeishuInboundMessage(source, { accountRef: 'cli_app_a' });
+    return inbox.receive({
+      adapterId: normalized.adapterId,
+      accountRef: normalized.accountRef,
+      eventType: normalized.eventType,
+      eventId: normalized.eventId,
+      messageId: normalized.messageId,
+      payload: normalized.message,
+      payloadHash: normalized.payloadHash,
+      legacyPayload: normalizeInboundMessageEvent(source).payload,
+      conversationLaneKey: normalized.conversationLaneKey,
+      sourceOrder: normalized.sourceOrder,
+    });
+  };
+  try {
+    let inbox = openInboundEventInbox({ dbPath, clock: () => 2, maxAttempts: 3 });
+
+    const legacyFirstRaw = raw('legacy_first');
+    const legacyEnvelope = normalizeInboundMessageEvent(legacyFirstRaw);
+    const legacyFirst = inbox.receive({
+      eventId: legacyEnvelope.eventId,
+      messageId: legacyEnvelope.messageId,
+      payload: legacyEnvelope.payload,
+    });
+    inbox.close();
+    const previousWriter = new Database(dbPath);
+    const previousRow = previousWriter.prepare(`
+      SELECT request_fingerprint FROM feishu_inbound_inbox WHERE id = ?
+    `).get(legacyFirst.entry.id);
+    previousWriter.prepare(`
+      UPDATE feishu_inbound_inbox
+      SET writer_provenance = NULL, payload_hash = ?
+      WHERE id = ?
+    `).run(`sha256:${previousRow.request_fingerprint}`, legacyFirst.entry.id);
+    previousWriter.close();
+    inbox = openInboundEventInbox({ dbPath, clock: () => 3, maxAttempts: 3 });
+
+    const legacyBridged = receiveV1(inbox, legacyFirstRaw);
+    assert.equal(legacyBridged.created, false);
+    assert.equal(legacyBridged.entry.id, legacyFirst.entry.id);
+    assert.equal(legacyBridged.entry.laneSequence, 1);
+
+    const namespacedFirstRaw = raw('namespaced_first');
+    const namespacedFirst = receiveV1(inbox, namespacedFirstRaw);
+    const namespacedEnvelope = normalizeInboundMessageEvent(namespacedFirstRaw);
+    const legacyReplay = inbox.receive({
+      eventId: namespacedEnvelope.eventId,
+      messageId: namespacedEnvelope.messageId,
+      payload: namespacedEnvelope.payload,
+    });
+    assert.equal(legacyReplay.created, false);
+    assert.equal(legacyReplay.entry.id, namespacedFirst.entry.id);
+
+    const changedPayload = {
+      ...namespacedEnvelope.payload,
+      message: {
+        ...namespacedEnvelope.payload.message,
+        content: JSON.stringify({ text: 'mixed writer payload drift' }),
+      },
+    };
+    assert.throws(
+      () => inbox.receive({
+        eventId: namespacedEnvelope.eventId,
+        messageId: namespacedEnvelope.messageId,
+        payload: changedPayload,
+      }),
+      (error) => error.code === 'IDEMPOTENCY_CONFLICT',
+    );
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
