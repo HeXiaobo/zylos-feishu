@@ -174,8 +174,9 @@ export function createFeishuConversationGateway({
   }
 
   function upgradeLegacyPending() {
-    let deadLettered = 0;
-    for (const entry of inbox.pendingLegacy()) {
+    const pending = inbox.pendingLegacy();
+    let { deadLettered } = pending;
+    for (const entry of pending.entries) {
       try {
         const legacyPayload = entry.payload;
         const rawEvent = {

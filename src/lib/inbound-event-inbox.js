@@ -313,6 +313,16 @@ function initializeSchema(database) {
 
 function toView(row) {
   if (!row) return null;
+  let payload;
+  try {
+    payload = JSON.parse(row.normalized_payload_json ?? row.payload_json);
+  } catch (error) {
+    if (row.status !== 'dead_letter') throw error;
+    payload = Object.freeze({
+      quarantined: true,
+      reason: 'invalid stored payload JSON',
+    });
+  }
   return {
     id: row.id,
     eventId: row.event_id,
@@ -324,7 +334,7 @@ function toView(row) {
     conversationLaneKey: row.conversation_lane_key,
     laneSequence: row.lane_sequence,
     sourceOrder: row.source_order_json === null ? null : JSON.parse(row.source_order_json),
-    payload: JSON.parse(row.normalized_payload_json ?? row.payload_json),
+    payload,
     status: row.status,
     attempt: row.attempt,
     version: row.version,
@@ -901,12 +911,26 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
       return failTransaction.immediate(requireRecord(input, 'inbound failure'));
     },
     pendingLegacy() {
-      return database.prepare(`
+      const entries = [];
+      let deadLettered = 0;
+      const rows = database.prepare(`
         SELECT * FROM feishu_inbound_inbox
         WHERE adapter_id IS NULL
           AND status IN ('received', 'failed', 'processing')
         ORDER BY id
-      `).all().map(toView);
+      `).all();
+      for (const row of rows) {
+        try {
+          entries.push(toView(row));
+        } catch (error) {
+          quarantineLegacyTransaction.immediate({ id: row.id, error });
+          deadLettered += 1;
+        }
+      }
+      return Object.freeze({
+        entries: Object.freeze(entries),
+        deadLettered,
+      });
     },
     quarantineLegacy(input) {
       return quarantineLegacyTransaction.immediate(

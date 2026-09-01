@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import Database from 'better-sqlite3';
+
 import { createInMemoryCoreMessageIntake } from '../src/lib/core-message-intake-port.js';
 import { createFeishuConversationGateway } from '../src/lib/feishu-conversation-gateway.js';
 import { normalizeFeishuInboundMessage } from '../src/lib/feishu-inbound-normalizer.js';
@@ -582,12 +584,22 @@ test('recover quarantines one malformed legacy row and continues healthy legacy 
     messageId: 'om-legacy-malformed',
     payload: { garbage: true },
   });
+  const corrupt = seed.receive({
+    eventId: 'evt-legacy-corrupt-json',
+    messageId: 'om-legacy-corrupt-json',
+    payload: { placeholder: true },
+  });
   seed.receive({
     eventId: healthyEnvelope.eventId,
     messageId: healthyEnvelope.messageId,
     payload: healthyEnvelope.payload,
   });
   seed.close();
+  const corruptDatabase = new Database(dbPath);
+  corruptDatabase.prepare(`
+    UPDATE feishu_inbound_inbox SET payload_json = ? WHERE id = ?
+  `).run('{invalid-json', corrupt.entry.id);
+  corruptDatabase.close();
 
   const core = createInMemoryCoreMessageIntake();
   const gateway = createFeishuConversationGateway({
@@ -604,7 +616,7 @@ test('recover quarantines one malformed legacy row and continues healthy legacy 
       claimed: 1,
       committed: 1,
       failed: 0,
-      deadLettered: 1,
+      deadLettered: 2,
     });
     assert.equal(core.acceptedEffects().length, 1);
   } finally {
@@ -616,6 +628,12 @@ test('recover quarantines one malformed legacy row and continues healthy legacy 
     const malformed = verify.query({ eventId: 'evt-legacy-malformed' });
     assert.equal(malformed.status, 'dead_letter');
     assert.match(malformed.lastError, /legacy upgrade/i);
+    const corruptJson = verify.query({ eventId: 'evt-legacy-corrupt-json' });
+    assert.equal(corruptJson.status, 'dead_letter');
+    assert.deepEqual(corruptJson.payload, {
+      quarantined: true,
+      reason: 'invalid stored payload JSON',
+    });
     assert.equal(verify.query({
       adapterId: 'feishu',
       accountRef: 'cli_app_a',
