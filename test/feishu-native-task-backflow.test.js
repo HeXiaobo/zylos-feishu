@@ -155,6 +155,61 @@ test('native task backflow rejects unauthorized actors and repairs version or un
   }
 });
 
+test('malformed projection markers reject before actor verification or Core command I/O', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-native-task-marker-'));
+  const submitted = [];
+  let verifiedActors = 0;
+  try {
+    const inbox = createTaskV2StatusInbox({ directory, clock: () => 1_788_000_000_000 });
+    let markerOverride;
+    const backflow = createFeishuNativeTaskBackflow({
+      inbox,
+      identity: { appId: 'cli-app', tenantRef: 'tenant-1', accountRef: 'acct-1' },
+      resolveProjection: async () => projection(markerOverride),
+      verifyActor: async () => {
+        verifiedActors += 1;
+        return null;
+      },
+      taskCommandPort: { submit: command => (submitted.push(command), { accepted: true }) },
+    });
+    backflow.ingest(nativeEvent({ eventId: 'evt-malformed-marker' }));
+    const [event] = inbox.pending({ limit: 1 });
+    const variants = [
+      ['taskId=missing', { taskId: undefined }],
+      ['taskId=whitespace', { taskId: ' task-1' }],
+      ['coreVersion=null', { coreVersion: null }],
+      ['coreVersion=string', { coreVersion: '7' }],
+      ['coreVersion=zero', { coreVersion: 0 }],
+      ['coreVersion=negative', { coreVersion: -1 }],
+      ['coreVersion=fractional', { coreVersion: 7.5 }],
+      ['coreVersion=NaN', { coreVersion: Number.NaN }],
+      ['coreVersion=Infinity', { coreVersion: Number.POSITIVE_INFINITY }],
+      ['coreVersion=unsafe', { coreVersion: Number.MAX_SAFE_INTEGER + 1 }],
+      ['tenantRef=missing', { tenantRef: undefined }],
+      ['effectId=whitespace', { effectId: ' effect-task-1-v7' }],
+      ['payloadHash=padded', {
+        payloadHash: ' sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      }],
+      ['legacy identity', {
+        tenantRef: null, accountRef: null, effectId: null, payloadHash: null,
+      }],
+    ];
+    for (const [name, override] of variants) {
+      markerOverride = override;
+      assert.deepEqual(await backflow.handle(event), {
+        status: 'rejected',
+        code: 'PROJECTION_IDENTITY_DRIFT',
+        repair: 'reproject',
+      }, name);
+    }
+    assert.equal(verifiedActors, 0);
+    assert.equal(submitted.length, 0);
+    inbox.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('supported start/submit/reject/accept/update backflow commands preserve capability and loop suppression', async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-native-task-actions-'));
   const submitted = [];

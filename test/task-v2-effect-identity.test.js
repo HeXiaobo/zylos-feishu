@@ -156,6 +156,24 @@ test('Task v2 SDK refuses partial or cross-scope TaskEffect marker rewrites', as
       effectId: 'effect-task-1-v3',
       payloadHash: ' sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     },
+    {
+      schema: 'zylos.task-v2-projection/v1',
+      coreTaskId: 'task-1',
+      coreTaskVersion: '3',
+      tenantRef: 'tenant-1',
+      accountRef: 'acct-1',
+      effectId: 'effect-task-1-v3',
+      payloadHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    },
+    {
+      schema: 'zylos.task-v2-projection/v1',
+      coreTaskId: 'task-1',
+      coreTaskVersion: 0,
+      tenantRef: 'tenant-1',
+      accountRef: 'acct-1',
+      effectId: 'effect-task-1-v3',
+      payloadHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    },
   ];
   for (const marker of attemptedMarkers) {
     let patches = 0;

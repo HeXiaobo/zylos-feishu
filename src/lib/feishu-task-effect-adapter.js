@@ -4,7 +4,10 @@ import {
   createVerifiedTaskEffectSettlement,
   taskEffectPayloadHash,
 } from './task-effect-settlement.js';
-import { parseCanonicalSha256 } from './canonical-sha256.js';
+import {
+  parseCanonicalTaskV2Marker,
+  TASK_V2_MARKER_SCHEMA,
+} from './task-v2-marker.js';
 
 const CLAIM_FIELDS = new Set([
   'effect',
@@ -104,13 +107,22 @@ function normalizeClaim(value, identity) {
 }
 
 function effectIdentity(effect, identity) {
-  return Object.freeze({
+  const marker = parseCanonicalTaskV2Marker({
+    schema: TASK_V2_MARKER_SCHEMA,
     tenantRef: identity.tenantRef,
     accountRef: identity.accountRef,
     effectId: effect.effectId,
     payloadHash: taskEffectPayloadHash(effect),
     coreTaskId: effect.taskId,
     coreTaskVersion: effect.coreVersion,
+  }, 'TaskEffect projection marker');
+  return Object.freeze({
+    tenantRef: marker.tenantRef,
+    accountRef: marker.accountRef,
+    effectId: marker.effectId,
+    payloadHash: marker.payloadHash,
+    coreTaskId: marker.coreTaskId,
+    coreTaskVersion: marker.coreTaskVersion,
   });
 }
 
@@ -131,43 +143,51 @@ function receipt(outcome, claim, remote) {
   });
 }
 
-function isLegacyProjection(remote) {
-  return typeof remote.coreTaskId === 'string'
-    && remote.coreTaskId.trim() !== ''
-    && Number.isSafeInteger(remote.coreTaskVersion)
-    && remote.coreTaskVersion > 0
-    && [remote.tenantRef, remote.accountRef, remote.effectId, remote.payloadHash]
-      .every(value => value === null || value === undefined);
+function parseRemoteMarker(remote) {
+  const identityAbsent = ['tenantRef', 'accountRef', 'effectId', 'payloadHash']
+    .every(field => remote[field] === null || remote[field] === undefined);
+  try {
+    return parseCanonicalTaskV2Marker({
+      schema: TASK_V2_MARKER_SCHEMA,
+      coreTaskId: remote.coreTaskId,
+      coreTaskVersion: remote.coreTaskVersion,
+      ...(identityAbsent
+        ? {}
+        : {
+          tenantRef: remote.tenantRef,
+          accountRef: remote.accountRef,
+          effectId: remote.effectId,
+          payloadHash: remote.payloadHash,
+        }),
+    }, 'native Task projection marker');
+  } catch {
+    throw domainError(
+      'EXTERNAL_IDENTITY_CONFLICT',
+      `native Task projection identity mismatch: ${remote.guid}`,
+    );
+  }
 }
 
 function assertNoIdentityConflict(remote, identity) {
-  if (isLegacyProjection(remote) && remote.coreTaskId === identity.coreTaskId) {
+  const marker = parseRemoteMarker(remote);
+  if (marker.classification === 'legacy') {
+    if (marker.coreTaskId === identity.coreTaskId) {
+      throw domainError(
+        'LEGACY_PROJECTION_REQUIRES_ADOPTION',
+        `legacy native Task projection requires explicit adoption: ${remote.guid}`,
+      );
+    }
     throw domainError(
-      'LEGACY_PROJECTION_REQUIRES_ADOPTION',
-      `legacy native Task projection requires explicit adoption: ${remote.guid}`,
+      'EXTERNAL_IDENTITY_CONFLICT',
+      `native Task projection identity mismatch: ${remote.guid}`,
     );
   }
-  let markerHashCanonical = false;
-  try {
-    parseCanonicalSha256(remote.payloadHash, 'native Task projection.payloadHash');
-    markerHashCanonical = true;
-  } catch {
-    // Classification below converts malformed readback into a permanent
-    // external identity conflict rather than normalizing it.
-  }
-  const markerComplete = [
-    remote.tenantRef,
-    remote.accountRef,
-    remote.effectId,
-  ].every(value => typeof value === 'string' && value.trim() !== '')
-    && markerHashCanonical;
-  if (!markerComplete
-      || remote.coreTaskId !== identity.coreTaskId
-      || remote.tenantRef !== identity.tenantRef
-      || remote.accountRef !== identity.accountRef
-      || remote.effectId !== identity.effectId
-      || remote.payloadHash !== identity.payloadHash
-      || remote.coreTaskVersion !== identity.coreTaskVersion) {
+  if (marker.coreTaskId !== identity.coreTaskId
+      || marker.tenantRef !== identity.tenantRef
+      || marker.accountRef !== identity.accountRef
+      || marker.effectId !== identity.effectId
+      || marker.payloadHash !== identity.payloadHash
+      || marker.coreTaskVersion !== identity.coreTaskVersion) {
     throw domainError(
       'EXTERNAL_IDENTITY_CONFLICT',
       `native Task projection identity mismatch: ${remote.guid}`,

@@ -194,6 +194,48 @@ test('legacy Task marker requires a separate durable adoption transaction', asyn
   assert.equal(state.calls.some(([name]) => name === 'update'), false);
 });
 
+test('malformed legacy-style markers are external conflicts, never adoption candidates', async () => {
+  const invalidBaseFields = [
+    ['coreTaskId=empty', { coreTaskId: '' }],
+    ['coreTaskId=whitespace', { coreTaskId: ' task-1' }],
+    ['coreTaskId=String object', { coreTaskId: new String('task-1') }],
+    ['coreTaskVersion=missing', { coreTaskVersion: undefined }],
+    ['coreTaskVersion=null', { coreTaskVersion: null }],
+    ['coreTaskVersion=string', { coreTaskVersion: '1' }],
+    ['coreTaskVersion=zero', { coreTaskVersion: 0 }],
+    ['coreTaskVersion=negative', { coreTaskVersion: -1 }],
+    ['coreTaskVersion=fractional', { coreTaskVersion: 1.5 }],
+    ['coreTaskVersion=NaN', { coreTaskVersion: Number.NaN }],
+    ['coreTaskVersion=Infinity', { coreTaskVersion: Number.POSITIVE_INFINITY }],
+    ['coreTaskVersion=unsafe', { coreTaskVersion: Number.MAX_SAFE_INTEGER + 1 }],
+    ['coreTaskVersion=Number object', { coreTaskVersion: new Number(1) }],
+  ];
+
+  for (const [name, override] of invalidBaseFields) {
+    const state = harness();
+    state.remote = {
+      guid: 'guid-task-1',
+      url: 'https://example.invalid/task-1',
+      coreTaskId: 'task-1',
+      coreTaskVersion: 1,
+      tenantRef: null,
+      accountRef: null,
+      effectId: null,
+      payloadHash: null,
+      ...override,
+    };
+    await assert.rejects(
+      () => state.adapter().apply({
+        effect: effect(1), attempt: 1, leaseEpoch: 1, workerId: 'worker-a', generation: 0,
+      }),
+      error => error?.code === 'EXTERNAL_IDENTITY_CONFLICT'
+        && error?.retryable === false,
+      name,
+    );
+    assert.equal(state.calls.filter(([operation]) => operation === 'update').length, 0, name);
+  }
+});
+
 test('legacy Task marker cannot be adopted concurrently through the TaskEffect adapter', async () => {
   const state = harness();
   state.remote = {

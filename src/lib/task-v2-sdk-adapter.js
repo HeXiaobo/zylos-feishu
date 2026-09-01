@@ -1,7 +1,10 @@
-import { parseCanonicalSha256 } from './canonical-sha256.js';
+import {
+  parseCanonicalTaskV2Marker,
+  TASK_V2_MARKER_SCHEMA,
+  taskV2MarkerRecord,
+} from './task-v2-marker.js';
 
 const USER_ID_TYPE = 'open_id';
-const MARKER_SCHEMA = 'zylos.task-v2-projection/v1';
 const PERMANENT_FEISHU_CODES = new Set([99992402]);
 const MAX_LIST_PAGES = 1_000;
 
@@ -52,35 +55,42 @@ function normalizeEffectIdentity(value, task) {
   if (identity.coreTaskId !== task.id || identity.coreTaskVersion !== task.version) {
     throw new TypeError('effectIdentity does not match task identity/version');
   }
-  const payloadHash = parseCanonicalSha256(
-    identity.payloadHash,
-    'effectIdentity.payloadHash',
-  );
+  const marker = parseCanonicalTaskV2Marker({
+    schema: TASK_V2_MARKER_SCHEMA,
+    coreTaskId: task.id,
+    coreTaskVersion: task.version,
+    tenantRef: identity.tenantRef,
+    accountRef: identity.accountRef,
+    effectId: identity.effectId,
+    payloadHash: identity.payloadHash,
+  }, 'effectIdentity');
   return {
-    tenantRef: requireText(identity.tenantRef, 'effectIdentity.tenantRef'),
-    accountRef: requireText(identity.accountRef, 'effectIdentity.accountRef'),
-    effectId: requireText(identity.effectId, 'effectIdentity.effectId'),
-    payloadHash,
+    tenantRef: marker.tenantRef,
+    accountRef: marker.accountRef,
+    effectId: marker.effectId,
+    payloadHash: marker.payloadHash,
   };
 }
 
 function taskMarker(task, rawEffectIdentity) {
   const identity = normalizeEffectIdentity(rawEffectIdentity, task);
-  return JSON.stringify({
-    schema: MARKER_SCHEMA,
-    coreTaskId: requireText(task.id, 'task.id'),
+  return JSON.stringify(taskV2MarkerRecord({
+    schema: TASK_V2_MARKER_SCHEMA,
+    coreTaskId: task.id,
     coreTaskVersion: task.version,
     ...(identity ?? {}),
-  });
+  }));
 }
 
 function parseTaskMarker(extra) {
   if (typeof extra !== 'string' || extra === '') return null;
   try {
     const marker = JSON.parse(extra);
-    if (marker?.schema !== MARKER_SCHEMA || typeof marker.coreTaskId !== 'string') return null;
-    return marker;
-  } catch {
+    if (!marker || typeof marker !== 'object' || Array.isArray(marker)) return null;
+    if (!Object.hasOwn(marker, 'schema') && !Object.hasOwn(marker, 'coreTaskId')) return null;
+    return parseCanonicalTaskV2Marker(marker);
+  } catch (error) {
+    if (error?.code === 'EXTERNAL_IDENTITY_CONFLICT') throw error;
     return null;
   }
 }
@@ -172,20 +182,14 @@ function taskFromResponse(response, operation) {
   if (!task || typeof task !== 'object') {
     throw new FeishuTaskV2Error(`Feishu Task v2 ${operation} returned no task`);
   }
-  const marker = parseTaskMarker(task.extra);
-  let markerPayloadHash = null;
-  if (marker?.payloadHash !== undefined && marker?.payloadHash !== null) {
-    try {
-      markerPayloadHash = parseCanonicalSha256(
-        marker.payloadHash,
-        'Task v2 marker.payloadHash',
-      );
-    } catch (cause) {
-      throw new FeishuTaskV2Error(
-        'Task v2 marker payload hash is not canonical',
-        { code: 'EXTERNAL_IDENTITY_CONFLICT', retryable: false, cause },
-      );
-    }
+  let marker;
+  try {
+    marker = parseTaskMarker(task.extra);
+  } catch (cause) {
+    throw new FeishuTaskV2Error(
+      'Task v2 marker is not canonical',
+      { code: 'EXTERNAL_IDENTITY_CONFLICT', retryable: false, cause },
+    );
   }
   const reminder = normalizeReminder(
     task.reminders ?? [],
@@ -206,7 +210,7 @@ function taskFromResponse(response, operation) {
     tenantRef: marker?.tenantRef ?? null,
     accountRef: marker?.accountRef ?? null,
     effectId: marker?.effectId ?? null,
-    payloadHash: markerPayloadHash,
+    payloadHash: marker?.payloadHash ?? null,
   });
 }
 
@@ -560,4 +564,4 @@ export function createSdkTaskV2Gateway({ client } = {}) {
   });
 }
 
-export const TASK_V2_MARKER_SCHEMA = MARKER_SCHEMA;
+export { TASK_V2_MARKER_SCHEMA };

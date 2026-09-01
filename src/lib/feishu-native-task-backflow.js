@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 
 import { parseCanonicalSha256 } from './canonical-sha256.js';
+import {
+  parseCanonicalTaskV2Marker,
+  TASK_V2_MARKER_SCHEMA,
+} from './task-v2-marker.js';
 
 const INPUT_FIELDS = new Set([
   'eventId',
@@ -115,12 +119,29 @@ function reject(code) {
   return Object.freeze({ status: 'rejected', code, repair: 'reproject' });
 }
 
-function exactProjectionMatches(projection, payload) {
-  return projection?.tenantRef === payload.tenantRef
-    && projection?.accountRef === payload.accountRef
+function exactProjectionMatches(marker, projection, payload) {
+  return marker.classification === 'complete'
+    && marker.tenantRef === payload.tenantRef
+    && marker.accountRef === payload.accountRef
     && projection?.externalTaskId === payload.externalTaskId
-    && projection?.effectId === payload.effectId
-    && projection?.payloadHash === payload.payloadHash;
+    && marker.effectId === payload.effectId
+    && marker.payloadHash === payload.payloadHash;
+}
+
+function parseProjectionMarker(projection) {
+  try {
+    return parseCanonicalTaskV2Marker({
+      schema: TASK_V2_MARKER_SCHEMA,
+      coreTaskId: projection?.taskId,
+      coreTaskVersion: projection?.coreVersion,
+      tenantRef: projection?.tenantRef,
+      accountRef: projection?.accountRef,
+      effectId: projection?.effectId,
+      payloadHash: projection?.payloadHash,
+    }, 'native Task backflow projection marker');
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -200,10 +221,11 @@ export function createFeishuNativeTaskBackflow({
       const mapping = ACTIONS[payload.action];
       if (!mapping) return reject('UNSUPPORTED_CHANGE');
       const projection = await resolveProjection(payload.externalTaskId);
-      if (!exactProjectionMatches(projection, payload)) {
+      const marker = parseProjectionMarker(projection);
+      if (!marker || !exactProjectionMatches(marker, projection, payload)) {
         return reject('PROJECTION_IDENTITY_DRIFT');
       }
-      if (projection.coreVersion !== payload.externalVersion) {
+      if (marker.coreTaskVersion !== payload.externalVersion) {
         return reject('VERSION_DRIFT');
       }
       const verified = await verifyActor({
@@ -226,9 +248,9 @@ export function createFeishuNativeTaskBackflow({
       const logicalKey = requireText(event.logical_key, 'durable native task logical_key');
       const requestId = stableId('req:native-task', logicalKey);
       const intent = {
-        taskId: requireText(projection.taskId, 'projection.taskId'),
+        taskId: marker.coreTaskId,
         command: mapping.command,
-        expectedVersion: projection.coreVersion,
+        expectedVersion: marker.coreTaskVersion,
         ...(mapping.command === 'UpdateTaskReminder'
           ? { reminderMinutesBeforeDue: payload.reminderMinutesBeforeDue }
           : {}),
@@ -247,7 +269,7 @@ export function createFeishuNativeTaskBackflow({
         actor,
         actorAssertion,
         origin: 'native_task_projection',
-        originEffectId: projection.effectId,
+        originEffectId: marker.effectId,
         capability: mapping.capability,
         intent,
       });
@@ -255,15 +277,15 @@ export function createFeishuNativeTaskBackflow({
       if (result.suppressed === true) {
         return Object.freeze({
           status: 'suppressed',
-          effectId: projection.effectId,
-          taskId: projection.taskId,
-          coreVersion: projection.coreVersion,
+          effectId: marker.effectId,
+          taskId: marker.coreTaskId,
+          coreVersion: marker.coreTaskVersion,
         });
       }
       return Object.freeze({
         status: 'applied',
-        taskId: projection.taskId,
-        coreVersion: result.task?.version ?? projection.coreVersion,
+        taskId: marker.coreTaskId,
+        coreVersion: result.task?.version ?? marker.coreTaskVersion,
       });
     },
   });
