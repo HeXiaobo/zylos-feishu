@@ -397,6 +397,33 @@ function initializeSchema(database) {
       'legacy and namespaced identities split the same source identity across inbox rows',
     );
   }
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_feishu_legacy_identity_no_split
+    BEFORE INSERT ON feishu_inbound_identities
+    WHEN EXISTS (
+      SELECT 1
+      FROM feishu_inbound_source_identities source
+      WHERE source.kind = NEW.kind
+        AND source.value = NEW.value
+        AND source.inbox_id <> NEW.inbox_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'split inbound identity across legacy and source indexes');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_feishu_source_identity_no_split
+    BEFORE INSERT ON feishu_inbound_source_identities
+    WHEN EXISTS (
+      SELECT 1
+      FROM feishu_inbound_identities legacy
+      WHERE legacy.kind = NEW.kind
+        AND legacy.value = NEW.value
+        AND legacy.inbox_id <> NEW.inbox_id
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'split inbound identity across source and legacy indexes');
+    END;
+  `);
 }
 
 function toView(row) {
@@ -643,7 +670,25 @@ export function openInboundEventInbox({ dbPath, clock = Date.now, maxAttempts = 
     }
     const pairs = identityPairs(normalized);
     const namespace = normalized.legacy ? null : normalized;
-    let existingRows = rowsForIdentities(pairs, namespace);
+    const sourceRowsForCollision = normalized.legacy
+      ? rowsForSourceIdentitiesAcrossNamespaces(pairs)
+      : rowsForIdentities(pairs, namespace);
+    const legacyRowsForCollision = rowsForIdentities(pairs);
+    if (sourceRowsForCollision.length > 0 && legacyRowsForCollision.length > 0) {
+      const collisionRows = [...new Map([
+        ...sourceRowsForCollision,
+        ...legacyRowsForCollision,
+      ].map((row) => [row.id, row])).values()];
+      if (collisionRows.length > 1) {
+        throw domainError(
+          'IDENTITY_CONFLICT',
+          'legacy and namespaced identities split the inbound identity across rows',
+        );
+      }
+    }
+    let existingRows = normalized.legacy
+      ? legacyRowsForCollision
+      : sourceRowsForCollision;
     let bridgeLegacyIdentities = false;
     if (existingRows.length === 0 && normalized.legacy) {
       const sourceRows = rowsForSourceIdentitiesAcrossNamespaces(pairs);

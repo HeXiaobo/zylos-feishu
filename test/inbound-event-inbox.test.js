@@ -921,6 +921,10 @@ test('schema migration fails closed when legacy and namespaced identities split 
       _timestamp: '1787900000000',
     });
     const damaged = new Database(dbPath);
+    damaged.exec(`
+      DROP TRIGGER IF EXISTS trg_feishu_legacy_identity_no_split;
+      DROP TRIGGER IF EXISTS trg_feishu_source_identity_no_split;
+    `);
     const inserted = damaged.prepare(`
       INSERT INTO feishu_inbound_inbox (
         event_id, message_id, request_fingerprint, payload_json, status,
@@ -947,6 +951,63 @@ test('schema migration fails closed when legacy and namespaced identities split 
       (error) => error.code === 'IDENTITY_CONFLICT'
         && /legacy and namespaced/i.test(error.message),
     );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('database fencing blocks a rolling legacy writer from splitting a namespaced identity', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-inbound-rolling-fence-'));
+  const dbPath = path.join(directory, 'inbound.db');
+  const eventId = 'evt_rolling_fence';
+  const messageId = 'om_rolling_fence';
+  try {
+    const inbox = openInboundEventInbox({ dbPath, clock: () => 9, maxAttempts: 3 });
+    const created = inbox.receive({
+      adapterId: 'feishu',
+      accountRef: 'cli_app_a',
+      eventType: 'im.message.receive_v1',
+      eventId,
+      messageId,
+      payload: { canonical: 'new writer row' },
+      conversationLaneKey: 'feishu:cli_app_a:group:oc_rolling:chat',
+      sourceOrder: null,
+    });
+    assert.equal(created.created, true);
+
+    const legacyPayload = JSON.stringify({
+      message: { message_id: messageId, content: JSON.stringify({ text: 'old writer row' }) },
+      sender: { sender_id: { open_id: 'ou_rolling' } },
+      _timestamp: '1787900000000',
+    });
+    const oldConnection = new Database(dbPath);
+    const oldWriterReceive = oldConnection.transaction(() => {
+      const inserted = oldConnection.prepare(`
+        INSERT INTO feishu_inbound_inbox (
+          event_id, message_id, request_fingerprint, payload_json, status,
+          available_at, received_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'received', 9, 9, 9)
+      `).run(
+        eventId,
+        messageId,
+        createHash('sha256').update(legacyPayload).digest('hex'),
+        legacyPayload,
+      );
+      const legacyId = Number(inserted.lastInsertRowid);
+      oldConnection.prepare(`
+        INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, ?)
+      `).run('event', eventId, legacyId);
+      oldConnection.prepare(`
+        INSERT INTO feishu_inbound_identities (kind, value, inbox_id) VALUES (?, ?, ?)
+      `).run('message', messageId, legacyId);
+    });
+    assert.throws(oldWriterReceive, /split inbound identity/i);
+    assert.equal(
+      oldConnection.prepare('SELECT COUNT(*) AS count FROM feishu_inbound_inbox').get().count,
+      1,
+    );
+    oldConnection.close();
+    inbox.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
