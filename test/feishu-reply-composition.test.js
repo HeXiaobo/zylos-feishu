@@ -248,6 +248,79 @@ test('durable lanes accept concurrently and restart reuses one reply handle and 
   }
 });
 
+test('two messages in one chat keep independent reactions until each reply settles', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-composition-one-to-many-'));
+  const reactions = [];
+  let composition;
+  try {
+    composition = openFeishuReplyComposition({
+      inboundDbPath: path.join(directory, 'inbound.db'),
+      presentationDbPath: path.join(directory, 'presentation.db'),
+      accountRef: 'cli_app_a',
+      authorize: async () => true,
+      coreIntake: createInMemoryCoreMessageIntake(),
+      reactionPort: createReactionPort(reactions),
+      cardPort: createCardPort([]),
+      delivery: {
+        send: async ({ intent }) => ({
+          outcome: 'platform_accepted',
+          externalRef: `reply:${intent.requestId}`,
+        }),
+        reconcile: async () => ({ outcome: 'unknown', externalRef: null }),
+      },
+      workerId: 'composition-one-to-many',
+      clock: () => 1_788_220_800_000,
+      pollIntervalMs: 1,
+      concurrency: 2,
+    });
+
+    const first = await composition.acceptMessage(event({
+      eventId: 'evt-shared-first',
+      messageId: 'om-shared-first',
+      chatId: 'oc-shared',
+      text: '事实看到了吗',
+    }));
+    const second = await composition.acceptMessage(event({
+      eventId: 'evt-shared-second',
+      messageId: 'om-shared-second',
+      chatId: 'oc-shared',
+      text: '实时看到了吗',
+    }));
+    await composition.maintain();
+
+    const addedMessageIds = reactions
+      .filter(call => call.kind === 'add')
+      .map(call => call.effect.sourceMessageId)
+      .sort();
+    assert.deepEqual(addedMessageIds, ['om-shared-first', 'om-shared-second']);
+    assert.equal(composition.inspect(first.receipt.requestId).presence.status, 'active');
+    assert.equal(composition.inspect(second.receipt.requestId).presence.status, 'active');
+
+    const firstTarget = composition.inspect(first.receipt.requestId).handle.route.targetRef;
+    const firstIntent = replyIntent(first.receipt.requestId, firstTarget, '第一条回答');
+    await composition.deliverFinal(deliveryClaim(firstIntent));
+    composition.settleFinal(deliverySettlement(firstIntent));
+    await composition.maintain();
+
+    assert.equal(composition.inspect(first.receipt.requestId).presence.status, 'finished');
+    assert.equal(composition.inspect(second.receipt.requestId).presence.status, 'active');
+    assert.deepEqual(
+      reactions.filter(call => call.kind === 'remove').map(call => call.effect.sourceMessageId),
+      ['om-shared-first'],
+    );
+
+    const secondTarget = composition.inspect(second.receipt.requestId).handle.route.targetRef;
+    const secondIntent = replyIntent(second.receipt.requestId, secondTarget, '第二条回答');
+    await composition.deliverFinal(deliveryClaim(secondIntent));
+    composition.settleFinal(deliverySettlement(secondIntent));
+    await composition.maintain();
+    assert.equal(composition.inspect(second.receipt.requestId).presence.status, 'finished');
+  } finally {
+    await composition?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('card progress never settles presence, final delivery survives projection failure, and unknown reconciles first', async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-composition-terminal-'));
   const reactions = [];
