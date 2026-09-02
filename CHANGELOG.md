@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   add `ROADMAP.md` to reflect the current native Task / CardKit / Smart-mode
   direction.
 
+## [0.3.7-rc.14] - 2026-09-02
+
+### Fixed
+- Keep the Feishu typing reaction visible while a reply card is opening or
+  streaming, and remove it only after a terminal reply, error notice, or task
+  receipt has reached a durable delivery settlement.
+- Recover reply-presence state after restarts and preserve the reaction across
+  task retries and legacy conversation-response delivery paths.
+
 ## [0.3.7-rc.13] - 2026-09-02
 
 ### Added
