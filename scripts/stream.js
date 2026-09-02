@@ -7,12 +7,14 @@ import dotenv from 'dotenv';
 
 import { getClient } from '../src/lib/client.js';
 import {
+  DATA_DIR,
   getConfig,
   getResponseStreamMainTimeoutMs,
   getStreamProcessDisplay,
 } from '../src/lib/config.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
-import { createConversationResponseDelivery } from '../src/lib/conversation-response-delivery.js';
+import { createConversationResponseRuntimeAdapter } from '../src/lib/conversation-response-runtime-adapter.js';
+import { openTypingDoneMarkerStore } from '../src/lib/typing-done-marker.js';
 
 dotenv.config({ path: path.join(process.env.HOME || os.homedir(), 'zylos/.env') });
 
@@ -36,7 +38,10 @@ async function main() {
       processDisplay: getStreamProcessDisplay(config),
       mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
     });
-    const result = await createConversationResponseDelivery({ stream }).deliver(delivery);
+    const result = await createConversationResponseRuntimeAdapter({
+      stream,
+      markers: openTypingDoneMarkerStore({ directory: path.join(DATA_DIR, 'typing') }),
+    }).deliver(delivery);
     process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
   } catch (error) {
     process.stderr.write(`[feishu] Response stream delivery failed: ${error.message}\n`);

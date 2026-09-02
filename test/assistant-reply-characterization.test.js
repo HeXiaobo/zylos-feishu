@@ -88,17 +88,59 @@ test('current parent/root reply target changes presentation target, not the targ
   assert.notEqual(replies[0].replyTargetRef, replies[1].replyTargetRef);
 });
 
-test('current card opening and 120-second timer remove reaction before settlement', () => {
+test('p2p and group card opening keep reaction until a delivered terminal marker', () => {
   const source = fs.readFileSync(path.join(REPO_ROOT, 'src/index.js'), 'utf8');
+  const sendSource = fs.readFileSync(path.join(REPO_ROOT, 'scripts/send.js'), 'utf8');
+  const streamSource = fs.readFileSync(path.join(REPO_ROOT, 'scripts/stream.js'), 'utf8');
   assert.match(source, /const TYPING_TIMEOUT = 120 \* 1000/);
-  assert.match(
+  assert.doesNotMatch(
     source,
     /const timer = setTimeout\(\(\) => \{\s*removeTypingIndicator\(messageId\);\s*\}, TYPING_TIMEOUT\)/,
   );
-  assert.match(
+  assert.doesNotMatch(
     source,
     /assistantRequest = await openConversationResponse\([\s\S]*?if \(assistantRequest\) removeTypingIndicator\(messageId\)/,
   );
+  assert.doesNotMatch(
+    source,
+    /\? await openConversationResponse\([\s\S]*?if \(assistantRequest\) removeTypingIndicator\(messageId\)/,
+  );
+  assert.match(source, /Typing indicator remains active after/);
+  assert.match(
+    source,
+    /async function settleTypingIndicator\(messageId\) \{\s*typingDoneMarkers\.mark\(messageId\);\s*await typingDoneMarkerConsumer\.drain\(\);\s*\}/,
+  );
+  assert.equal(
+    [...source.matchAll(/removeTypingIndicator\(/g)].length,
+    3,
+    'production callers must settle through the durable marker consumer',
+  );
+  assert.equal(
+    [...source.matchAll(/if \(\['create_task', 'confirm'\]\.includes\(response\?\.workIntake\?\.decision\)\)/g)].length,
+    2,
+    'p2p and group WorkIntake must leave chat_only presence to the assistant terminal',
+  );
+  assert.match(source, /async function handleMessage\(data, metadata = \{\}\)/);
+  assert.equal(
+    [...source.matchAll(/deliveryAttempt: metadata\.attempt \?\? 1/g)].length,
+    2,
+    'p2p and group task actions must receive the durable inbox attempt',
+  );
+  assert.match(
+    source,
+    /let settled = false;[\s\S]*decideTaskActionFailure\([\s\S]*if \(failure\.atAttemptLimit\) settled = true;[\s\S]*if \(failure\.retryTask\) throw error;[\s\S]*if \(settled\) await settleTypingIndicator\(messageId\);/,
+  );
+  assert.match(
+    sendSource,
+    /function settleAssistantReplyPresence\(\) \{\s*if \(taskCommentReplyEndpoint\) return false;\s*markTypingDone\(parsedEndpoint\.msg\);\s*return true;\s*\}/,
+  );
+  assert.equal(
+    [...sendSource.matchAll(/markTypingDone\(parsedEndpoint\.msg\)/g)].length,
+    1,
+    'task-comment delivery must never be turned into an assistant presence settlement',
+  );
+  assert.match(streamSource, /createConversationResponseRuntimeAdapter/);
+  assert.match(streamSource, /openTypingDoneMarkerStore/);
   const fixture = loadContractFixture('current-behavior.json');
   assert.match(
     fixture.observations.find((entry) => entry.name === 'reaction-card-open').gap,

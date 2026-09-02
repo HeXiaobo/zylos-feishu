@@ -55,6 +55,12 @@ import {
   replyRefactorEnabled,
   resolveFeishuRouteTarget,
 } from './lib/feishu-reply-composition.js';
+import {
+  createTypingDoneMarkerConsumer,
+  createTypingPresenceCoordinator,
+  openTypingDoneMarkerStore,
+  persistTimeoutPresenceCompletions,
+} from './lib/typing-done-marker.js';
 import { isRetryableC4Failure } from './lib/c4-retry-policy.js';
 import { resolveZylosCli } from './lib/zylos-cli-resolver.js';
 import {
@@ -68,6 +74,7 @@ import {
   isExplicitTaskProtocolMessage,
   parseExplicitTaskMessage,
 } from './lib/task-entry.js';
+import { decideTaskActionFailure } from './lib/task-action-failure-policy.js';
 import {
   createMemberAccessPolicy,
   decideLegacyDmAccess,
@@ -170,6 +177,7 @@ const connectionMode = config.connection_mode || 'websocket';
 const INTERNAL_SECRET = crypto.randomUUID();
 const taskV2Enabled = isTaskV2Enabled(process.env);
 const replyRefactorV1Enabled = replyRefactorEnabled(process.env);
+const LEGACY_INBOUND_MAX_ATTEMPTS = 5;
 // Persist token to file so send.js (spawned by C4 in a separate process tree) can read it
 const TOKEN_FILE = path.join(DATA_DIR, '.internal-token');
 try {
@@ -263,10 +271,60 @@ function saveCursors(cursors) {
 // Typing indicator (emoji reaction on message while processing)
 // ============================================================
 const TYPING_EMOJI = 'Typing';  // ⌨️ keyboard typing indicator
-const TYPING_TIMEOUT = 120 * 1000; // 120 seconds max
+const TYPING_TIMEOUT = 120 * 1000; // stale observation window
 
 // Track active typing indicators: Map<messageId, { reactionId, timer }>
 const activeTypingIndicators = new Map();
+const TYPING_DIR = path.join(DATA_DIR, 'typing');
+const typingDoneMarkers = openTypingDoneMarkerStore({ directory: TYPING_DIR });
+const typingPresenceCoordinator = createTypingPresenceCoordinator({
+  store: typingDoneMarkers,
+  addReaction: messageId => addReaction(messageId, TYPING_EMOJI),
+  async removeReaction(messageId, reactionId) {
+    const removed = await removeReaction(messageId, reactionId);
+    if (removed.success) return removed;
+    let response;
+    try {
+      response = await getClient().im.messageReaction.list({
+        path: { message_id: messageId },
+        params: { reaction_type: TYPING_EMOJI, page_size: 50 },
+      });
+    } catch {
+      return removed;
+    }
+    if (response?.code !== 0 || !Array.isArray(response.data?.items)) return removed;
+    const stillPresent = response.data.items.some(item => item.reaction_id === reactionId);
+    return stillPresent ? removed : { success: false, notFound: true };
+  },
+  async reconcileReaction(messageId, reactionId) {
+    let response;
+    try {
+      response = await getClient().im.messageReaction.list({
+        path: { message_id: messageId },
+        params: { reaction_type: TYPING_EMOJI, page_size: 50 },
+      });
+    } catch (error) {
+      return { outcome: 'unknown', message: error.message };
+    }
+    if (response?.code !== 0 || !Array.isArray(response.data?.items)) {
+      return { outcome: 'unknown', message: response?.msg };
+    }
+    let owned;
+    if (reactionId) {
+      owned = response.data.items.find(item => item.reaction_id === reactionId);
+    } else {
+      const botIds = [botAppId, botOpenId].filter(Boolean);
+      if (botIds.length === 0) return { outcome: 'unknown', message: 'bot identity unavailable' };
+      owned = response.data.items.find(item => (
+        item.operator?.operator_type === 'app'
+        && botIds.includes(item.operator?.operator_id)
+      ));
+    }
+    return owned?.reaction_id
+      ? { outcome: 'reconciled', reactionId: owned.reaction_id }
+      : { outcome: 'not_found' };
+  },
+});
 
 /**
  * Add a typing indicator (emoji reaction) to a message.
@@ -274,15 +332,16 @@ const activeTypingIndicators = new Map();
  */
 async function addTypingIndicator(messageId) {
   try {
-    const result = await addReaction(messageId, TYPING_EMOJI);
-    if (result.success && result.reactionId) {
-      // Set auto-remove timeout
+    if (activeTypingIndicators.has(messageId)) return true;
+    const presence = await typingPresenceCoordinator.begin(messageId);
+    if (presence) {
+      // Elapsed time is observability only. Delivery settlement owns removal.
       const timer = setTimeout(() => {
-        removeTypingIndicator(messageId);
+        console.warn(`[feishu] Typing indicator remains active after ${TYPING_TIMEOUT}ms: ${messageId}`);
       }, TYPING_TIMEOUT);
 
       activeTypingIndicators.set(messageId, {
-        reactionId: result.reactionId,
+        reactionId: presence.reactionId,
         timer,
       });
 
@@ -300,33 +359,24 @@ async function addTypingIndicator(messageId) {
  */
 async function removeTypingIndicator(messageId) {
   const state = activeTypingIndicators.get(messageId);
-  if (!state) return;
-
-  clearTimeout(state.timer);
-  let removed = false;
-
-  try {
-    const result = await removeReaction(messageId, state.reactionId);
-    if (result.success) {
-      removed = true;
-    } else {
-      await new Promise(r => setTimeout(r, 1000));
-      const retry = await removeReaction(messageId, state.reactionId);
-      removed = retry.success;
-    }
-  } catch (err) {
-    console.log(`[feishu] Failed to remove typing indicator: ${err.message}`);
+  if (state) clearTimeout(state.timer);
+  let removed = await typingPresenceCoordinator.finish(messageId);
+  if (!removed && typingDoneMarkers.getActive(messageId)) {
+    await new Promise(r => setTimeout(r, 1000));
+    removed = await typingPresenceCoordinator.finish(messageId);
   }
 
   if (removed) {
     activeTypingIndicators.delete(messageId);
+    return true;
   } else {
     // Deferred retry to avoid orphaned emoji reaction
-    state.timer = setTimeout(() => {
-      removeReaction(messageId, state.reactionId)
-        .catch(() => {})
-        .finally(() => activeTypingIndicators.delete(messageId));
-    }, 10000);
+    if (state) {
+      state.timer = setTimeout(() => {
+        void removeTypingIndicator(messageId);
+      }, 10000);
+    }
+    return false;
   }
 }
 
@@ -334,47 +384,27 @@ async function removeTypingIndicator(messageId) {
  * Check for typing-done marker files written by send.js.
  * When found, remove the typing indicator and clean up the marker.
  */
-const TYPING_DIR = path.join(DATA_DIR, 'typing');
-fs.mkdirSync(TYPING_DIR, { recursive: true });
+const typingDoneMarkerConsumer = createTypingDoneMarkerConsumer({
+  markers: typingDoneMarkers,
+  async remove(messageId) {
+    const removed = await removeTypingIndicator(messageId);
+    if (removed) console.log(`[feishu] Typing indicator removed for ${messageId} (reply sent)`);
+    return removed;
+  },
+});
 
-// Clean up stale typing markers from previous run
-try {
-  const staleFiles = fs.readdirSync(TYPING_DIR);
-  for (const f of staleFiles) {
-    try { fs.unlinkSync(path.join(TYPING_DIR, f)); } catch {}
-  }
-  if (staleFiles.length > 0) console.log(`[feishu] Cleaned ${staleFiles.length} stale typing markers`);
-} catch {}
-
-function checkTypingDoneMarkers() {
-  try {
-    const files = fs.readdirSync(TYPING_DIR);
-    const now = Date.now();
-    for (const file of files) {
-      if (!file.endsWith('.done')) continue;
-      const messageId = file.replace('.done', '');
-      const filePath = path.join(TYPING_DIR, file);
-
-      if (activeTypingIndicators.has(messageId)) {
-        removeTypingIndicator(messageId);
-        console.log(`[feishu] Typing indicator removed for ${messageId} (reply sent)`);
-        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
-      } else {
-        // Clean up orphaned markers older than 60s (indicator timed out or never registered)
-        try {
-          const content = fs.readFileSync(filePath, 'utf8');
-          const markerTime = parseInt(content, 10);
-          if (now - markerTime > 60000) {
-            fs.unlinkSync(filePath);
-          }
-        } catch { /* ignore */ }
-      }
-    }
-  } catch { /* ignore */ }
+async function settleTypingIndicator(messageId) {
+  typingDoneMarkers.mark(messageId);
+  await typingDoneMarkerConsumer.drain();
 }
 
 // Poll for typing-done markers every 2 seconds
-const typingCheckInterval = setInterval(checkTypingDoneMarkers, 2000);
+const typingCheckInterval = setInterval(() => {
+  if (replyRefactorV1Enabled) return;
+  void typingDoneMarkerConsumer.drain().catch((error) => {
+    console.warn(`[feishu] Typing completion marker drain failed: ${error.message}`);
+  });
+}, 2000);
 
 // ============================================================
 // Permission error tracking (cooldown to avoid spam)
@@ -894,7 +924,15 @@ function getConversationResponseStream() {
 
 const conversationResponseTimeoutSweep = setInterval(() => {
   if (replyRefactorV1Enabled) return;
-  getConversationResponseStream().sweepExpired().then(result => {
+  const stream = getConversationResponseStream();
+  stream.sweepExpired().then(async result => {
+    await persistTimeoutPresenceCompletions({
+      requestIds: result.presenceCompletionRequestIds ?? [],
+      activeMessageIds: typingDoneMarkers.listActiveMessageIds(),
+      requestIdForMessage: assistantRequestId,
+      mark: messageId => typingDoneMarkers.mark(messageId),
+      acknowledge: requestId => stream.acknowledgePresenceCompletion(requestId),
+    });
     if (result.expired > 0) {
       console.warn(`[feishu] Expired ${result.expired} stalled response stream(s)`);
     }
@@ -1464,6 +1502,7 @@ async function handleAuthorizedTaskInput({
   threadId,
   rootId,
   parentId,
+  deliveryAttempt = 1,
 }) {
   let route;
   try {
@@ -1493,27 +1532,41 @@ async function handleAuthorizedTaskInput({
     mentions,
     threadId,
   );
-  addTypingIndicator(messageId);
+  await addTypingIndicator(messageId);
+  let settled = false;
   try {
     await executeTaskAction(route);
     console.log(`[feishu] Applied ${route.command.type} to ${route.command.taskId}`);
+    settled = true;
   } catch (error) {
     console.error(`[feishu] Task action failed: ${error.message}`);
-    const retrying = error.retryable !== false;
+    const failure = decideTaskActionFailure({
+      retryable: error.retryable !== false,
+      attempt: deliveryAttempt,
+      maxAttempts: LEGACY_INBOUND_MAX_ATTEMPTS,
+    });
     const replyUuid = `zta_${crypto.createHash('sha256')
-      .update(`${messageId}:${error.code || 'TASK_ACTION_FAILED'}`)
+      .update(`${messageId}:${error.code || 'TASK_ACTION_FAILED'}:${failure.phase}`)
       .digest('hex')
       .slice(0, 40)}`;
-    await sendThreadAwareMessage(
+    const delivered = await sendThreadAwareMessage(
       chatId,
-      retrying
-        ? '任务操作暂未完成，系统正在自动重试。'
-        : '任务状态已变化，请刷新任务后重试。',
+      failure.message,
       { chatType, rootId, parentId, messageId, uuid: replyUuid },
     );
-    if (retrying) throw error;
+    if (!delivered) {
+      // The final inbox attempt is terminal even when Feishu is unavailable;
+      // do not leave an immortal reaction after the row is dead-lettered.
+      if (failure.atAttemptLimit) settled = true;
+      const deliveryError = new Error('task action status notice was not delivered');
+      deliveryError.code = 'TASK_ACTION_NOTICE_DELIVERY_FAILED';
+      deliveryError.retryable = !failure.atAttemptLimit;
+      throw deliveryError;
+    }
+    if (failure.retryTask) throw error;
+    settled = true;
   } finally {
-    removeTypingIndicator(messageId);
+    if (settled) await settleTypingIndicator(messageId);
   }
   return { handled: true, route };
 }
@@ -2085,7 +2138,7 @@ async function sendThreadAwareMessage(chatId, text, {
  *
  * @param {object} data - { message, sender } from the event
  */
-async function handleMessage(data) {
+async function handleMessage(data, metadata = {}) {
   const message = data.message;
   const sender = data.sender;
   const mentions = message.mentions;
@@ -2234,6 +2287,7 @@ async function handleMessage(data) {
         threadId,
         rootId,
         parentId,
+        deliveryAttempt: metadata.attempt ?? 1,
       })
       : { handled: false, route: null };
     if (taskInput.handled) return;
@@ -2246,7 +2300,7 @@ async function handleMessage(data) {
     await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
 
     // The response card itself is the acknowledgement for ordinary Agent chat.
-    if (!assistantRequest) addTypingIndicator(messageId);
+    if (!assistantRequest) await addTypingIndicator(messageId);
 
     // Fetch context: thread context for topic messages, quoted content for replies
     if (threadId) {
@@ -2264,25 +2318,28 @@ async function handleMessage(data) {
     const senderName = await resolveUserName(senderUserId, senderOpenId);
     const cleanText = resolveMentions(text, mentions);
     const threadRootId = threadId ? rootId : null;
-    const rejectReply = () => {
-      removeTypingIndicator(messageId);
+    const rejectReply = async () => {
+      let presented = false;
       if (assistantRequest) {
-        failConversationResponse(assistantRequest).then(handled => {
-          if (!handled) {
-            sendThreadAwareMessage(chatId, '处理未完成，请稍后重试。', { chatType, rootId, parentId, messageId })
-              .catch(e => console.error('[feishu] reject reply failed:', e.message));
-          }
-        });
-        return;
+        presented = await failConversationResponse(assistantRequest);
       }
-      sendThreadAwareMessage(chatId, '处理未完成，请稍后重试。', { chatType, rootId, parentId, messageId })
-        .catch(e => console.error('[feishu] reject reply failed:', e.message));
+      if (!presented) {
+        try {
+          presented = await sendThreadAwareMessage(
+            chatId,
+            '处理未完成，请稍后重试。',
+            { chatType, rootId, parentId, messageId },
+          );
+        } catch (error) {
+          console.error('[feishu] reject reply failed:', error.message);
+        }
+      }
+      if (presented) await settleTypingIndicator(messageId);
     };
 
     // Handle images (lazy download: only when message is being sent to C4)
     if (imageKeys.length > 0) {
       assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
-      if (assistantRequest) removeTypingIndicator(messageId);
       const mediaPaths = [];
       for (const imgKey of imageKeys) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -2305,7 +2362,6 @@ async function handleMessage(data) {
 
     if (fileKey) {
       assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
-      if (assistantRequest) removeTypingIndicator(messageId);
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       let localPath = null;
       try {
@@ -2338,7 +2394,6 @@ async function handleMessage(data) {
       assistantRequest = buildAssistantRequest(messageId);
     } else if (taskRoute?.kind !== 'task-intent') {
       assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
-      if (assistantRequest) removeTypingIndicator(messageId);
     }
     await sendToC4('feishu', endpoint, msg, rejectReply, {
       taskEnvelope: taskRoute?.kind === 'task-intent'
@@ -2348,23 +2403,23 @@ async function handleMessage(data) {
       assistantRequest: assistantRequest || undefined,
       onSuccess: workIntakeEnvelope
         ? async (response) => {
-          try {
-            return await handleWorkIntakeResult(response, {
-              inboundEnvelope: workIntakeEnvelope,
-              endpoint,
-              messageId,
-              chatId,
-              chatType,
-              rootId,
-              parentId,
-              assistantRequest,
-            });
-          } finally {
-            removeTypingIndicator(messageId);
+          const result = await handleWorkIntakeResult(response, {
+            inboundEnvelope: workIntakeEnvelope,
+            endpoint,
+            messageId,
+            chatId,
+            chatType,
+            rootId,
+            parentId,
+            assistantRequest,
+          });
+          if (['create_task', 'confirm'].includes(response?.workIntake?.decision)) {
+            await settleTypingIndicator(messageId);
           }
+          return result;
         }
         : taskRoute?.kind === 'task-intent'
-          ? () => removeTypingIndicator(messageId)
+          ? () => settleTypingIndicator(messageId)
           : undefined,
     });
     return;
@@ -2399,6 +2454,7 @@ async function handleMessage(data) {
         threadId,
         rootId,
         parentId,
+        deliveryAttempt: metadata.attempt ?? 1,
       })
       : { handled: false, route: null };
     if (taskInput.handled) return;
@@ -2418,7 +2474,7 @@ async function handleMessage(data) {
     updateCursor(chatId, messageId);
 
     if (!assistantRequest && groupActivation.showImmediateResponse) {
-      addTypingIndicator(messageId);
+      await addTypingIndicator(messageId);
     }
 
     // Fetch context: thread context for topic messages, quoted content for replies
@@ -2437,20 +2493,24 @@ async function handleMessage(data) {
     const senderName = await resolveUserName(senderUserId, senderOpenId);
     const cleanText = resolveMentions(text, mentions);
     const threadRootId = threadId ? rootId : null;
-    const groupRejectReply = () => {
-      removeTypingIndicator(messageId);
+    const groupRejectReply = async () => {
       if (!groupActivation.showImmediateResponse) return;
+      let presented = false;
       if (assistantRequest) {
-        failConversationResponse(assistantRequest).then(handled => {
-          if (!handled) {
-            sendThreadAwareMessage(chatId, '处理未完成，请稍后重试。', { chatType, rootId, parentId, messageId })
-              .catch(e => console.error('[feishu] reject reply failed:', e.message));
-          }
-        });
-        return;
+        presented = await failConversationResponse(assistantRequest);
       }
-      sendThreadAwareMessage(chatId, '处理未完成，请稍后重试。', { chatType, rootId, parentId, messageId })
-        .catch(e => console.error('[feishu] reject reply failed:', e.message));
+      if (!presented) {
+        try {
+          presented = await sendThreadAwareMessage(
+            chatId,
+            '处理未完成，请稍后重试。',
+            { chatType, rootId, parentId, messageId },
+          );
+        } catch (error) {
+          console.error('[feishu] reject reply failed:', error.message);
+        }
+      }
+      if (presented) await settleTypingIndicator(messageId);
     };
 
     // Handle images (lazy download: only for messages being sent to C4)
@@ -2458,7 +2518,6 @@ async function handleMessage(data) {
       assistantRequest = groupActivation.showImmediateResponse
         ? await openConversationResponse({ chatId, chatType, messageId, rootId, parentId })
         : null;
-      if (assistantRequest) removeTypingIndicator(messageId);
       const mediaPaths = [];
       for (const imgKey of imageKeys) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -2473,7 +2532,7 @@ async function handleMessage(data) {
         const msg = formatMessage('group', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, contextMessages, mediaPaths[0], { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
         await sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
-        groupRejectReply();
+        await groupRejectReply();
       }
       return;
     }
@@ -2482,7 +2541,6 @@ async function handleMessage(data) {
       assistantRequest = groupActivation.showImmediateResponse
         ? await openConversationResponse({ chatId, chatType, messageId, rootId, parentId })
         : null;
-      if (assistantRequest) removeTypingIndicator(messageId);
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       let localPath = null;
       try {
@@ -2495,7 +2553,7 @@ async function handleMessage(data) {
         const msg = formatMessage('group', senderName, `[file: ${fileName}]${cleanText ? ' ' + cleanText : ''}`, contextMessages, localPath, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
         await sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
       } else {
-        groupRejectReply();
+        await groupRejectReply();
       }
       return;
     }
@@ -2520,7 +2578,6 @@ async function handleMessage(data) {
       assistantRequest = buildAssistantRequest(messageId);
     } else if (taskRoute?.kind !== 'task-intent' && groupActivation.showImmediateResponse) {
       assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
-      if (assistantRequest) removeTypingIndicator(messageId);
     }
     await sendToC4('feishu', endpoint, msg, groupRejectReply, {
       taskEnvelope: taskRoute?.kind === 'task-intent'
@@ -2530,23 +2587,23 @@ async function handleMessage(data) {
       assistantRequest: assistantRequest || undefined,
       onSuccess: workIntakeEnvelope
         ? async (response) => {
-          try {
-            return await handleWorkIntakeResult(response, {
-              inboundEnvelope: workIntakeEnvelope,
-              endpoint,
-              messageId,
-              chatId,
-              chatType,
-              rootId,
-              parentId,
-              assistantRequest,
-            });
-          } finally {
-            removeTypingIndicator(messageId);
+          const result = await handleWorkIntakeResult(response, {
+            inboundEnvelope: workIntakeEnvelope,
+            endpoint,
+            messageId,
+            chatId,
+            chatType,
+            rootId,
+            parentId,
+            assistantRequest,
+          });
+          if (['create_task', 'confirm'].includes(response?.workIntake?.decision)) {
+            await settleTypingIndicator(messageId);
           }
+          return result;
         }
         : taskRoute?.kind === 'task-intent'
-          ? () => removeTypingIndicator(messageId)
+          ? () => settleTypingIndicator(messageId)
           : undefined,
     });
   }
@@ -2825,9 +2882,6 @@ function shutdown() {
 
   for (const [messageId, state] of activeTypingIndicators.entries()) {
     clearTimeout(state.timer);
-    if (state.reactionId) {
-      removeReaction(messageId, state.reactionId).catch(() => {});
-    }
     activeTypingIndicators.delete(messageId);
   }
 
@@ -2884,7 +2938,7 @@ if (!creds.app_id || !creds.app_secret) {
     } else {
       inboundEventInbox = openInboundEventInbox({
         dbPath: path.join(DATA_DIR, 'inbound-events.db'),
-        maxAttempts: 5,
+        maxAttempts: LEGACY_INBOUND_MAX_ATTEMPTS,
       });
       console.log('[feishu] Reply refactor v1 composition: legacy rollback path');
     }
