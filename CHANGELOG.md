@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   add `ROADMAP.md` to reflect the current native Task / CardKit / Smart-mode
   direction.
 
+## [0.3.7-rc.15] - 2026-09-03
+
+### Fixed
+- Treat queued and active reply time limits as observation windows rather than
+  proof of runtime failure, so long-running replies remain pending and retain
+  their partial output.
+- Remove misleading failure and resend prompts for messages that Core has
+  already accepted durably; canonical runtime failures now state that the
+  message remains recorded.
+
 ## [0.3.7-rc.14] - 2026-09-02
 
 ### Fixed
