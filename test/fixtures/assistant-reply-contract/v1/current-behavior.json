@@ -41,9 +41,9 @@
     {
       "name": "projection-timeout-terminalization",
       "path": "src/lib/conversation-response-stream.js",
-      "current": "queued/main projection timeouts set local state.status to failed and render retry text",
-      "gap": "local projection/observation state is presented as Runtime evidence",
-      "target": "projection timeout never generates RunFailed"
+      "current": "queued/main projection timeouts are observation-only",
+      "gap": null,
+      "target": "maintain observation-only timeout projection"
     },
     {
       "name": "durable-inbound-dedupe",

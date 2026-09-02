@@ -48,8 +48,8 @@ couplings to replace after compatibility evidence exists.
 `current-behavior.json` records the production seams that satisfy part of the
 target contract and the missing behavior. Target-only behavior is represented
 by passing fixture assertions plus `test.todo` cases. In particular, the local
-strings `排队超时` and `本次回复未生成` are projection/observation output;
-they are not evidence that the shared Runtime emitted `RunFailed`.
+projection observation windows never emit retry instructions or claim that a
+reply was not generated; only canonical Runtime events can terminate a run.
 
 The common fixture hash is written to `fixture-manifest.json` so the parent
 integration task can compare names and bytes across repositories.

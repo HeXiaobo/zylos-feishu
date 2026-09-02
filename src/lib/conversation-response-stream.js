@@ -17,9 +17,10 @@ const DEFAULT_MAIN_TIMEOUT_MS = 900_000;
 const MAX_CHAT_LIST_SUMMARY_BYTES = 120;
 const SUMMARY_ELLIPSIS = '…';
 const DEFAULT_THROTTLE_MS = 250;
-const RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请重新发送。';
-const NON_RETRYABLE_FAILURE_ANSWER = '⚠️ 本次回复未生成，请稍后再试。';
-const MAIN_TIMEOUT_PHASE = '⚠️ 回复超时，请重试';
+const RETRYABLE_FAILURE_PHASE = '⚠️ 回复暂时中断';
+const NON_RETRYABLE_FAILURE_PHASE = '⚠️ 回复中断';
+const RETRYABLE_FAILURE_ANSWER = '⚠️ 回复暂时中断，消息已记录。';
+const NON_RETRYABLE_FAILURE_ANSWER = '⚠️ 回复中断，消息已记录。';
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 120_000;
@@ -226,7 +227,7 @@ function terminalChatListSummary(state) {
 }
 
 function failureAnswer(phase) {
-  return typeof phase === 'string' && (phase.includes('可重试') || phase.includes('请重试'))
+  return phase === RETRYABLE_FAILURE_PHASE
     ? RETRYABLE_FAILURE_ANSWER
     : NON_RETRYABLE_FAILURE_ANSWER;
 }
@@ -245,8 +246,8 @@ function phaseForEvent(event) {
     case 'OutputDelta': return '正在生成回答';
     case 'RunCompleted': return null;
     case 'RunFailed': return event.payload?.retryable
-      ? '⚠️ 本次处理未完成，可重试'
-      : '⚠️ 本次处理未完成';
+      ? RETRYABLE_FAILURE_PHASE
+      : NON_RETRYABLE_FAILURE_PHASE;
     default: return null;
   }
 }
@@ -324,6 +325,7 @@ function renderCard({
   publicReasoning = '',
   streaming,
   running = streaming,
+  showPhase = true,
   part,
   totalParts,
   processDisplay = 'collapsible',
@@ -334,7 +336,7 @@ function renderCard({
   const showProcess = processDisplay === 'collapsible'
     && running
     && (publicReasoning || progress.length > 0);
-  const showPhase = Boolean(phase)
+  const renderPhase = showPhase && Boolean(phase)
     && (!running || (processDisplay === 'collapsible' && !showProcess));
   const card = {
     schema: '2.0',
@@ -357,7 +359,7 @@ function renderCard({
       elements: [
         ...(showProcess
           ? [renderProcessPanel(phase, progress, publicReasoning)]
-          : (showPhase ? [{ tag: 'markdown', element_id: PHASE_ELEMENT_ID, content: phase }] : [])),
+          : (renderPhase ? [{ tag: 'markdown', element_id: PHASE_ELEMENT_ID, content: phase }] : [])),
         {
           tag: 'markdown',
           element_id: ANSWER_ELEMENT_ID,
@@ -684,6 +686,7 @@ export function createConversationResponseStream({
       publicReasoning: state.publicReasoning,
       streaming: !terminal,
       running: !terminal && part === totalParts - 1,
+      showPhase: state.status !== 'failed',
       part,
       totalParts,
       processDisplay,
@@ -768,6 +771,7 @@ export function createConversationResponseStream({
         publicReasoning: state.publicReasoning,
         streaming: state.mode === 'cardkit' && !terminal && part === segments.length - 1,
         running: !terminal && part === segments.length - 1,
+        showPhase: state.status !== 'failed',
         part,
         totalParts: segments.length,
         processDisplay,
@@ -788,6 +792,7 @@ export function createConversationResponseStream({
           summary: terminalChatListSummary(state),
           streaming: false,
           running: false,
+          showPhase: false,
           part,
           totalParts: state.cards.length,
           processDisplay,
@@ -1467,38 +1472,21 @@ export function createConversationResponseStream({
           : 0;
         const mainTimedOut = state.status === 'started' && mainElapsed >= mainTimeoutMs;
         if (mainTimedOut) {
-          logger.warn?.('Main response stream timed out; projecting a retry terminal', {
-            requestId,
-            mainElapsed,
-            mainTimeoutMs,
-          });
-          state.output = '';
-          state.status = 'failed';
-          state.phase = MAIN_TIMEOUT_PHASE;
-          clearTransientProcess(state);
-          state.compatibilityTerminal = true;
-          if (projectionError) {
-            compactTerminalState(state);
-            state.terminalProjectionPending = true;
-            save(state);
-            return {
-              handled: true,
-              pending: true,
-              replayed: false,
-              status: state.status,
-              reason: 'main_timeout',
-            };
+          if (!Number.isSafeInteger(state.mainTimeoutObservedAt)) {
+            state.mainTimeoutObservedAt = clock();
+            logger.warn?.('Main response stream exceeded its observation window', {
+              requestId,
+              mainElapsed,
+              mainTimeoutMs,
+            });
           }
-          await render(state, { terminal: true, purpose: 'main-timeout' });
-          compactTerminalState(state);
-          state.presenceCompletionPending = true;
           save(state);
           return {
             handled: true,
-            replayed: false,
+            pending: true,
+            replayed: true,
             status: state.status,
-            reason: 'main_timeout',
-            parts: state.cards.length || 1,
+            reason: 'main_timeout_observed',
           };
         }
         if (projectionError) {
@@ -1585,13 +1573,10 @@ export function createConversationResponseStream({
         checked += 1;
         try {
           const result = await stream.apply({ requestId: state.requestId, events: [] });
-          if (result?.reason === 'queued_timeout' || result?.reason === 'main_timeout') expired += 1;
-          if (result?.reason === 'main_timeout' && result?.pending !== true) {
-            const settled = load(state.requestId);
-            if (settled?.presenceCompletionPending === true) {
-              presenceCompletionRequestIds.push(state.requestId);
-            }
-          }
+          if (
+            result?.reason === 'queued_timeout_observed'
+            || result?.reason === 'main_timeout_observed'
+          ) expired += 1;
         } catch (error) {
           failed += 1;
           logger.warn?.('Response stream timeout sweep failed', {
@@ -1651,7 +1636,7 @@ export function createConversationResponseStream({
           id,
           '',
           'failed',
-          retryable ? '⚠️ 本次处理未完成，可重试' : '⚠️ 本次处理未完成',
+          retryable ? RETRYABLE_FAILURE_PHASE : NON_RETRYABLE_FAILURE_PHASE,
         );
       } finally {
         release();

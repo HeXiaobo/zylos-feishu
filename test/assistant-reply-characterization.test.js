@@ -148,7 +148,7 @@ test('p2p and group card opening keep reaction until a delivered terminal marker
   );
 });
 
-test('queued timeout stays observational while the legacy main timeout remains projection evidence', () => {
+test('queued and main timeouts stay observational without inventing terminal failures', () => {
   const source = fs.readFileSync(
     path.join(REPO_ROOT, 'src/lib/conversation-response-stream.js'),
     'utf8',
@@ -158,13 +158,15 @@ test('queued timeout stays observational while the legacy main timeout remains p
   assert.match(source, /reason: 'queued_timeout_observed'/);
   assert.doesNotMatch(source, /Queued response stream timed out; projecting a retry terminal/);
   assert.doesNotMatch(source, /排队超时/);
-  assert.match(source, /Main response stream timed out; projecting a retry terminal/);
-  assert.match(source, /state\.status = 'failed'/);
-  assert.match(source, /本次回复未生成/);
+  assert.match(source, /Main response stream exceeded its observation window/);
+  assert.match(source, /state\.mainTimeoutObservedAt = clock\(\)/);
+  assert.match(source, /reason: 'main_timeout_observed'/);
+  assert.doesNotMatch(source, /本次处理未完成|本次回复未生成|重新发送/);
   const observation = loadContractFixture('current-behavior.json').observations
     .find((entry) => entry.name === 'projection-timeout-terminalization');
-  assert.match(observation.gap, /Runtime evidence/);
-  assert.equal(observation.target, 'projection timeout never generates RunFailed');
+  assert.equal(observation.current, 'queued/main projection timeouts are observation-only');
+  assert.equal(observation.gap, null);
+  assert.equal(observation.target, 'maintain observation-only timeout projection');
 });
 
 test('durable inbox retains replay assets and adds namespaced identities plus lane sequence', () => {
