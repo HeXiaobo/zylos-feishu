@@ -303,7 +303,7 @@ test('records a queued timeout without inventing a user-visible terminal', () =>
   assert.equal(persisted.queuedTimeoutObservedAt, now);
 }));
 
-test('fails a started stream after the configured main timeout with an honest retry terminal', () => withState(async stateDirectory => {
+test('keeps a started stream pending after the main observation window', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   let now = 1_000;
   const stream = createConversationResponseStream({
@@ -323,6 +323,7 @@ test('fails a started stream after the configured main timeout with an honest re
       event(2, 'OutputDelta', { delta: '部分答案' }),
     ],
   });
+  const callsBeforeTimeout = calls.length;
 
   now = 2_001;
   const timedOut = await stream.apply({
@@ -330,16 +331,23 @@ test('fails a started stream after the configured main timeout with an honest re
     events: [],
   });
 
-  assert.equal(timedOut.status, 'failed');
-  assert.equal(timedOut.reason, 'main_timeout');
-  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 回复超时，请重试');
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
-  assert.doesNotMatch(JSON.stringify(terminalCard), /部分答案/);
-  assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
+  assert.deepEqual(timedOut, {
+    handled: true,
+    pending: true,
+    replayed: true,
+    status: 'started',
+    reason: 'main_timeout_observed',
+  });
+  assert.equal(calls.length, callsBeforeTimeout);
+  const persisted = JSON.parse(fs.readFileSync(
+    path.join(stateDirectory, fs.readdirSync(stateDirectory).find(name => name.endsWith('.json'))),
+    'utf8',
+  ));
+  assert.equal(persisted.status, 'started');
+  assert.equal(persisted.mainTimeoutObservedAt, now);
 }));
 
-test('sweeps a started stream into timeout without waiting for another delivery', () => withState(async stateDirectory => {
+test('sweeps a started stream into an observation without closing the response', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   let now = 1_000;
   const stream = createConversationResponseStream({
@@ -364,18 +372,18 @@ test('sweeps a started stream into timeout without waiting for another delivery'
     checked: 1,
     expired: 1,
     failed: 0,
-    presenceCompletionRequestIds: ['assistant.feishu.om_1'],
+    presenceCompletionRequestIds: [],
   });
   const retry = await stream.sweepExpired();
-  assert.deepEqual(retry.presenceCompletionRequestIds, ['assistant.feishu.om_1']);
-  assert.equal(await stream.acknowledgePresenceCompletion('assistant.feishu.om_1'), true);
+  assert.deepEqual(retry.presenceCompletionRequestIds, []);
+  assert.equal(await stream.acknowledgePresenceCompletion('assistant.feishu.om_1'), false);
   assert.deepEqual((await stream.sweepExpired()).presenceCompletionRequestIds, []);
-  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 回复超时，请重试');
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
+  const currentCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(currentCard, 'zylos_answer').content, '_等待回答…_');
+  assert.doesNotMatch(JSON.stringify(currentCard), /本次处理未完成|本次回复未生成|重新发送/);
 }));
 
-test('removes stale partial output from every continuation card on main timeout', () => withState(async stateDirectory => {
+test('preserves partial output on every continuation card after the main observation window', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   let now = 1_000;
   const stream = createConversationResponseStream({
@@ -405,12 +413,13 @@ test('removes stale partial output from every continuation card on main timeout'
     .filter(([name]) => name === 'update')
     .slice(updatesBeforeTimeout);
 
-  assert.equal(timeoutUpdates.length, 3);
-  for (const [, payload] of timeoutUpdates) {
-    const card = JSON.parse(payload.data.card.data);
-    assert.doesNotMatch(JSON.stringify(card), /x{20}/);
-    assert.equal(cardElement(card, 'zylos_phase').content, '⚠️ 回复超时，请重试');
-  }
+  assert.equal(timeoutUpdates.length, 0);
+  const persisted = JSON.parse(fs.readFileSync(
+    path.join(stateDirectory, fs.readdirSync(stateDirectory).find(name => name.endsWith('.json'))),
+    'utf8',
+  ));
+  assert.equal(persisted.output, 'x'.repeat(750));
+  assert.equal(persisted.status, 'started');
 }));
 
 test('starts the main timeout only after RunStarted and keeps the queued timeout separate', () => withState(async stateDirectory => {
@@ -450,8 +459,9 @@ test('starts the main timeout only after RunStarted and keeps the queued timeout
     requestId: 'assistant.feishu.om_1',
     events: [],
   });
-  assert.equal(timedOut.status, 'failed');
-  assert.equal(timedOut.reason, 'main_timeout');
+  assert.equal(timedOut.status, 'started');
+  assert.equal(timedOut.pending, true);
+  assert.equal(timedOut.reason, 'main_timeout_observed');
 }));
 
 test('does not expire queued work that starts before the timeout boundary', () => withState(async stateDirectory => {
@@ -683,8 +693,9 @@ test('rejects empty completed answers and preserves explicit failure summaries',
       events: [event(1, 'RunFailed', { retryable: true })],
     });
     const finalCard = JSON.parse(failed.calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-    assert.equal(finalCard.config.summary.content, '⚠️ 本次处理未完成，可重试');
-    assert.match(cardElement(finalCard, 'zylos_answer').content, /请重新发送/);
+    assert.equal(finalCard.config.summary.content, '⚠️ 回复暂时中断');
+    assert.equal(cardElement(finalCard, 'zylos_phase'), undefined);
+    assert.equal(cardElement(finalCard, 'zylos_answer').content, '⚠️ 回复暂时中断，消息已记录。');
     assert.doesNotMatch(cardElement(finalCard, 'zylos_answer').content, /没有可显示的回答/);
   });
 }));
@@ -1317,8 +1328,8 @@ test('projects an explicit failure notice when C4 rejects while CardKit conversi
   assert.equal(failed.handled, true);
   assert.equal(failed.pending, undefined);
   const terminalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
-  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 本次处理未完成，可重试');
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
+  assert.equal(cardElement(terminalCard, 'zylos_phase'), undefined);
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 回复暂时中断，消息已记录。');
   assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
 }));
 
@@ -1405,12 +1416,12 @@ test('canonical Core completion corrects an earlier local failure in plain-text 
   });
   assert.deepEqual(texts, [
     '已接收，正在处理…',
-    '⚠️ 本次回复未生成，请重新发送。',
+    '⚠️ 回复暂时中断，消息已记录。',
     'Core 的纯文本最终答案',
   ]);
 }));
 
-test('renders an explicit retry instruction for a compatibility failure instead of an empty answer card', () => withState(async stateDirectory => {
+test('renders one recorded-message notice for a compatibility failure', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
   await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
@@ -1418,10 +1429,10 @@ test('renders an explicit retry instruction for a compatibility failure instead 
   await stream.fail({ requestId: 'assistant.feishu.om_1', retryable: true });
 
   const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(terminalCard.config.summary.content, '⚠️ 本次处理未完成，可重试');
-  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 本次处理未完成，可重试');
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
-  assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
+  assert.equal(terminalCard.config.summary.content, '⚠️ 回复暂时中断');
+  assert.equal(cardElement(terminalCard, 'zylos_phase'), undefined);
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 回复暂时中断，消息已记录。');
+  assert.doesNotMatch(JSON.stringify(terminalCard), /本次处理未完成|本次回复未生成|重新发送/);
 }));
 
 test('retries a deferred terminal projection after both CardKit conversion and patch fail', () => withState(async stateDirectory => {
@@ -1453,8 +1464,8 @@ test('retries a deferred terminal projection after both CardKit conversion and p
   const repaired = await stream.apply({ requestId: 'assistant.feishu.om_1', events: [] });
   assert.equal(repaired.repaired, true);
   const terminalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
-  assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 本次处理未完成，可重试');
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');
+  assert.equal(cardElement(terminalCard, 'zylos_phase'), undefined);
+  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 回复暂时中断，消息已记录。');
 }));
 
 test('legacy compatibility completion cannot overwrite an existing terminal result', () => withState(async stateDirectory => {
