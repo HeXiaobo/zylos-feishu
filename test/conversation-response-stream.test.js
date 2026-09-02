@@ -360,7 +360,16 @@ test('sweeps a started stream into timeout without waiting for another delivery'
   now = 2_001;
   const swept = await stream.sweepExpired();
 
-  assert.deepEqual(swept, { checked: 1, expired: 1, failed: 0 });
+  assert.deepEqual(swept, {
+    checked: 1,
+    expired: 1,
+    failed: 0,
+    presenceCompletionRequestIds: ['assistant.feishu.om_1'],
+  });
+  const retry = await stream.sweepExpired();
+  assert.deepEqual(retry.presenceCompletionRequestIds, ['assistant.feishu.om_1']);
+  assert.equal(await stream.acknowledgePresenceCompletion('assistant.feishu.om_1'), true);
+  assert.deepEqual((await stream.sweepExpired()).presenceCompletionRequestIds, []);
   const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
   assert.equal(cardElement(terminalCard, 'zylos_phase').content, '⚠️ 回复超时，请重试');
   assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 本次回复未生成，请重新发送。');

@@ -1491,6 +1491,7 @@ export function createConversationResponseStream({
           }
           await render(state, { terminal: true, purpose: 'main-timeout' });
           compactTerminalState(state);
+          state.presenceCompletionPending = true;
           save(state);
           return {
             handled: true,
@@ -1563,21 +1564,34 @@ export function createConversationResponseStream({
       try {
         entries = fs.readdirSync(stateDirectory, { withFileTypes: true });
       } catch (error) {
-        if (error?.code === 'ENOENT') return { checked: 0, expired: 0, failed: 0 };
+        if (error?.code === 'ENOENT') {
+          return { checked: 0, expired: 0, failed: 0, presenceCompletionRequestIds: [] };
+        }
         throw error;
       }
 
       let checked = 0;
       let expired = 0;
       let failed = 0;
+      const presenceCompletionRequestIds = [];
       for (const entry of entries) {
         if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
         const state = readState(path.join(stateDirectory, entry.name));
-        if (!state || !['queued', 'started'].includes(state.status)) continue;
+        if (!state) continue;
+        if (state.presenceCompletionPending === true) {
+          presenceCompletionRequestIds.push(state.requestId);
+        }
+        if (!['queued', 'started'].includes(state.status)) continue;
         checked += 1;
         try {
           const result = await stream.apply({ requestId: state.requestId, events: [] });
           if (result?.reason === 'queued_timeout' || result?.reason === 'main_timeout') expired += 1;
+          if (result?.reason === 'main_timeout' && result?.pending !== true) {
+            const settled = load(state.requestId);
+            if (settled?.presenceCompletionPending === true) {
+              presenceCompletionRequestIds.push(state.requestId);
+            }
+          }
         } catch (error) {
           failed += 1;
           logger.warn?.('Response stream timeout sweep failed', {
@@ -1586,7 +1600,26 @@ export function createConversationResponseStream({
           });
         }
       }
-      return { checked, expired, failed };
+      return {
+        checked,
+        expired,
+        failed,
+        presenceCompletionRequestIds: [...new Set(presenceCompletionRequestIds)].sort(),
+      };
+    },
+
+    async acknowledgePresenceCompletion(requestId) {
+      const id = requireText(requestId, 'requestId');
+      const release = await acquireRequestLock(id);
+      try {
+        const state = load(id);
+        if (!state?.presenceCompletionPending) return false;
+        delete state.presenceCompletionPending;
+        save(state);
+        return true;
+      } finally {
+        release();
+      }
     },
 
     async completeWithFullAnswer({ requestId, output } = {}) {

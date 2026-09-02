@@ -40,8 +40,13 @@ import {
 import { createTaskCommentReplyProduction } from '../src/lib/task-comment-reply-production.js';
 import { isTaskCommentsEnabled } from '../src/lib/task-comment-runtime-policy.js';
 import { isSilentResponse } from '../src/lib/silent-response.js';
+import {
+  openTypingDoneMarkerStore,
+  settlementMessageIdFromEndpoint,
+} from '../src/lib/typing-done-marker.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
+const typingDoneMarkers = openTypingDoneMarkerStore({ directory: TYPING_DIR });
 
 const MAX_LENGTH = 2000;  // Feishu message max length
 
@@ -84,7 +89,7 @@ const parsedEndpoint = parseEndpoint(rawEndpoint);
 const endpointId = parsedEndpoint.chatId;
 
 if (isSilentResponse(message)) {
-  markTypingDone(parsedEndpoint.msg);
+  settleAssistantReplyPresence();
   process.exit(0);
 }
 
@@ -358,16 +363,19 @@ async function sendMedia(type, filePath) {
  * The marker file name is the original trigger message ID.
  */
 function markTypingDone(msgId) {
-  if (!msgId) return;
-  try {
-    const safeMsgId = String(msgId).replace(/[^a-zA-Z0-9_-]/g, '_');
-    fs.mkdirSync(TYPING_DIR, { recursive: true });
-    const donePath = path.resolve(TYPING_DIR, `${safeMsgId}.done`);
-    if (!donePath.startsWith(path.resolve(TYPING_DIR) + path.sep)) return;
-    fs.writeFileSync(donePath, String(Date.now()));
-  } catch {
-    // Non-critical
+  const messageId = settlementMessageIdFromEndpoint(rawEndpoint);
+  if (!messageId) return false;
+  if (msgId !== messageId) {
+    throw new Error('terminal delivery route has no exact source message identity');
   }
+  typingDoneMarkers.mark(messageId);
+  return true;
+}
+
+function settleAssistantReplyPresence() {
+  if (taskCommentReplyEndpoint) return false;
+  markTypingDone(parsedEndpoint.msg);
+  return true;
 }
 
 /**
@@ -488,8 +496,9 @@ async function send() {
         await recordOutgoing(message);
       }
     }
-    // Mark the trigger message as replied (for typing indicator removal)
-    markTypingDone(parsedEndpoint.msg);
+    // Task comments have no inbound message reaction lifecycle. Ordinary
+    // assistant replies must durably settle their exact trigger message.
+    settleAssistantReplyPresence();
     console.log('Message sent successfully');
     process.exit(0);
   } catch (err) {
