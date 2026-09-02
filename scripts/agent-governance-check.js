@@ -15,7 +15,9 @@ const RELEASE_MANIFEST_V2 = 'zylos.release-manifest/v2';
 const V2_REPOSITORY = 'HeXiaobo/zylos-feishu';
 const PREFLIGHT_SCHEMA = 'zylos.agent-preflight/v1';
 const PUBLICATION_AUTHORIZATION_SCHEMA = 'zylos.release-publication-authorization/v1';
+const DEPLOYMENT_AUTHORIZATION_SCHEMA = 'zylos.release-deployment-authorization/v1';
 const PUBLICATION_SCOPE = 'RELEASE_GLOBAL_BUNDLE';
+const DEPLOYMENT_SCOPE = 'DEPLOY_GLOBAL_BUNDLE';
 const SHA256 = /^[0-9a-f]{64}$/;
 const PREFLIGHT_MAX_AGE_MS = 15 * 60 * 1000;
 const PREFLIGHT_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
@@ -542,13 +544,17 @@ function withoutReportBinding(authorization) {
 function validateV2OwnerAuthorization(manifest, failures, { mode }) {
   const label = 'evidence.ownerAuthorization';
   const authorization = manifest?.evidence?.ownerAuthorization;
+  const isDeploy = mode === 'deploy';
+  const expectedSchema = isDeploy ? DEPLOYMENT_AUTHORIZATION_SCHEMA : PUBLICATION_AUTHORIZATION_SCHEMA;
+  const expectedFlag = isDeploy ? 'deploymentAuthorized' : 'publicationAuthorized';
+  const expectedScope = isDeploy ? DEPLOYMENT_SCOPE : PUBLICATION_SCOPE;
   if (!isObject(authorization)) {
     failures.push(`v2 ${mode} manifest ${label} is required`);
     return;
   }
 
-  if (authorization.schema !== PUBLICATION_AUTHORIZATION_SCHEMA) {
-    failures.push(`v2 ${mode} manifest ${label}.schema must be ${PUBLICATION_AUTHORIZATION_SCHEMA}`);
+  if (authorization.schema !== expectedSchema) {
+    failures.push(`v2 ${mode} manifest ${label}.schema must be ${expectedSchema}`);
   }
   if (authorization.status !== 'PASS') {
     failures.push(`v2 ${mode} manifest ${label}.status must be PASS (found ${authorization.status ?? 'missing'})`);
@@ -568,14 +574,11 @@ function validateV2OwnerAuthorization(manifest, failures, { mode }) {
   if (!canonicalIsoTimestamp(authorization.authorizedAt)) {
     failures.push(`v2 ${mode} manifest ${label}.authorizedAt must be a canonical ISO timestamp`);
   }
-  if (authorization.publicationAuthorized !== true) {
-    failures.push(`v2 ${mode} manifest ${label}.publicationAuthorized must be true`);
+  if (authorization[expectedFlag] !== true) {
+    failures.push(`v2 ${mode} manifest ${label}.${expectedFlag} must be true`);
   }
-  if (authorization.scope !== PUBLICATION_SCOPE) {
-    failures.push(`v2 ${mode} manifest ${label}.scope must be exactly ${PUBLICATION_SCOPE}`);
-  }
-  if (mode === 'deploy' && authorization.deploymentAuthorized !== true) {
-    failures.push(`v2 deploy manifest ${label}.deploymentAuthorized must be true`);
+  if (authorization.scope !== expectedScope) {
+    failures.push(`v2 ${mode} manifest ${label}.scope must be exactly ${expectedScope}`);
   }
 
   validateExactCandidateBundle(`${mode} manifest ${label}.bundle`, authorization.bundle, candidateBundle(manifest), failures);
@@ -649,13 +652,23 @@ function validatePreflightReceipt(manifest, failures, { mode }) {
   if (mode === 'deploy') {
     if (receipt.deploymentStage !== 'final') failures.push(`${label}.report.deploymentStage must be final`);
     if (receipt.deploymentAllowed !== true) failures.push(`${label}.report.deploymentAllowed must be true`);
-    if (receipt.publicationAllowed !== true) failures.push(`${label}.report.publicationAllowed must be true`);
+    if (receipt.publicationAllowed !== false) failures.push(`${label}.report.publicationAllowed must be false`);
   } else {
     if (receipt.deploymentStage !== null && receipt.deploymentStage !== undefined) {
       failures.push(`${label}.report.deploymentStage must be null for publication`);
     }
     if (receipt.publicationAllowed !== true) failures.push(`${label}.report.publicationAllowed must be true`);
     if (typeof receipt.deploymentAllowed !== 'boolean') failures.push(`${label}.report.deploymentAllowed must be boolean`);
+  }
+  if (typeof receipt.publicationAllowed !== 'boolean') {
+    failures.push(`${label}.report.publicationAllowed must be boolean`);
+  } else if (receipt.publicationAllowed !== manifest.publicationAllowed) {
+    failures.push(`${label}.report.publicationAllowed must match manifest`);
+  }
+  if (typeof receipt.deploymentAllowed !== 'boolean') {
+    failures.push(`${label}.report.deploymentAllowed must be boolean`);
+  } else if (receipt.deploymentAllowed !== manifest.deploymentAllowed) {
+    failures.push(`${label}.report.deploymentAllowed must match manifest`);
   }
   if (!freshIsoTimestamp(receipt.generatedAt)) {
     failures.push(`${label}.report.generatedAt must be a fresh canonical ISO timestamp`);
@@ -745,6 +758,9 @@ export function validateReleaseManifest({
       }
       if (manifest.deploymentAllowed !== true) {
         failures.push('release manifest deploymentAllowed must be true');
+      }
+      if (manifest.publicationAllowed !== false) {
+        failures.push('v2 deploy manifest publicationAllowed must be false');
       }
     }
   } else {

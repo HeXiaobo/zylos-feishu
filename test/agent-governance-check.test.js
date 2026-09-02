@@ -105,13 +105,23 @@ function bindPreflightReceipt(
 
 function hardenV2Manifest(manifest, directory, { deploy = false } = {}) {
   const authorization = manifest.evidence.ownerAuthorization;
-  authorization.schema = 'zylos.release-publication-authorization/v1';
+  authorization.schema = deploy
+    ? 'zylos.release-deployment-authorization/v1'
+    : 'zylos.release-publication-authorization/v1';
   authorization.releaseId = manifest.releaseId;
   authorization.authorizedBy = 'owner@example.invalid';
   authorization.authorizationRef = `task:${manifest.releaseId}`;
   authorization.authorizedAt = new Date().toISOString();
-  authorization.publicationAuthorized = true;
-  authorization.scope = 'RELEASE_GLOBAL_BUNDLE';
+  if (deploy) {
+    manifest.publicationAllowed = false;
+    delete authorization.publicationAuthorized;
+    authorization.deploymentAuthorized = true;
+    authorization.scope = 'DEPLOY_GLOBAL_BUNDLE';
+  } else {
+    delete authorization.deploymentAuthorized;
+    authorization.publicationAuthorized = true;
+    authorization.scope = 'RELEASE_GLOBAL_BUNDLE';
+  }
   authorization.bundle = {
     coreSha: manifest.candidate.core.sha,
     feishuSha: manifest.candidate.feishu.sha,
