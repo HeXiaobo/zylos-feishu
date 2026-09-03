@@ -1206,7 +1206,7 @@ async function sendToC4(
   endpoint,
   content,
   onReject,
-  { taskEnvelope, workIntakeEnvelope, assistantRequest, onSuccess } = {},
+  { taskEnvelope, workIntakeEnvelope, assistantRequest, priority, onSuccess } = {},
 ) {
   if (!content) {
     throw new TypeError('sendToC4 content must be non-empty');
@@ -1217,6 +1217,7 @@ async function sendToC4(
     source,
     endpoint,
     content,
+    priority,
     taskEnvelope,
     assistantRequest,
     workIntakeEnvelope,
@@ -2225,6 +2226,11 @@ async function handleMessage(data, metadata = {}) {
   }
 
   const extracted = await extractMessageContent(message);
+  // Issue #53: the runtime admission queue sorts by priority (1 highest, 3
+  // default). Owner DMs must not wait behind high-volume bot traffic, so they
+  // enter at priority 2; everyone else keeps the default. Group paths are
+  // intentionally untouched.
+  const dmPriority = chatType === 'p2p' && isOwner(senderUserId, senderOpenId) ? 2 : undefined;
   let { text } = extracted;
   const { imageKeys, fileKey, fileName } = extracted;
   const explicitTaskText = resolveMentions(text, mentions, {
@@ -2352,10 +2358,10 @@ async function handleMessage(data, metadata = {}) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('p2p', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, [], mediaPaths[0], { quotedContent, threadContext, threadRootId });
-        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined, priority: dmPriority });
       } else {
         const msg = formatMessage('p2p', senderName, '[image download failed]', [], null, { quotedContent, threadContext, threadRootId });
-        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined, priority: dmPriority });
       }
       return;
     }
@@ -2372,10 +2378,10 @@ async function handleMessage(data, metadata = {}) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('p2p', senderName, `[file: ${fileName}]`, [], localPath, { quotedContent, threadContext, threadRootId });
-        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined, priority: dmPriority });
       } else {
         const msg = formatMessage('p2p', senderName, `[file download failed: ${fileName}]`, [], null, { quotedContent, threadContext, threadRootId });
-        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, rejectReply, { assistantRequest: assistantRequest || undefined, priority: dmPriority });
       }
       return;
     }
@@ -2401,6 +2407,7 @@ async function handleMessage(data, metadata = {}) {
         : undefined,
       workIntakeEnvelope: workIntakeEnvelope || undefined,
       assistantRequest: assistantRequest || undefined,
+      priority: dmPriority,
       onSuccess: workIntakeEnvelope
         ? async (response) => {
           const result = await handleWorkIntakeResult(response, {

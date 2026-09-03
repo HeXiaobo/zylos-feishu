@@ -123,6 +123,7 @@ export function buildC4ReceiveArgs({
   source,
   endpoint,
   content,
+  priority,
   taskEnvelope,
   assistantRequest,
   workIntakeEnvelope,
@@ -138,6 +139,12 @@ export function buildC4ReceiveArgs({
     '--endpoint', endpoint,
     '--json',
   ];
+  if (priority !== undefined) {
+    if (!Number.isInteger(priority) || priority < 1 || priority > 3) {
+      throw new TypeError('priority must be an integer 1, 2, or 3');
+    }
+    args.push('--priority', String(priority));
+  }
   if (taskEnvelope) {
     args.push('--task-envelope-json', JSON.stringify(taskEnvelope));
   }
