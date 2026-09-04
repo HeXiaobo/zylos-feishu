@@ -478,9 +478,10 @@ async function send() {
           });
           streamed = result.handled === true;
         } catch (error) {
-          // The placeholder already owns this assistant request. Any error here
-          // is retried against that same durable stream; emitting a fresh
-          // message would risk a duplicate after an ambiguous Feishu outcome.
+          // The durable stream owns this assistant request. The two-card
+          // terminal delivers the answer as new message(s) keyed by a stable
+          // per-part Feishu uuid, so retries of this same request are
+          // deduplicated by Feishu; re-throwing keeps that single path.
           throw error;
         }
       }
