@@ -12,6 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   add `ROADMAP.md` to reflect the current native Task / CardKit / Smart-mode
   direction.
 
+## [0.3.7-rc.18] - 2026-09-04
+
+### Fixed
+- Route streaming replies to plain messages when `message.useMarkdownCard`
+  is false: the streaming intake now honors the same config as the c4-send
+  proactive path (a 'received' receipt, progress silently skipped, and the
+  final answer delivered as a separate re-notifying message instead of
+  mutating one in-place card that never notifies on completion and clears
+  the unread state on open). The admin `set-markdown-card` hot-reload
+  toggle now covers both delivery paths without a restart (#57).
+
 ## [0.3.7-rc.17] - 2026-09-04
 
 ### Fixed
