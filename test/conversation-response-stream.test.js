@@ -97,7 +97,7 @@ function withState(testFn) {
     .finally(() => fs.rmSync(directory, { recursive: true, force: true }));
 }
 
-test('opens once, coalesces real deltas, keeps sequence monotonic, and closes the same card', () => withState(async stateDirectory => {
+test('opens once, coalesces real deltas, keeps sequence monotonic, and delivers the answer as a new card', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   let now = 1_000;
   const stream = createConversationResponseStream({
@@ -126,7 +126,9 @@ test('opens once, coalesces real deltas, keeps sequence monotonic, and closes th
   const updatesAfterDelta = calls.filter(([name]) => name === 'update');
   assert.equal(updatesAfterDelta.length, 1, 'one batch must coalesce both deltas into one CardKit update');
   const deltaCard = JSON.parse(updatesAfterDelta[0][1].data.card.data);
-  assert.equal(deltaCard.body.elements[1].content, '真实增量');
+  assert.equal(cardElement(deltaCard, 'zylos_answer'), undefined, 'the status card never carries the answer');
+  assert.equal(deltaCard.body.elements.length, 1);
+  assert.match(processDetail(deltaCard), /正在生成回答/);
   assert.equal(JSON.stringify(deltaCard).includes('must-not-render'), false);
 
   await stream.apply({
@@ -137,15 +139,27 @@ test('opens once, coalesces real deltas, keeps sequence monotonic, and closes th
   const closes = calls.filter(([name]) => name === 'close').map(([, payload]) => payload);
   assert.deepEqual(updates.map(call => call.data.sequence), [1, 2]);
   assert.deepEqual(closes.map(call => call.data.sequence), [3]);
-  const finalCard = JSON.parse(updates.at(-1).data.card.data);
+  const finalStatusCard = JSON.parse(updates.at(-1).data.card.data);
   const closeSettings = JSON.parse(closes[0].data.settings);
-  assert.equal(finalCard.config.streaming_mode, false);
-  assert.equal(finalCard.config.summary.content, '真实完整答案');
-  assert.equal(closeSettings.config.summary.content, '真实完整答案');
-  assert.equal(cardElement(finalCard, 'zylos_phase'), undefined);
-  assert.equal(cardElement(finalCard, 'zylos_answer').content, '真实完整答案');
-  assert.equal(finalCard.body.elements.length, 1);
-  assert.equal(cardElement(finalCard, 'zylos_answer').element_id.length <= 20, true);
+  assert.equal(finalStatusCard.config.streaming_mode, false);
+  assert.equal(finalStatusCard.config.summary.content, '已完成');
+  assert.equal(closeSettings.config.summary.content, '已完成');
+  assert.equal(cardElement(finalStatusCard, 'zylos_phase').content, '✅ 已完成');
+  assert.equal(cardElement(finalStatusCard, 'zylos_answer'), undefined);
+
+  const answerSends = calls.filter(([name]) => name === 'send').slice(1);
+  assert.equal(answerSends.length, 1, 'the answer arrives as one new card message');
+  const answerCard = JSON.parse(answerSends[0][1].data.content);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '真实完整答案');
+  assert.equal(answerCard.config.streaming_mode, false);
+  assert.equal(cardElement(answerCard, 'zylos_phase'), undefined);
+
+  const replayedTerminal = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(7, 'RunCompleted', { output: '真实完整答案' })],
+  });
+  assert.equal(replayedTerminal.replayed, true, 'a durable terminal replay must not resend the answer');
+  assert.equal(calls.filter(([name]) => name === 'send').length, 2);
 }));
 
 test('visible Core events may start late and keep their original non-contiguous sequence', () => withState(async stateDirectory => {
@@ -202,24 +216,13 @@ for (const conversion of [true, false]) {
       events: [eventFor(requestB, 3, 'RunCompleted', { output: 'B 的答案' })],
     });
 
-    const terminalWrites = calls.flatMap(([operation, payload]) => {
-      if (operation === 'update') {
-        const card = JSON.parse(payload.data.card.data);
-        return card.config.streaming_mode === false
-          ? [{ target: payload.path.card_id, answer: cardElement(card, 'zylos_answer').content }]
-          : [];
-      }
-      if (operation === 'patch') {
-        const card = JSON.parse(payload.data.content);
-        return card.config.streaming_mode === false
-          ? [{ target: payload.path.message_id, answer: cardElement(card, 'zylos_answer').content }]
-          : [];
-      }
-      return [];
-    });
+    const answerCards = calls
+      .filter(([operation]) => operation === 'send')
+      .map(([, payload]) => JSON.parse(payload.data.content))
+      .filter(card => cardElement(card, 'zylos_answer'));
 
-    assert.ok(terminalWrites.some(write => write.target.includes('om_response_1') && write.answer === 'A 的答案'));
-    assert.ok(terminalWrites.some(write => write.target.includes('om_response_2') && write.answer === 'B 的答案'));
+    assert.ok(answerCards.some(card => cardElement(card, 'zylos_answer').content === 'A 的答案'));
+    assert.ok(answerCards.some(card => cardElement(card, 'zylos_answer').content === 'B 的答案'));
     const completedSends = calls.filter(([operation, payload]) => {
       if (operation !== 'send') return false;
       const card = JSON.parse(payload.data.content);
@@ -229,7 +232,7 @@ for (const conversion of [true, false]) {
   }));
 }
 
-test('phase events stay visible while running and disappear when completion supplies the answer', () => withState(async stateDirectory => {
+test('phase events stay visible while running and the terminal status card shows 已完成', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({
     client,
@@ -247,7 +250,7 @@ test('phase events stay visible while running and disappear when completion supp
     ],
   });
   const progressCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.match(cardElement(progressCard, 'zylos_answer').content, /等待回答/);
+  assert.equal(cardElement(progressCard, 'zylos_answer'), undefined);
   assert.equal(cardElement(progressCard, 'zylos_progress').header.title.content, '正在整理结果');
   assert.match(processDetail(progressCard), /正在分析问题/);
   assert.match(processDetail(progressCard), /正在整理结果/);
@@ -256,10 +259,12 @@ test('phase events stay visible while running and disappear when completion supp
     requestId: 'assistant.feishu.om_1',
     events: [event(5, 'RunCompleted', { output: '只有完整答案，没有伪造 token 流。' })],
   });
-  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(cardElement(finalCard, 'zylos_phase'), undefined);
-  assert.equal(cardElement(finalCard, 'zylos_answer').content, '只有完整答案，没有伪造 token 流。');
-  assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
+  const finalStatusCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(finalStatusCard, 'zylos_phase').content, '✅ 已完成');
+  assert.equal(cardElement(finalStatusCard, 'zylos_answer'), undefined);
+  assert.equal(finalStatusCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '只有完整答案，没有伪造 token 流。');
 }));
 
 test('records a queued timeout without inventing a user-visible terminal', () => withState(async stateDirectory => {
@@ -379,11 +384,12 @@ test('sweeps a started stream into an observation without closing the response',
   assert.equal(await stream.acknowledgePresenceCompletion('assistant.feishu.om_1'), false);
   assert.deepEqual((await stream.sweepExpired()).presenceCompletionRequestIds, []);
   const currentCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(cardElement(currentCard, 'zylos_answer').content, '_等待回答…_');
+  assert.equal(cardElement(currentCard, 'zylos_answer'), undefined, 'no answer cards exist before completion');
+  assert.equal(cardElement(currentCard, 'zylos_progress').header.title.content, '思考中');
   assert.doesNotMatch(JSON.stringify(currentCard), /本次处理未完成|本次回复未生成|重新发送/);
 }));
 
-test('preserves partial output on every continuation card after the main observation window', () => withState(async stateDirectory => {
+test('preserves partial output durably without spawning answer cards mid-stream', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   let now = 1_000;
   const stream = createConversationResponseStream({
@@ -404,7 +410,7 @@ test('preserves partial output on every continuation card after the main observa
       event(2, 'OutputDelta', { delta: 'x'.repeat(750) }),
     ],
   });
-  assert.equal(calls.filter(([name]) => name === 'reply').length, 3);
+  assert.equal(calls.filter(([name]) => name === 'reply').length, 1, 'deltas never spawn cards before the terminal');
 
   const updatesBeforeTimeout = calls.filter(([name]) => name === 'update').length;
   now = 2_001;
@@ -524,9 +530,12 @@ test('allows canonical completion to repair a queued-timeout compatibility termi
   });
 
   assert.equal(completed.status, 'completed');
-  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(cardElement(finalCard, 'zylos_answer').content, '延迟到达的真实答案');
-  assert.doesNotMatch(JSON.stringify(finalCard), /排队超时/);
+  const finalStatusCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(finalStatusCard, 'zylos_phase').content, '✅ 已完成');
+  assert.doesNotMatch(JSON.stringify(finalStatusCard), /排队超时/);
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '延迟到达的真实答案');
+  assert.doesNotMatch(JSON.stringify(answerCard), /排队超时/);
 }));
 
 test('allows canonical completion to repair a main-timeout compatibility terminal', () => withState(async stateDirectory => {
@@ -556,12 +565,15 @@ test('allows canonical completion to repair a main-timeout compatibility termina
   });
 
   assert.equal(completed.status, 'completed');
-  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(cardElement(finalCard, 'zylos_answer').content, '迟到但真实的答案');
-  assert.doesNotMatch(JSON.stringify(finalCard), /回复超时/);
+  const finalStatusCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(finalStatusCard, 'zylos_phase').content, '✅ 已完成');
+  assert.doesNotMatch(JSON.stringify(finalStatusCard), /回复超时/);
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '迟到但真实的答案');
+  assert.doesNotMatch(JSON.stringify(answerCard), /回复超时/);
 }));
 
-test('keeps one current status collapsed above the streaming answer without numbered boilerplate', () => withState(async stateDirectory => {
+test('keeps one current status in the collapsed panel without numbered boilerplate', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
   await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
@@ -575,17 +587,17 @@ test('keeps one current status collapsed above the streaming answer without numb
   });
 
   const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  const [status, answer] = card.body.elements;
+  const [status] = card.body.elements;
+  assert.equal(card.body.elements.length, 1, 'the status card carries only the process panel');
   assert.equal(status.tag, 'collapsible_panel');
   assert.equal(status.element_id, 'zylos_progress');
   assert.equal(status.expanded, false);
   assert.equal(status.header.title.content, '正在整理结果');
-  assert.equal(answer.element_id, 'zylos_answer');
-  assert.match(answer.content, /等待回答/);
   assert.match(status.elements[0].content, /正在分析问题/);
   assert.match(status.elements[0].content, /正在读取资料/);
   assert.equal(/^\d+\./m.test(status.elements[0].content), false);
   assert.equal(card.body.elements.some(element => element.element_id === 'zylos_phase'), false);
+  assert.equal(card.body.elements.some(element => element.element_id === 'zylos_answer'), false);
 }));
 
 test('uses the compact thinking status before tool progress arrives', () => withState(async stateDirectory => {
@@ -618,7 +630,7 @@ test('keeps the collapsed process panel when CardKit falls back to ordinary card
   assert.equal(cardElement(card, 'zylos_progress').tag, 'collapsible_panel');
   assert.equal(cardElement(card, 'zylos_progress').expanded, false);
   assert.match(cardElement(card, 'zylos_progress').elements[0].content, /正在读取资料/);
-  assert.match(cardElement(card, 'zylos_answer').content, /等待回答/);
+  assert.equal(cardElement(card, 'zylos_answer'), undefined);
 }));
 
 test('uses a user-facing chat-list summary in both running card modes', async () => {
@@ -642,7 +654,7 @@ test('uses a user-facing chat-list summary in both running card modes', async ()
   }
 });
 
-test('normalizes the completed answer into the ordinary-card chat-list summary', async () => {
+test('normalizes the completed answer into the delivered answer-card chat-list summary', async () => {
   for (const chatType of ['p2p', 'group']) {
     await withState(async stateDirectory => {
       const { client, calls } = createClient({ conversion: false });
@@ -658,9 +670,12 @@ test('normalizes the completed answer into the ordinary-card chat-list summary',
         ],
       });
 
-      const finalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
-      assert.equal(finalCard.config.summary.content, '真实结果 已完成 详情');
-      assert.equal(cardElement(finalCard, 'zylos_answer').content, output);
+      const statusCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+      assert.equal(statusCard.config.summary.content, '已完成');
+      assert.equal(cardElement(statusCard, 'zylos_answer'), undefined);
+      const answerCard = JSON.parse(calls.filter(([name]) => name === 'send' || name === 'reply').at(-1)[1].data.content);
+      assert.equal(answerCard.config.summary.content, '真实结果 已完成 详情');
+      assert.equal(cardElement(answerCard, 'zylos_answer').content, output);
     });
   }
 });
@@ -692,15 +707,20 @@ test('rejects empty completed answers and preserves explicit failure summaries',
       requestId: 'assistant.feishu.om_1',
       events: [event(1, 'RunFailed', { retryable: true })],
     });
-    const finalCard = JSON.parse(failed.calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-    assert.equal(finalCard.config.summary.content, '⚠️ 回复暂时中断');
-    assert.equal(cardElement(finalCard, 'zylos_phase'), undefined);
-    assert.equal(cardElement(finalCard, 'zylos_answer').content, '⚠️ 回复暂时中断，消息已记录。');
-    assert.doesNotMatch(cardElement(finalCard, 'zylos_answer').content, /没有可显示的回答/);
+    const finalStatusCard = JSON.parse(failed.calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+    assert.equal(finalStatusCard.config.summary.content, '⚠️ 回复暂时中断');
+    assert.equal(cardElement(finalStatusCard, 'zylos_phase').content, '⚠️ 回复暂时中断');
+    assert.equal(cardElement(finalStatusCard, 'zylos_answer'), undefined);
+    const failureNotices = failed.calls
+      .filter(([name]) => name === 'send')
+      .map(([, payload]) => JSON.parse(payload.data.content))
+      .filter(content => Object.hasOwn(content, 'text'));
+    assert.equal(failureNotices.length, 1, 'the failure notice arrives as a new message');
+    assert.equal(failureNotices[0].text, '⚠️ 回复暂时中断，消息已记录。');
   });
 }));
 
-test('can hide transient process UI while continuing to stream the answer', () => withState(async stateDirectory => {
+test('can hide transient process UI behind a compact phase line while the answer streams separately', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({
     client,
@@ -720,8 +740,8 @@ test('can hide transient process UI while continuing to stream the answer', () =
   });
 
   const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.deepEqual(card.body.elements.map(element => element.element_id), ['zylos_answer']);
-  assert.equal(card.body.elements[0].content, '答案正在逐步出现。');
+  assert.deepEqual(card.body.elements.map(element => element.element_id), ['zylos_phase']);
+  assert.equal(card.body.elements[0].content, '正在生成回答');
   assert.equal(card.config.streaming_mode, true);
 }));
 
@@ -739,12 +759,12 @@ test('keeps long completed answers free of extra copy actions', () => withState(
     ],
   });
 
-  const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(Buffer.byteLength(card.config.summary.content, 'utf8') <= 120, true);
-  assert.equal(card.config.summary.content.endsWith('…'), true);
-  assert.equal(cardElement(card, 'zylos_answer').content, '这是一段需要方便复制的较长回答。'.repeat(12));
-  assert.equal(card.body.elements.some(element => element.element_id === 'zylos_copy'), false);
-  assert.deepEqual(card.body.elements.map(element => element.tag), ['markdown']);
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(Buffer.byteLength(answerCard.config.summary.content, 'utf8') <= 120, true);
+  assert.equal(answerCard.config.summary.content.endsWith('…'), true);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '这是一段需要方便复制的较长回答。'.repeat(12));
+  assert.equal(answerCard.body.elements.some(element => element.element_id === 'zylos_copy'), false);
+  assert.deepEqual(answerCard.body.elements.map(element => element.tag), ['markdown']);
 }));
 
 test('sends proactive text as the same completed response card without a placeholder', () => withState(async stateDirectory => {
@@ -879,7 +899,7 @@ test('streams public reasoning in its own card region without mixing it into the
   });
 
   const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(cardElement(card, 'zylos_answer').content, '这是答案。');
+  assert.equal(cardElement(card, 'zylos_answer'), undefined, 'the answer never mixes into the status card');
   assert.equal(cardElement(card, 'zylos_progress').header.title.content, '正在生成回答');
   assert.match(processDetail(card), /正在分析问题[\s\S]*正在生成回答/);
   assert.match(processDetail(card), /工作摘要/);
@@ -899,8 +919,10 @@ test('streams public reasoning in its own card region without mixing it into the
     requestId: 'assistant.feishu.om_1',
     events: [event(7, 'RunCompleted', { output: '这是最终答案。' })],
   });
-  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
+  const finalStatusCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(finalStatusCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
+  const finalAnswerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(cardElement(finalAnswerCard, 'zylos_answer').content, '这是最终答案。');
   const finalState = JSON.parse(fs.readFileSync(
     fs.readdirSync(stateDirectory)
       .filter(name => name.endsWith('.json'))
@@ -982,7 +1004,7 @@ test('renders fixed public action progress without exposing model-authored summa
   assert.equal(finalCard.body.elements.some(element => element.element_id === 'zylos_progress'), false);
 }));
 
-test('swaps to continuation cards only when the verified answer exceeds one card', () => withState(async stateDirectory => {
+test('splits the delivered answer across new cards only when it exceeds one card', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({
     client,
@@ -1000,14 +1022,18 @@ test('swaps to continuation cards only when the verified answer exceeds one card
       event(4, 'OutputDelta', { delta: 'x'.repeat(750) }),
     ],
   });
-  assert.equal(calls.filter(([name]) => name === 'reply').length, 3);
-  assert.equal(calls.filter(([name]) => name === 'close').length >= 2, true);
-  const cards = calls
-    .filter(([name]) => name === 'reply')
-    .map(([, payload]) => JSON.parse(payload.data.content));
-  assert.equal(cards[0].body.elements[1].content.includes('续'), false);
-  assert.match(cards[1].body.elements[1].content, /续 2/);
-  assert.match(cards[2].body.elements[1].content, /续 3/);
+  assert.equal(calls.filter(([name]) => name === 'reply').length, 1, 'only the status card exists mid-stream');
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(5, 'RunCompleted', { output: 'x'.repeat(750) })],
+  });
+  const answerReplies = calls.filter(([name]) => name === 'reply').slice(1);
+  assert.equal(answerReplies.length, 3, 'the overlong answer arrives as three new cards');
+  const cards = answerReplies.map(([, payload]) => JSON.parse(payload.data.content));
+  assert.equal(cards[0].body.elements[0].content.includes('续'), false);
+  assert.match(cards[1].body.elements[0].content, /续 2/);
+  assert.match(cards[2].body.elements[0].content, /续 3/);
 }));
 
 test('overlong output remains deliverable when CardKit conversion is unavailable', () => withState(async stateDirectory => {
@@ -1035,7 +1061,7 @@ test('overlong output remains deliverable when CardKit conversion is unavailable
   assert.equal(calls.some(([name]) => name === 'update' || name === 'close'), false);
 }));
 
-test('patches every continuation card when CardKit conversion becomes unavailable', () => withState(async stateDirectory => {
+test('never converts or patches delivered answer cards', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   let conversionAttempts = 0;
   client.cardkit.v1.card.idConvert = async payload => {
@@ -1062,20 +1088,13 @@ test('patches every continuation card when CardKit conversion becomes unavailabl
     ],
   });
 
-  const continuationReplies = calls
-    .filter(([name]) => name === 'reply')
-    .slice(1);
-  const patchedMessageIds = calls
-    .filter(([name]) => name === 'patch')
-    .map(([, payload]) => payload.path.message_id);
-  assert.equal(continuationReplies.length >= 2, true);
-  assert.equal(patchedMessageIds.length, continuationReplies.length);
-  assert.deepEqual(
-    patchedMessageIds,
-    continuationReplies.map(([, payload], index) => `om_response_${index + 2}`),
-  );
-  assert.equal(calls.filter(([name]) => name === 'update').length, 1);
-  assert.equal(conversionAttempts, continuationReplies.length + 1);
+  const answerReplies = calls.filter(([name]) => name === 'reply').slice(1);
+  assert.equal(answerReplies.length >= 2, true);
+  const answerCards = answerReplies.map(([, payload]) => JSON.parse(payload.data.content));
+  assert.equal(answerCards.every(card => cardElement(card, 'zylos_answer')), true);
+  assert.equal(conversionAttempts, 1, 'only the status placeholder is converted to CardKit');
+  assert.equal(calls.filter(([name]) => name === 'patch').length, 0, 'answer cards are never patched in place');
+  assert.equal(calls.filter(([name]) => name === 'update').length, 1, 'only the terminal status card is updated');
 }));
 
 test('survives process restart and resumes from persisted sequence without duplicate send', () => withState(async stateDirectory => {
@@ -1095,7 +1114,9 @@ test('survives process restart and resumes from persisted sequence without dupli
     requestId: 'assistant.feishu.om_1',
     events: [event(4, 'RunCompleted', { output: '重启后完成' })],
   });
-  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 2, 'status placeholder plus one answer card');
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '重启后完成');
   assert.deepEqual(
     calls.filter(([name]) => name === 'update').map(([, payload]) => payload.data.sequence),
     [1, 2],
@@ -1303,10 +1324,13 @@ test('repairs compatibility completion through the existing placeholder when Car
 
   assert.equal(completed.handled, true);
   assert.equal(completed.pending, undefined);
-  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 2, 'status placeholder plus one answer card');
   assert.equal(calls.filter(([name]) => name === 'patch').length, 2);
-  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '等待可靠事件投影的答案');
+  const terminalStatusCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+  assert.equal(cardElement(terminalStatusCard, 'zylos_phase').content, '✅ 已完成');
+  assert.equal(cardElement(terminalStatusCard, 'zylos_answer'), undefined);
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '等待可靠事件投影的答案');
 }));
 
 test('projects an explicit failure notice when C4 rejects while CardKit conversion fails', () => withState(async stateDirectory => {
@@ -1327,10 +1351,16 @@ test('projects an explicit failure notice when C4 rejects while CardKit conversi
 
   assert.equal(failed.handled, true);
   assert.equal(failed.pending, undefined);
-  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
-  assert.equal(cardElement(terminalCard, 'zylos_phase'), undefined);
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 回复暂时中断，消息已记录。');
-  assert.doesNotMatch(JSON.stringify(terminalCard), /没有可显示的回答/);
+  const terminalStatusCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+  assert.equal(cardElement(terminalStatusCard, 'zylos_phase').content, '⚠️ 回复暂时中断');
+  assert.equal(cardElement(terminalStatusCard, 'zylos_answer'), undefined);
+  assert.doesNotMatch(JSON.stringify(terminalStatusCard), /没有可显示的回答/);
+  const failureNotices = calls
+    .filter(([name]) => name === 'send')
+    .map(([, payload]) => JSON.parse(payload.data.content))
+    .filter(content => Object.hasOwn(content, 'text'));
+  assert.equal(failureNotices.length, 1);
+  assert.equal(failureNotices[0].text, '⚠️ 回复暂时中断，消息已记录。');
 }));
 
 test('legacy full-answer completion finalizes the existing card and durable terminal replay is a no-op', () => withState(async stateDirectory => {
@@ -1344,10 +1374,13 @@ test('legacy full-answer completion finalizes the existing card and durable term
   assert.equal(completed.handled, true);
   const compatibilityCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
   const compatibilityClose = JSON.parse(calls.filter(([name]) => name === 'close').at(-1)[1].data.settings);
-  assert.equal(compatibilityCard.config.summary.content, '兼容完整答案');
-  assert.equal(compatibilityClose.config.summary.content, '兼容完整答案');
-  assert.equal(cardElement(compatibilityCard, 'zylos_phase'), undefined);
-  assert.equal(cardElement(compatibilityCard, 'zylos_answer').content, '兼容完整答案');
+  assert.equal(compatibilityCard.config.summary.content, '已完成');
+  assert.equal(compatibilityClose.config.summary.content, '已完成');
+  assert.equal(cardElement(compatibilityCard, 'zylos_phase').content, '✅ 已完成');
+  assert.equal(cardElement(compatibilityCard, 'zylos_answer'), undefined);
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(answerCard.config.summary.content, '兼容完整答案');
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '兼容完整答案');
   const apiCallCount = calls.length;
   await stream.apply({
     requestId: 'assistant.feishu.om_1',
@@ -1384,9 +1417,11 @@ test('canonical Core completion corrects an earlier local ambiguous failure on t
   });
   assert.equal(completed.status, 'completed');
   const finalUpdate = calls.filter(([name]) => name === 'update').at(-1)[1];
-  const finalCard = JSON.parse(finalUpdate.data.card.data);
-  assert.equal(cardElement(finalCard, 'zylos_phase'), undefined);
-  assert.equal(cardElement(finalCard, 'zylos_answer').content, 'Core 的最终答案');
+  const finalStatusCard = JSON.parse(finalUpdate.data.card.data);
+  assert.equal(cardElement(finalStatusCard, 'zylos_phase').content, '✅ 已完成');
+  assert.equal(cardElement(finalStatusCard, 'zylos_answer'), undefined);
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, 'Core 的最终答案');
 }));
 
 test('canonical Core completion corrects an earlier local failure in plain-text fallback', () => withState(async stateDirectory => {
@@ -1428,11 +1463,17 @@ test('renders one recorded-message notice for a compatibility failure', () => wi
 
   await stream.fail({ requestId: 'assistant.feishu.om_1', retryable: true });
 
-  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
-  assert.equal(terminalCard.config.summary.content, '⚠️ 回复暂时中断');
-  assert.equal(cardElement(terminalCard, 'zylos_phase'), undefined);
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 回复暂时中断，消息已记录。');
-  assert.doesNotMatch(JSON.stringify(terminalCard), /本次处理未完成|本次回复未生成|重新发送/);
+  const terminalStatusCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(terminalStatusCard.config.summary.content, '⚠️ 回复暂时中断');
+  assert.equal(cardElement(terminalStatusCard, 'zylos_phase').content, '⚠️ 回复暂时中断');
+  assert.equal(cardElement(terminalStatusCard, 'zylos_answer'), undefined);
+  assert.doesNotMatch(JSON.stringify(terminalStatusCard), /本次处理未完成|本次回复未生成|重新发送/);
+  const failureNotices = calls
+    .filter(([name]) => name === 'send')
+    .map(([, payload]) => JSON.parse(payload.data.content))
+    .filter(content => Object.hasOwn(content, 'text'));
+  assert.equal(failureNotices.length, 1, 'one recorded-message notice as a new message');
+  assert.equal(failureNotices[0].text, '⚠️ 回复暂时中断，消息已记录。');
 }));
 
 test('retries a deferred terminal projection after both CardKit conversion and patch fail', () => withState(async stateDirectory => {
@@ -1463,9 +1504,15 @@ test('retries a deferred terminal projection after both CardKit conversion and p
 
   const repaired = await stream.apply({ requestId: 'assistant.feishu.om_1', events: [] });
   assert.equal(repaired.repaired, true);
-  const terminalCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
-  assert.equal(cardElement(terminalCard, 'zylos_phase'), undefined);
-  assert.equal(cardElement(terminalCard, 'zylos_answer').content, '⚠️ 回复暂时中断，消息已记录。');
+  const terminalStatusCard = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+  assert.equal(cardElement(terminalStatusCard, 'zylos_phase').content, '⚠️ 回复暂时中断');
+  assert.equal(cardElement(terminalStatusCard, 'zylos_answer'), undefined);
+  const failureNotices = calls
+    .filter(([name]) => name === 'send')
+    .map(([, payload]) => JSON.parse(payload.data.content))
+    .filter(content => Object.hasOwn(content, 'text'));
+  assert.equal(failureNotices.length, 1);
+  assert.equal(failureNotices[0].text, '⚠️ 回复暂时中断，消息已记录。');
 }));
 
 test('legacy compatibility completion cannot overwrite an existing terminal result', () => withState(async stateDirectory => {
@@ -1571,4 +1618,47 @@ test('preferPlainPlaceholder opens with a plain receipt and delivers the answer 
 
   assert.equal(calls.filter(([name]) => ['convert', 'update', 'close'].includes(name)).length, 0,
     'plain mode never touches CardKit or patches a card in place');
+}));
+
+test('degrades a rejected final answer card to one plain segment message', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let interactiveSends = 0;
+  const originalCreate = client.im.message.create;
+  client.im.message.create = async payload => {
+    const content = JSON.parse(payload.data.content);
+    if (content.schema === '2.0') {
+      interactiveSends += 1;
+      if (interactiveSends > 1) {
+        return { code: 230001, msg: 'interactive unavailable' };
+      }
+    }
+    return originalCreate(payload);
+  };
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    logger: { warn() {} },
+  });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'RunStarted'),
+      event(2, 'RunCompleted', { output: '卡片被拒后的答案' }),
+    ],
+  });
+
+  const textSends = calls
+    .filter(([name]) => name === 'send')
+    .map(([, payload]) => JSON.parse(payload.data.content))
+    .filter(content => Object.hasOwn(content, 'text'));
+  assert.equal(textSends.length, 1, 'the rejected answer card degrades to one plain message');
+  assert.equal(textSends[0].text, '卡片被拒后的答案');
+  const replay = await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(2, 'RunCompleted', { output: '卡片被拒后的答案' })],
+  });
+  assert.equal(replay.replayed, true, 'the durable terminal replay must not resend the degraded answer');
+  assert.equal(calls.filter(([name]) => name === 'send').length, 2);
 }));
