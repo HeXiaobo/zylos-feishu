@@ -12,6 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   add `ROADMAP.md` to reflect the current native Task / CardKit / Smart-mode
   direction.
 
+## [0.3.7-rc.19] - 2026-09-04
+
+### Changed
+- Card-mode replies (`message.useMarkdownCard` enabled, the default) now use
+  a two-card split: the status card streams the phase and collapsible
+  process panel in place and closes as **已完成**, while the final answer is
+  delivered as **new card message(s)** (one per size segment). In-place
+  card updates never re-notify the chat list, so a new answer message is
+  what surfaces completion; failure notices are likewise delivered as a new
+  message. Plain-text mode (`message.useMarkdownCard` off) is unchanged (#63).
+
 ## [0.3.7-rc.18] - 2026-09-04
 
 ### Fixed

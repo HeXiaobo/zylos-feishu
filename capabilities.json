@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "product": "zylos-feishu",
-  "release": "0.3.7-rc.18",
+  "release": "0.3.7-rc.19",
   "requires": {
     "zylos-core": {
       "schemaVersion": 1,
