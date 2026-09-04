@@ -1042,7 +1042,10 @@ function createConversationResponseProjectionPort() {
       .map(event => responseProjectionEvent(event, operation.operationId));
     if (events.length > 0) {
       const projected = await stream.apply({ requestId: operation.requestId, events });
-      const terminalTypes = operation.events.map(event => event.type).filter(type => TERMINAL_RUN_EVENTS.has(type));
+      // Terminal types come from the actually-projected events: RunCancelled is
+      // filtered out above and never reaches the card, so it must not be logged
+      // as a projected terminal.
+      const terminalTypes = events.map(event => event.type).filter(type => TERMINAL_RUN_EVENTS.has(type));
       console.log(`[feishu] Response card projection requestId=${operation.requestId} events=${events.length} handled=${projected?.handled === true}${terminalTypes.length ? ` terminal=${terminalTypes.join(',')}` : ''}`);
       if (projected?.handled !== true) {
         return {
