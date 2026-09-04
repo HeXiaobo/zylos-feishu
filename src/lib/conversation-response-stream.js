@@ -491,6 +491,12 @@ export function createConversationResponseStream({
   queuedTimeoutMs = DEFAULT_QUEUED_TIMEOUT_MS,
   mainTimeoutMs = DEFAULT_MAIN_TIMEOUT_MS,
   processDisplay = 'collapsible',
+  // Issue #57: when true, the intake receipt is a plain text message and the
+  // final answer is delivered as a separate new plain message, instead of an
+  // interactive card updated in place. Both are new messages (so the answer
+  // re-notifies and never clears the unread state silently). Accepts a getter
+  // so a hot-reloaded config is read at each open rather than at construction.
+  preferPlainPlaceholder = false,
   completedDeliveryReconciler = null,
   logger = console,
 } = {}) {
@@ -855,17 +861,29 @@ export function createConversationResponseStream({
     return { handled: true, messageId: state.cards[0]?.messageId || state.plainMessageId };
   }
 
+  function prefersPlainPlaceholder() {
+    return typeof preferPlainPlaceholder === 'function'
+      ? preferPlainPlaceholder() === true
+      : preferPlainPlaceholder === true;
+  }
+
   function newOpeningState(requestId, target) {
     return {
       version: 1,
       requestId,
       target,
       mode: 'delivery_pending',
-      delivery: {
-        kind: 'interactive_placeholder',
-        status: 'pending',
-        uuid: stableToken(requestId, 'placeholder'),
-      },
+      delivery: prefersPlainPlaceholder()
+        ? {
+            kind: 'plain_placeholder',
+            status: 'pending',
+            uuid: stableToken(requestId, 'plain-placeholder'),
+          }
+        : {
+            kind: 'interactive_placeholder',
+            status: 'pending',
+            uuid: stableToken(requestId, 'placeholder'),
+          },
       status: 'opening',
       phase: '正在接收消息…',
       progress: [],

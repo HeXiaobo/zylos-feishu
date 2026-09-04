@@ -1528,3 +1528,47 @@ test('ignores and diagnoses a higher-sequence event that arrives after canonical
     },
   ]]);
 }));
+
+test('preferPlainPlaceholder opens with a plain receipt and delivers the answer as a separate new message (issue #57)', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let flagged = false;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    preferPlainPlaceholder: () => {
+      // Getter form: read once at open to emulate hot-reloaded config.
+      return flagged;
+    },
+  });
+
+  // Getter false before open: ordinary interactive card (existing behavior).
+  assert.equal(flagged, false);
+  flagged = true; // admin toggles useMarkdownCard off before the intake open.
+
+  const opened = await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  assert.equal(opened.mode, 'plain_text');
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'AssistantRequestAccepted', { sourceId: 'om_1' }),
+      event(2, 'RunQueued'),
+      event(3, 'RunStarted'),
+      event(4, 'ProgressUpdated', { stage: 'reading' }),
+      event(5, 'OutputDelta', { delta: '半截' }),
+      event(6, 'RunCompleted', { output: '纯文本完整答案' }),
+    ],
+  });
+
+  const textSends = calls.filter(([name]) => name === 'send' || name === 'reply').filter(([, payload]) => {
+    const content = JSON.parse(payload.data.content);
+    return Object.hasOwn(content, 'text');
+  });
+  assert.equal(textSends.length, 2, 'receipt and answer are two new messages');
+  assert.equal(JSON.parse(textSends[0][1].data.content).text, '已接收，正在处理…');
+  assert.equal(JSON.parse(textSends[1][1].data.content).text, '纯文本完整答案');
+
+  assert.equal(calls.filter(([name]) => ['convert', 'update', 'close'].includes(name)).length, 0,
+    'plain mode never touches CardKit or patches a card in place');
+}));
