@@ -5,7 +5,7 @@ import { openFeishuReplyPresentation } from './feishu-reply-presentation.js';
 
 export const REPLY_REFACTOR_FLAG = 'C4_REPLY_REFACTOR_V1';
 
-const TERMINAL_RUN_EVENTS = new Set(['RunCompleted', 'RunFailed', 'RunCancelled']);
+export const TERMINAL_RUN_EVENTS = new Set(['RunCompleted', 'RunFailed', 'RunCancelled']);
 
 function domainError(code, message) {
   const error = new Error(message);

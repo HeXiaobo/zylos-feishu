@@ -54,6 +54,7 @@ import {
   openFeishuReplyComposition,
   replyRefactorEnabled,
   resolveFeishuRouteTarget,
+  TERMINAL_RUN_EVENTS,
 } from './lib/feishu-reply-composition.js';
 import {
   createTypingDoneMarkerConsumer,
@@ -957,6 +958,15 @@ function buildAssistantRequest(messageId, { requireIdle } = {}) {
 
 async function openConversationResponse({ chatId, chatType, messageId, rootId, parentId, request }) {
   const responseRequest = request || buildAssistantRequest(messageId);
+  if (!replyRefactorV1Enabled) {
+    // Legacy mode has no card completion path (the projection port is wired only
+    // inside the refactor composition), so opening a placeholder here would
+    // strand the user on a permanent "receiving…" card (issue #54). Return the
+    // request untouched so assistantResponse requestId matching keeps working;
+    // replies go out through the legacy text path.
+    console.log(`[feishu] Conversation response card skipped (legacy mode), requestId=${responseRequest.requestId}`);
+    return responseRequest;
+  }
   try {
     await getConversationResponseStream().open({
       requestId: responseRequest.requestId,
@@ -983,7 +993,7 @@ function requiresAssistantResponse({ assistantRequest, workIntakeEnvelope, respo
 }
 
 function failConversationResponse(request) {
-  if (!request) return Promise.resolve(false);
+  if (!request || !replyRefactorV1Enabled) return Promise.resolve(false);
   return getConversationResponseStream()
     .fail({ requestId: request.requestId, retryable: true })
     .then(result => result.handled)
@@ -1025,12 +1035,18 @@ function createConversationResponseProjectionPort() {
         target: resolveFeishuRouteTarget(snapshot.handle.route.targetRef),
       });
       cardId = opened.messageId;
+      console.log(`[feishu] Response card opened requestId=${operation.requestId} cardId=${cardId}`);
     }
     const events = operation.events
       .filter(event => !['FallbackRequested', 'RunCancelled'].includes(event.type))
       .map(event => responseProjectionEvent(event, operation.operationId));
     if (events.length > 0) {
       const projected = await stream.apply({ requestId: operation.requestId, events });
+      // Terminal types come from the actually-projected events: RunCancelled is
+      // filtered out above and never reaches the card, so it must not be logged
+      // as a projected terminal.
+      const terminalTypes = events.map(event => event.type).filter(type => TERMINAL_RUN_EVENTS.has(type));
+      console.log(`[feishu] Response card projection requestId=${operation.requestId} events=${events.length} handled=${projected?.handled === true}${terminalTypes.length ? ` terminal=${terminalTypes.join(',')}` : ''}`);
       if (projected?.handled !== true) {
         return {
           outcome: 'rejected',
@@ -2941,6 +2957,11 @@ if (!creds.app_id || !creds.app_secret) {
         maxAttempts: LEGACY_INBOUND_MAX_ATTEMPTS,
       });
       console.log('[feishu] Reply refactor v1 composition: legacy rollback path');
+    }
+    if (!replyRefactorV1Enabled && config?.message?.useMarkdownCard) {
+      console.warn('[feishu] WARNING: message.useMarkdownCard is enabled but C4_REPLY_REFACTOR_V1 is unset. '
+        + 'The legacy path does not render reply cards; replies go out as plain text. '
+        + 'Set C4_REPLY_REFACTOR_V1=1 to enable the refactor composition, or set message.useMarkdownCard=false to silence this warning.');
     }
   } catch (err) {
     console.error(`[feishu] Inbound inbox failed to initialize: ${err.message}`);
