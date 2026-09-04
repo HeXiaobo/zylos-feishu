@@ -12,6 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   add `ROADMAP.md` to reflect the current native Task / CardKit / Smart-mode
   direction.
 
+## [0.3.7-rc.17] - 2026-09-04
+
+### Fixed
+- Never open assistant response cards the legacy path cannot complete: the
+  card open/fail calls are gated on `C4_REPLY_REFACTOR_V1`, card open and
+  projection attempts are logged with the requestId, and a loud startup
+  warning fires when `message.useMarkdownCard` is enabled without the
+  refactor flag (#54).
+- Admit owner DMs at priority 2 ahead of default-priority traffic: p2p
+  messages from owners inject `--priority 2` into c4-receive so they no
+  longer wait behind high-volume bot-to-bot turns; group paths keep the
+  default priority (#53).
+
 ## [0.3.7-rc.16] - 2026-09-03
 
 ### Fixed
