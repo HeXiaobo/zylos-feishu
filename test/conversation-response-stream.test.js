@@ -1662,3 +1662,20 @@ test('degrades a rejected final answer card to one plain segment message', () =>
   assert.equal(replay.replayed, true, 'the durable terminal replay must not resend the degraded answer');
   assert.equal(calls.filter(([name]) => name === 'send').length, 2);
 }));
+
+test('open() renders a custom initial phase for a task status card', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  const opened = await stream.open({
+    requestId: 'assistant.feishu.om_task',
+    target: target(),
+    initialPhase: '📋 马上创建飞书任务…',
+  });
+  assert.equal(opened.handled, true);
+
+  const initialCard = JSON.parse(calls.find(([name]) => name === 'send')[1].data.content);
+  assert.equal(cardElement(initialCard, 'zylos_phase').content, '📋 马上创建飞书任务…');
+  assert.equal(cardElement(initialCard, 'zylos_answer'), undefined);
+  assert.equal(initialCard.config.streaming_mode, true);
+}));

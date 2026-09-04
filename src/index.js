@@ -961,7 +961,7 @@ function buildAssistantRequest(messageId, { requireIdle } = {}) {
   });
 }
 
-async function openConversationResponse({ chatId, chatType, messageId, rootId, parentId, request }) {
+async function openConversationResponse({ chatId, chatType, messageId, rootId, parentId, request, initialPhase }) {
   const responseRequest = request || buildAssistantRequest(messageId);
   if (!replyRefactorV1Enabled) {
     // Legacy mode has no card completion path (the projection port is wired only
@@ -982,13 +982,13 @@ async function openConversationResponse({ chatId, chatType, messageId, rootId, p
           ? (parentId || rootId || messageId)
           : null,
       },
+      ...(initialPhase ? { initialPhase } : {}),
     });
     return responseRequest;
   } catch (error) {
     console.warn(`[feishu] Failed to open immediate response card: ${error.message}`);
     return null;
   }
-  return null;
 }
 
 function requiresAssistantResponse({ assistantRequest, workIntakeEnvelope, response }) {
@@ -1693,6 +1693,23 @@ async function handleWorkIntakeResult(response, {
   if (!workIntakeResultHandler) {
     workIntakeResultHandler = createWorkIntakeResultHandler({
       sendTaskReceipt: async ({ title, deliveryUuid, context }) => {
+        // Open a task status card in the originating conversation. Its phase
+        // advances as Core emits task lifecycle events (TaskCreated →
+        // TaskStarted → SubmittedForReview → Accepted), and the completion is
+        // delivered as a new message so the chat re-notifies. Falls back to the
+        // legacy plain-text receipt when cards are unavailable.
+        const opened = context.assistantRequest
+          ? await openConversationResponse({
+            chatId: context.chatId,
+            chatType: context.chatType,
+            messageId: context.messageId,
+            rootId: context.rootId,
+            parentId: context.parentId,
+            request: context.assistantRequest,
+            initialPhase: '📋 马上创建飞书任务…',
+          })
+          : null;
+        if (opened) return { success: true };
         const delivered = await sendThreadAwareMessage(
           context.chatId,
           `已登记任务：${title}`,

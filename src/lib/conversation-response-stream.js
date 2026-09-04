@@ -895,7 +895,7 @@ export function createConversationResponseStream({
       : preferPlainPlaceholder === true;
   }
 
-  function newOpeningState(requestId, target) {
+  function newOpeningState(requestId, target, initialPhase = '正在接收消息…') {
     return {
       version: 1,
       requestId,
@@ -903,17 +903,17 @@ export function createConversationResponseStream({
       mode: 'delivery_pending',
       delivery: prefersPlainPlaceholder()
         ? {
-            kind: 'plain_placeholder',
-            status: 'pending',
-            uuid: stableToken(requestId, 'plain-placeholder'),
-          }
+          kind: 'plain_placeholder',
+          status: 'pending',
+          uuid: stableToken(requestId, 'plain-placeholder'),
+        }
         : {
-            kind: 'interactive_placeholder',
-            status: 'pending',
-            uuid: stableToken(requestId, 'placeholder'),
-          },
+          kind: 'interactive_placeholder',
+          status: 'pending',
+          uuid: stableToken(requestId, 'placeholder'),
+        },
       status: 'opening',
-      phase: '正在接收消息…',
+      phase: initialPhase,
       progress: [],
       publicReasoning: '',
       output: '',
@@ -930,7 +930,7 @@ export function createConversationResponseStream({
 
   async function finishOpening(state) {
     const initialCard = renderStatusCard({
-      phase: '正在接收消息…',
+      phase: state.phase || '正在接收消息…',
       streaming: true,
       processDisplay,
     });
@@ -1302,9 +1302,11 @@ export function createConversationResponseStream({
 
     async open(input) {
       const request = requireRecord(input, 'open response stream request');
-      requireExactFields(request, ['requestId', 'target'], 'open response stream request');
-      const requestId = requireText(request.requestId, 'requestId');
-      const target = normalizeTarget(request.target);
+      const requestId = requireText(input.requestId, 'requestId');
+      const target = normalizeTarget(input.target);
+      const initialPhase = input.initialPhase === undefined || input.initialPhase === null
+        ? '正在接收消息…'
+        : requireText(input.initialPhase, 'initialPhase');
       const release = await acquireRequestLock(requestId);
       try {
         const existing = load(requestId);
@@ -1324,7 +1326,7 @@ export function createConversationResponseStream({
           return { handled: true, replayed: true, mode: existing.mode, messageId: existing.cards[0]?.messageId || existing.plainMessageId };
         }
 
-        const state = newOpeningState(requestId, target);
+        const state = newOpeningState(requestId, target, initialPhase);
         save(state);
         await finishOpening(state);
         return {
