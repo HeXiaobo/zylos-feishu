@@ -918,6 +918,11 @@ function getConversationResponseStream() {
       processDisplay: getStreamProcessDisplay(config),
       queuedTimeoutMs: getResponseStreamQueuedTimeoutMs(config),
       mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
+      // Issue #57: message.useMarkdownCard=false must steer BOTH delivery paths
+      // (runtime streaming and c4-send) to plain text. The getter reads the
+      // hot-reloaded config at each open so the admin toggle takes effect
+      // without a process restart on the streaming path.
+      preferPlainPlaceholder: () => config.message?.useMarkdownCard === false,
     });
   }
   return conversationResponseStream;
