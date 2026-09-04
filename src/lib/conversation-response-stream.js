@@ -165,6 +165,7 @@ function readState(filePath) {
     if (state?.version !== 1) return null;
     if (!Array.isArray(state.progress)) state.progress = [];
     if (typeof state.publicReasoning !== 'string') state.publicReasoning = '';
+    if (!Array.isArray(state.answerCards)) state.answerCards = [];
     return state;
   } catch {
     return null;
@@ -218,12 +219,6 @@ function completedChatListSummary(output) {
   const summary = normalized || '处理完成。';
   if (Buffer.byteLength(summary, 'utf8') <= MAX_CHAT_LIST_SUMMARY_BYTES) return summary;
   return `${truncateUtf8(summary, MAX_CHAT_LIST_SUMMARY_BYTES - Buffer.byteLength(SUMMARY_ELLIPSIS, 'utf8'))}${SUMMARY_ELLIPSIS}`;
-}
-
-function terminalChatListSummary(state) {
-  return state.status === 'completed'
-    ? completedChatListSummary(state.output)
-    : state.phase;
 }
 
 function failureAnswer(phase) {
@@ -317,27 +312,38 @@ function clearTransientProcess(state) {
   state.publicReasoning = '';
 }
 
-function renderCard({
+// Two-card split: the status card streams phase/progress in place and never
+// carries the answer; the answer is delivered as new card message(s) at the
+// terminal so completion re-notifies the chat list (in-place updates never do).
+function statusCardTerminalSummary(state) {
+  return state.status === 'completed' ? '已完成' : state.phase;
+}
+
+// The delivered answer lives in the answer cards; the status card (or plain
+// receipt) is only the fallback identity for legacy/pre-answer states.
+function terminalMessageId(state) {
+  return state.answerCards?.at(-1)?.messageId
+    || state.cards[0]?.messageId
+    || state.plainMessageId;
+}
+
+function renderStatusCard({
   phase,
-  answer,
   summary,
   progress = [],
   publicReasoning = '',
   streaming,
   running = streaming,
   showPhase = true,
-  part,
-  totalParts,
   processDisplay = 'collapsible',
 }) {
-  const continuation = part > 0
-    ? `\n\n_续 ${part + 1}${totalParts > 1 ? ` / ${totalParts}` : ''}_`
-    : '';
   const showProcess = processDisplay === 'collapsible'
     && running
     && (publicReasoning || progress.length > 0);
-  const renderPhase = showPhase && Boolean(phase)
-    && (!running || (processDisplay === 'collapsible' && !showProcess));
+  // The phase renders whenever the process panel does not (the panel header
+  // carries the phase). With the answer living in its own cards, this line is
+  // the status card's only body content in non-collapsible modes.
+  const renderPhase = showPhase && Boolean(phase) && !showProcess;
   const card = {
     schema: '2.0',
     config: {
@@ -360,14 +366,33 @@ function renderCard({
         ...(showProcess
           ? [renderProcessPanel(phase, progress, publicReasoning)]
           : (renderPhase ? [{ tag: 'markdown', element_id: PHASE_ELEMENT_ID, content: phase }] : [])),
-        {
-          tag: 'markdown',
-          element_id: ANSWER_ELEMENT_ID,
-          content: `${answer || (running
-            ? '_等待回答…_'
-            : (phase?.startsWith('⚠️') ? failureAnswer(phase) : '_没有可显示的回答_'))}${continuation}`,
-        },
       ],
+    },
+  };
+  if (Buffer.byteLength(JSON.stringify(card), 'utf8') > MAX_CARD_BYTES) {
+    throw new TypeError('conversation response card exceeds Feishu size limit');
+  }
+  return card;
+}
+
+function renderAnswerCard({ answer, summary, part = 0, totalParts = 1 }) {
+  const continuation = part > 0
+    ? `\n\n_续 ${part + 1}${totalParts > 1 ? ` / ${totalParts}` : ''}_`
+    : '';
+  const card = {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      width_mode: 'fill',
+      streaming_mode: false,
+      summary: { content: summary },
+    },
+    body: {
+      elements: [{
+        tag: 'markdown',
+        element_id: ANSWER_ELEMENT_ID,
+        content: `${answer}${continuation}`,
+      }],
     },
   };
   if (Buffer.byteLength(JSON.stringify(card), 'utf8') > MAX_CARD_BYTES) {
@@ -478,8 +503,9 @@ function nextSequence(card) {
 /**
  * Feishu-owned ConversationResponseStream Module.  Callers only open a stream
  * and apply channel-neutral lifecycle events; the implementation hides stable
- * message creation, CardKit conversion, coalescing, monotonic sequences,
- * overlong continuation cards, restart state, terminal close, and fallback.
+ * message creation, CardKit conversion, coalescing, monotonic sequences, the
+ * two-card split (in-place status card + answer delivered as new message(s)
+ * so completion re-notifies), restart state, terminal close, and fallback.
  */
 export function createConversationResponseStream({
   client,
@@ -528,6 +554,9 @@ export function createConversationResponseStream({
   }
 
   function compactTerminalState(state) {
+    // Idempotent: once compacted (output replaced by its hash), a re-close
+    // must not recompute the hash from the missing output.
+    if (state.terminalTombstone === true && typeof state.output !== 'string') return;
     const terminalOutput = typeof state.output === 'string' ? state.output : '';
     state.outputHash = outputHash(terminalOutput);
     state.terminalTombstone = true;
@@ -544,6 +573,7 @@ export function createConversationResponseStream({
     delete state.mainStartedAt;
     delete state.output;
     for (const card of state.cards) delete card.rendered;
+    for (const card of state.answerCards || []) delete card.rendered;
   }
 
   function terminalOutputMatches(state, output) {
@@ -627,15 +657,12 @@ export function createConversationResponseStream({
       save(state);
       return;
     }
-    const ordinary = renderCard({
+    const ordinary = renderStatusCard({
       phase: state.phase,
-      answer: state.output,
       progress: state.progress,
       publicReasoning: state.publicReasoning,
       streaming: false,
       running: true,
-      part: 0,
-      totalParts: 1,
       processDisplay,
     });
     await patchOrdinary(initial.messageId, ordinary);
@@ -672,7 +699,7 @@ export function createConversationResponseStream({
           settings: JSON.stringify({
             config: {
               streaming_mode: false,
-              summary: { content: terminalChatListSummary(state) },
+              summary: { content: statusCardTerminalSummary(state) },
             },
           }),
           sequence,
@@ -683,57 +710,74 @@ export function createConversationResponseStream({
     cardState.closed = true;
   }
 
-  async function createContinuation(state, part, answer, totalParts, terminal) {
-    const card = renderCard({
-      phase: state.phase,
-      answer,
-      summary: terminal ? terminalChatListSummary(state) : null,
-      progress: state.progress,
-      publicReasoning: state.publicReasoning,
-      streaming: !terminal,
-      running: !terminal && part === totalParts - 1,
-      showPhase: state.status !== 'failed',
-      part,
-      totalParts,
-      processDisplay,
-    });
-    const messageId = await sendInteractive(
-      client,
-      state.target,
-      card,
-      stableToken(state.requestId, `part:${part}`),
-    );
-    let cardId = null;
+  // Terminal answer delivery for the two-card split. The answer always
+  // arrives as NEW message(s) — card messages for completed answers, one
+  // plain message for failures — because only new messages re-notify the
+  // chat list. Idempotent three ways: per-part Feishu uuid dedupe, the
+  // per-part answerCards entries persisted before the next send, and the
+  // terminal fingerprint that short-circuits fully delivered results.
+  async function deliverTerminalAnswer(state) {
+    const fingerprint = createHash('sha256')
+      .update(`${state.status}\0${state.output || ''}`)
+      .digest('hex')
+      .slice(0, 20);
+    if (state.finalAnswerFingerprint === fingerprint) return;
+    if (!Array.isArray(state.answerCards)) state.answerCards = [];
     try {
-      cardId = await convertCard(messageId);
-    } catch (error) {
-      logger.warn?.('CardKit conversion failed for continuation; using ordinary cards', {
-        requestId: state.requestId,
-        part,
-        error: error.message,
-      });
-    }
-    const cardState = {
-      part,
-      messageId,
-      cardId,
-      nextSequence: 1,
-      closed: terminal,
-      rendered: card,
-    };
-    if (!cardId) {
-      if (state.mode === 'cardkit') {
-        logger.warn?.('CardKit conversion unavailable for continuation; using ordinary cards', {
-          requestId: state.requestId,
-          part,
-        });
-        state.mode = 'ordinary_card';
+      if (state.status === 'failed') {
+        const messageId = await sendPlain(
+          client,
+          state.target,
+          failureAnswer(state.phase),
+          stableToken(state.requestId, `final-answer-plain:${fingerprint}`),
+        );
+        // part -1: the failure notice is not an answer segment, so a later
+        // canonical correction (failed → completed) still delivers part 0.
+        state.answerCards.push({ part: -1, messageId, cardId: null, closed: true, rendered: null });
+      } else {
+        const segments = splitUtf8(state.output || '', answerBytesPerCard);
+        const summary = completedChatListSummary(state.output || '');
+        for (let part = 0; part < segments.length; part += 1) {
+          if (state.answerCards.some(entry => entry.part === part)) continue;
+          const card = renderAnswerCard({
+            answer: segments[part],
+            summary,
+            part,
+            totalParts: segments.length,
+          });
+          let answerMessageId;
+          try {
+            answerMessageId = await sendInteractive(
+              client,
+              state.target,
+              card,
+              stableToken(state.requestId, `final-answer:${part}`),
+            );
+            state.answerCards.push({ part, messageId: answerMessageId, cardId: null, closed: true, rendered: card });
+          } catch (error) {
+            if (error.deliveryOutcome !== 'rejected') throw error;
+            // A deterministic card rejection (e.g. invalid card) would loop
+            // forever on retry — degrade that segment to a plain message.
+            logger.warn?.('Final answer card was rejected; delivering the segment as plain text', {
+              requestId: state.requestId,
+              part,
+              error: error.message,
+            });
+            answerMessageId = await sendPlain(
+              client,
+              state.target,
+              segments[part],
+              stableToken(state.requestId, `final-answer-plain:${fingerprint}:${part}`),
+            );
+            state.answerCards.push({ part, messageId: answerMessageId, cardId: null, closed: true, rendered: null, plain: true });
+          }
+          save(state);
+        }
       }
-      await patchOrdinary(messageId, card);
+      state.finalAnswerFingerprint = fingerprint;
+    } finally {
+      save(state);
     }
-    state.cards.push(cardState);
-    if (terminal) await closeCard(state, cardState, `close-terminal-part-${part}`);
-    return cardState;
   }
 
   async function render(state, { terminal = false, purpose = 'event' } = {}) {
@@ -761,55 +805,39 @@ export function createConversationResponseStream({
       return;
     }
 
-    const segments = splitUtf8(state.output, answerBytesPerCard);
-    for (let part = 0; part < segments.length; part += 1) {
-      let cardState = state.cards[part];
-      if (!cardState) {
-        const previous = state.cards.at(-1);
-        if (previous) await closeCard(state, previous, `close-before-part-${part}`);
-        cardState = await createContinuation(state, part, segments[part], segments.length, terminal);
-      }
-      const card = renderCard({
-        phase: state.phase,
-        answer: segments[part],
-        summary: terminal ? terminalChatListSummary(state) : null,
+    // Two-card split: the single status card carries phase/progress only.
+    // The answer is never rendered here — deliverTerminalAnswer sends it as
+    // new message(s) at the terminal so the chat list re-notifies.
+    const [cardState] = state.cards;
+    if (cardState) {
+      const card = renderStatusCard({
+        phase: terminal && state.status === 'completed' ? '✅ 已完成' : state.phase,
+        summary: terminal ? statusCardTerminalSummary(state) : null,
         progress: state.progress,
         publicReasoning: state.publicReasoning,
-        streaming: state.mode === 'cardkit' && !terminal && part === segments.length - 1,
-        running: !terminal && part === segments.length - 1,
-        showPhase: state.status !== 'failed',
-        part,
-        totalParts: segments.length,
+        streaming: state.mode === 'cardkit' && !terminal,
+        running: !terminal,
         processDisplay,
       });
       if (JSON.stringify(cardState.rendered) !== JSON.stringify(card)) {
         await updateCard(state, cardState, card, purpose);
       }
-      if (terminal || part < segments.length - 1) {
-        await closeCard(state, cardState, `${purpose}:close`);
-      }
     }
-    if (terminal && state.status === 'failed' && state.cards.length > segments.length) {
-      for (let part = segments.length; part < state.cards.length; part += 1) {
-        const cardState = state.cards[part];
-        const card = renderCard({
-          phase: state.phase,
-          answer: '',
-          summary: terminalChatListSummary(state),
-          streaming: false,
-          running: false,
-          showPhase: false,
-          part,
-          totalParts: state.cards.length,
-          processDisplay,
-        });
-        if (JSON.stringify(cardState.rendered) !== JSON.stringify(card)) {
-          await updateCard(state, cardState, card, `${purpose}:invalidate-extra`);
-        }
-        await closeCard(state, cardState, `${purpose}:close-extra`);
-      }
+    if (terminal) {
+      if (cardState) await closeCard(state, cardState, `${purpose}:close`);
+      await deliverTerminalAnswer(state);
     }
     state.lastRenderedAt = clock();
+  }
+
+  // Terminal renders must survive a mid-delivery crash: the pending flag is
+  // persisted BEFORE rendering, so a later apply() can resume the close +
+  // final-answer delivery idempotently instead of silently skipping it.
+  async function renderTerminal(state, purpose) {
+    state.terminalRenderPending = true;
+    save(state);
+    await render(state, { terminal: true, purpose });
+    delete state.terminalRenderPending;
   }
 
   async function terminalCompatibility(requestId, output, status, phase) {
@@ -818,7 +846,7 @@ export function createConversationResponseStream({
     if (state.mode === 'delivery_pending') await finishOpening(state);
     if (['completed', 'failed'].includes(state.status)) {
       if (state.status === status && terminalOutputMatches(state, output)) {
-        return { handled: true, replayed: true, messageId: state.cards[0]?.messageId || state.plainMessageId };
+        return { handled: true, replayed: true, messageId: terminalMessageId(state) };
       }
       const error = new Error('conversation response stream already has a different terminal result');
       error.code = 'ASSISTANT_TERMINAL_CONFLICT';
@@ -847,7 +875,7 @@ export function createConversationResponseStream({
       return {
         handled: true,
         pending: true,
-        messageId: state.cards[0]?.messageId || state.plainMessageId,
+        messageId: terminalMessageId(state),
       };
     }
     state.output = output;
@@ -855,10 +883,10 @@ export function createConversationResponseStream({
     state.phase = phase;
     clearTransientProcess(state);
     state.compatibilityTerminal = true;
-    await render(state, { terminal: true, purpose: 'compatibility-terminal' });
+    await renderTerminal(state, 'compatibility-terminal');
     compactTerminalState(state);
     save(state);
-    return { handled: true, messageId: state.cards[0]?.messageId || state.plainMessageId };
+    return { handled: true, messageId: terminalMessageId(state) };
   }
 
   function prefersPlainPlaceholder() {
@@ -894,17 +922,16 @@ export function createConversationResponseStream({
       compatibilityTerminal: false,
       plainTerminalSent: false,
       plainTerminalFingerprint: null,
+      finalAnswerFingerprint: null,
+      answerCards: [],
       cards: [],
     };
   }
 
   async function finishOpening(state) {
-    const initialCard = renderCard({
+    const initialCard = renderStatusCard({
       phase: '正在接收消息…',
-      answer: '',
       streaming: true,
-      part: 0,
-      totalParts: 1,
       processDisplay,
     });
     if (state.delivery.kind === 'interactive_placeholder') {
@@ -1048,23 +1075,22 @@ export function createConversationResponseStream({
     return {
       handled: true,
       replayed: true,
-      parts: state.cards.length || 1,
-      messageId: state.cards[0]?.messageId || state.plainMessageId,
+      parts: state.answerCards?.length || state.cards.length || 1,
+      messageId: terminalMessageId(state),
     };
   }
 
   async function finishCompletedCards(state, output) {
     const segments = splitUtf8(output, answerBytesPerCard);
+    if (!Array.isArray(state.answerCards)) state.answerCards = [];
     try {
-      for (let part = state.cards.length; part < segments.length; part += 1) {
-        const card = renderCard({
-          phase: state.phase,
+      for (let part = 0; part < segments.length; part += 1) {
+        if (state.answerCards.some(entry => entry.part === part)) continue;
+        const card = renderAnswerCard({
           answer: segments[part],
           summary: completedChatListSummary(output),
-          streaming: false,
           part,
           totalParts: segments.length,
-          processDisplay,
         });
         state.delivery.part = part;
         state.delivery.uuid = stableToken(state.requestId, `completed:${part}`);
@@ -1076,11 +1102,10 @@ export function createConversationResponseStream({
           card,
           state.delivery.uuid,
         );
-        state.cards.push({
+        state.answerCards.push({
           part,
           messageId,
           cardId: null,
-          nextSequence: 1,
           closed: true,
           rendered: card,
         });
@@ -1089,8 +1114,8 @@ export function createConversationResponseStream({
     } catch (error) {
       state.delivery.lastError = error.message;
       save(state);
-      error.deliveredParts = state.cards.length;
-      if (error.deliveryOutcome === 'rejected' && state.cards.length === 0) {
+      error.deliveredParts = state.answerCards.length;
+      if (error.deliveryOutcome === 'rejected' && state.answerCards.length === 0) {
         logger.warn?.('Completed response card was rejected; using one idempotent plain fallback', {
           requestId: state.requestId,
           error: error.message,
@@ -1115,8 +1140,8 @@ export function createConversationResponseStream({
     return {
       handled: true,
       replayed: false,
-      parts: state.cards.length,
-      messageId: state.cards[0]?.messageId,
+      parts: state.answerCards.length,
+      messageId: terminalMessageId(state),
     };
   }
 
@@ -1128,10 +1153,10 @@ export function createConversationResponseStream({
         let state = load(requestId);
         if (state) {
           assertCompletedStateIdentity(state, { target, output });
-          if (state.delivery?.status === 'sent') {
+          if (state.delivery?.status === 'sent' && !state.terminalRenderPending) {
             return completedReplay(state);
           }
-          if (!state.delivery && (state.cards.length > 0 || state.plainMessageId)) {
+          if (!state.delivery && (state.cards.length > 0 || state.answerCards.length > 0 || state.plainMessageId)) {
             return completedReplay(state);
           }
         }
@@ -1153,6 +1178,8 @@ export function createConversationResponseStream({
             compatibilityTerminal: false,
             plainTerminalSent: false,
             plainTerminalFingerprint: null,
+            finalAnswerFingerprint: null,
+            answerCards: [],
             cards: [],
           };
           save(state);
@@ -1240,27 +1267,24 @@ export function createConversationResponseStream({
         if (state.delivery.kind !== 'completed_cards') {
           throw new TypeError('pending completed delivery kind is unsupported');
         }
-        const part = state.delivery.part ?? state.cards.length;
-        if (part !== state.cards.length) {
+        if (!Array.isArray(state.answerCards)) state.answerCards = [];
+        const part = state.delivery.part ?? state.answerCards.length;
+        if (part !== state.answerCards.length) {
           const error = new Error('completed delivery part identity is inconsistent');
           error.code = 'ASSISTANT_TERMINAL_CONFLICT';
           throw error;
         }
         const segments = splitUtf8(output, answerBytesPerCard);
-        const card = renderCard({
-          phase: state.phase,
+        const card = renderAnswerCard({
           answer: segments[part],
           summary: completedChatListSummary(output),
-          streaming: false,
           part,
           totalParts: segments.length,
-          processDisplay,
         });
-        state.cards.push({
+        state.answerCards.push({
           part,
           messageId,
           cardId: null,
-          nextSequence: 1,
           closed: true,
           rendered: card,
         });
@@ -1348,7 +1372,7 @@ export function createConversationResponseStream({
           state.output = state.durableOutput || '';
           delete state.durableOutput;
           delete state.terminalProjectionPending;
-          await render(state, { terminal: true, purpose: 'terminal-repair' });
+          await renderTerminal(state, 'terminal-repair');
           compactTerminalState(state);
           save(state);
           return {
@@ -1356,7 +1380,7 @@ export function createConversationResponseStream({
             replayed: false,
             repaired: true,
             status: state.status,
-            parts: state.cards.length || 1,
+            parts: state.answerCards.length || state.cards.length || 1,
           };
         }
         if (state.terminalTombstone && !state.compatibilityTerminal) {
@@ -1521,7 +1545,25 @@ export function createConversationResponseStream({
             status: state.status,
           };
         }
-        if (!changed) return { handled: true, replayed: true, status: state.status };
+        if (!changed) {
+          // A previous terminal render may have crashed mid-delivery (the
+          // pending flag is persisted before rendering). Resume the close +
+          // final-answer delivery; both are idempotent.
+          if (state.terminalRenderPending === true
+            && ['completed', 'failed'].includes(state.status)) {
+            await renderTerminal(state, 'terminal-resume');
+            compactTerminalState(state);
+            save(state);
+            return {
+              handled: true,
+              replayed: false,
+              resumed: true,
+              status: state.status,
+              parts: state.answerCards.length || state.cards.length || 1,
+            };
+          }
+          return { handled: true, replayed: true, status: state.status };
+        }
 
         if (compatibility) {
           state.durableOutput = canonicalOutput;
@@ -1551,14 +1593,20 @@ export function createConversationResponseStream({
         if (!terminal && (containsDelta || state.status === 'started') && elapsed < throttleMs) {
           await pause(throttleMs - elapsed);
         }
-        await render(state, { terminal, purpose: `event-${state.lastEventSequence}` });
+        if (terminal) {
+          await renderTerminal(state, `event-${state.lastEventSequence}`);
+        } else {
+          await render(state, { terminal, purpose: `event-${state.lastEventSequence}` });
+        }
         if (terminal) compactTerminalState(state);
         save(state);
         return {
           handled: true,
           replayed: false,
           status: state.status,
-          parts: state.cards.length || 1,
+          parts: terminal
+            ? (state.answerCards.length || state.cards.length || 1)
+            : (state.cards.length || 1),
         };
       } finally {
         release();
