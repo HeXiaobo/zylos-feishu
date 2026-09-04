@@ -362,3 +362,41 @@ test('fails closed before building an unsupported or malformed Core task command
     assert.throws(() => buildZylosTaskCommandArgs(route), TypeError);
   }
 });
+
+test('passes an integer admission priority through to c4-receive (issue #53)', () => {
+  const args = buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_chat|type:p2p|msg:om_owner_1',
+    content: '[Feishu DM] Owner said: hello',
+    priority: 2,
+  });
+
+  const flagIndex = args.indexOf('--priority');
+  assert.notEqual(flagIndex, -1, '--priority flag must be present');
+  assert.equal(args[flagIndex + 1], '2', 'priority value must follow the flag');
+  assert.ok(args.indexOf('--priority') < args.indexOf('--content'), 'priority is a receiver option, not content');
+});
+
+test('omits the priority flag when no priority is provided', () => {
+  const args = buildC4ReceiveArgs({
+    receiverPath: '/opt/zylos/c4-receive.js',
+    source: 'feishu',
+    endpoint: 'oc_chat|type:p2p|msg:om_1',
+    content: '[Feishu DM] Someone said: hello',
+  });
+
+  assert.equal(args.includes('--priority'), false);
+});
+
+test('fails closed on a non-integer or out-of-range admission priority', () => {
+  for (const priority of [0, 4, -1, 1.5, '2', null]) {
+    assert.throws(() => buildC4ReceiveArgs({
+      receiverPath: '/opt/zylos/c4-receive.js',
+      source: 'feishu',
+      endpoint: 'oc_chat|type:p2p|msg:om_1',
+      content: 'x',
+      priority,
+    }), TypeError);
+  }
+});
