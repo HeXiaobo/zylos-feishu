@@ -8,7 +8,12 @@ function requireRecord(value, field) {
   return value;
 }
 
-export function createConversationResponseRuntimeAdapter({ stream, markers, logger = console } = {}) {
+export function createConversationResponseRuntimeAdapter({
+  stream,
+  markers,
+  onTerminalMark = null,
+  logger = console,
+} = {}) {
   const delivery = createConversationResponseDelivery({ stream });
   const markerStore = requireRecord(markers, 'typing marker store');
   if (typeof markerStore.mark !== 'function') {
@@ -44,6 +49,20 @@ export function createConversationResponseRuntimeAdapter({ stream, markers, logg
             error: error?.message ?? String(error),
           });
           throw error;
+        }
+        // Directly clear the typing reaction(s) the bot has on the originating
+        // message. This one-shot worker process has no legacy 2s typing drain,
+        // and the reply-refactor composition adds the reaction through its own
+        // presence ledger, so the marker alone would leave the ⌨️ emoji behind.
+        if (typeof onTerminalMark === 'function') {
+          try {
+            await onTerminalMark(messageId);
+          } catch (error) {
+            logger.warn?.('Typing reaction could not be cleared after terminal delivery', {
+              messageId,
+              error: error?.message ?? String(error),
+            });
+          }
         }
       }
       return result;
