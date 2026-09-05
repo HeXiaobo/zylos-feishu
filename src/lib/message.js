@@ -605,6 +605,46 @@ export async function removeReaction(messageId, reactionId) {
 }
 
 /**
+ * Remove every Typing reaction the bot itself added to a message.
+ * Unlike removeReaction this does not need a locally-tracked reactionId, so it
+ * clears an orphaned typing indicator even when the local presence state was
+ * lost (e.g. the reply-refactor v1 composition adds reactions via its own
+ * presence ledger rather than the legacy typing store).
+ * @param {string} messageId - Message to clear typing reactions from
+ * @param {{ getClient?: Function }} [deps]
+ * @returns {{ success: boolean, removed: number, message?: string }}
+ */
+export async function clearTypingReactions(messageId, { client = getClient() } = {}) {
+  let removed = 0;
+  try {
+    const list = await client.im.messageReaction.list({
+      path: { message_id: messageId },
+      params: { reaction_type: 'Typing', page_size: 50 },
+    });
+    if (list?.code !== 0 || !Array.isArray(list.data?.items)) {
+      return { success: false, removed: 0, message: list?.msg || 'reaction list failed' };
+    }
+    for (const item of list.data.items) {
+      // A bot can only delete reactions it added itself.
+      const isOwned = item.operator?.operator_type === 'app'
+        && (!item.reaction_id || true);
+      if (!isOwned || !item.reaction_id) continue;
+      try {
+        const del = await client.im.messageReaction.delete({
+          path: { message_id: messageId, reaction_id: item.reaction_id },
+        });
+        if (del?.code === 0) removed += 1;
+      } catch {
+        // single-reaction delete failure must not block the rest
+      }
+    }
+    return { success: true, removed };
+  } catch (err) {
+    return { success: false, removed, message: err.message };
+  }
+}
+
+/**
  * Extract permission error info from Feishu API errors.
  * Detects error code 99991672 and extracts the grant URL for admin authorization.
  * @param {Error|object} err - The error from a Feishu API call

@@ -36,6 +36,7 @@ import {
   extractPermissionError,
   addReaction,
   removeReaction,
+  clearTypingReactions,
   listMessages,
   MESSAGE_GET_PARAMS,
   getInteractiveCardContent,
@@ -1077,9 +1078,20 @@ function createConversationResponseProjectionPort() {
       if (terminalTypes.length) {
         const sourceMessageId = sourceMessageIdFromTargetRef(snapshot.handle.route?.targetRef);
         if (sourceMessageId) {
+          // The refactor composition adds the typing reaction via its own
+          // presence ledger, not the legacy typing store, so settle the legacy
+          // marker AND clear any Typing reaction the bot has on the message
+          // directly by id — this also recovers an orphaned reaction.
           await settleTypingIndicator(sourceMessageId).catch(error => {
             console.warn(`[feishu] Failed to settle typing indicator for ${sourceMessageId}: ${error.message}`);
           });
+          const cleared = await clearTypingReactions(sourceMessageId).catch(error => {
+            console.warn(`[feishu] Failed to clear typing reactions for ${sourceMessageId}: ${error.message}`);
+            return { removed: 0 };
+          });
+          if (cleared?.removed > 0) {
+            console.log(`[feishu] Cleared ${cleared.removed} typing reaction(s) for ${sourceMessageId}`);
+          }
         }
       }
     }
