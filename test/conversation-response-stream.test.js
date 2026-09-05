@@ -1717,3 +1717,41 @@ test('plain completed delivery retries its persisted UUID even after the prefere
   await stream.sendCompleted({ ...request, requestId: 'new-card-request' });
   assert.equal(calls.at(-1)[1].data.msg_type, 'interactive');
 }));
+
+for (const mode of ['cardkit', 'ordinary', 'plain']) {
+  test(`DM ${mode} status and all final segments quote the same source inline`, () => withState(async stateDirectory => {
+    const {client, calls} = createClient({conversion: mode !== 'ordinary'});
+    const stream = createConversationResponseStream({client, stateDirectory, preferPlainPlaceholder: mode === 'plain', answerBytesPerCard: 256});
+    await stream.open({requestId: 'assistant.feishu.om_1', target: {...target(), replyToMessageId: 'om_trigger'}});
+    await stream.completeWithFullAnswer({requestId: 'assistant.feishu.om_1', output: 'x'.repeat(600)});
+    const replies = calls.filter(([name]) => name === 'reply');
+    assert.equal(replies.length, mode === 'plain' ? 2 : 4);
+    for (const [,payload] of replies) {
+      assert.equal(payload.path.message_id, 'om_trigger');
+      assert.equal(payload.data.reply_in_thread, false);
+    }
+    assert.equal(calls.filter(([name]) => name === 'send').length, 0);
+    const before = calls.length;
+    const restarted = createConversationResponseStream({client, stateDirectory});
+    await restarted.completeWithFullAnswer({requestId: 'assistant.feishu.om_1', output: 'x'.repeat(600)});
+    assert.equal(calls.length, before);
+  }));
+}
+
+test('explicitly rejected DM quotes fall back to base send for status and answer', () => withState(async stateDirectory => {
+  const {client, calls} = createClient();
+  client.im.message.reply = async payload => { calls.push(['rejected-reply', payload]); return {code: 230011, msg: 'source recalled'}; };
+  const stream = createConversationResponseStream({client, stateDirectory});
+  await stream.open({requestId: 'assistant.feishu.om_1', target: {...target(), replyToMessageId: 'om_gone'}});
+  await stream.completeWithFullAnswer({requestId: 'assistant.feishu.om_1', output: 'answer'});
+  assert.equal(calls.filter(([name]) => name === 'send').length, 2);
+  assert.equal(calls.filter(([name]) => name === 'rejected-reply').length, 2);
+}));
+
+test('unknown DM quote outcome does not create a duplicate base message', () => withState(async stateDirectory => {
+  const {client, calls} = createClient();
+  client.im.message.reply = async () => { throw new Error('socket timeout'); };
+  const stream = createConversationResponseStream({client, stateDirectory});
+  await assert.rejects(stream.open({requestId: 'assistant.feishu.om_1', target: {...target(), replyToMessageId: 'om_trigger'}}), /socket timeout/);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 0);
+}));

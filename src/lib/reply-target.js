@@ -1,15 +1,11 @@
 /**
  * Pure routing helper: decide the reply-to target for an outbound message.
  *
- * Reply-to (threaded/quoted) sends via Feishu's `im.message.reply` API are ONLY
- * meaningful in GROUP chats. In a 1:1 p2p DM, a reply lands on a thread/quote
- * line that Feishu does NOT surface in the main DM view — the API still returns
- * `code:0` (success), so the recipient silently never sees the message.
- *
- * Therefore: for p2p DMs (and any non-group chat) the reply target is ALWAYS
- * null, forcing callers down the base send path (sendMessage/sendImage/sendFile
- * to the chatId), which is delivered normally. Groups keep their reply-to
- * behavior for @mention/thread continuation.
+ * Historically, routing a DM through its inherited root/parent produced
+ * successful API responses without a visible main-chat reply. Keep that guard
+ * by default (including media). Text/card callers may explicitly opt in to
+ * quoting only the triggering message, with reply_in_thread=false.
+ * Group routing and thread continuation are unchanged.
  *
  * @param {object} endpoint - Parsed endpoint fields.
  * @param {string} [endpoint.type] - Chat type ('p2p' | 'group' | 'topic_group').
@@ -20,10 +16,14 @@
  * @param {object} [opts]
  * @param {boolean} [opts.isFirstChunk=true] - Whether this is the first chunk;
  *   @mention replies (msg without root) only apply to the first chunk.
+ * @param {boolean} [opts.quoteDirectMessage=false] - Text/card callers may quote
+ *   the exact triggering DM message, and MUST send reply_in_thread=false.
+ *   Never inherit root/parent for DMs. Media callers retain the safe default.
  * @returns {string|null} The message id to reply to, or null for a base send.
  */
-export function chooseReplyTarget({ type, thread, root, parent, msg } = {}, { isFirstChunk = true } = {}) {
-  // Only groups ever use reply-to. p2p DMs (and unknown types) always base-send.
+export function chooseReplyTarget({ type, thread, root, parent, msg } = {}, { isFirstChunk = true, quoteDirectMessage = false } = {}) {
+  if (type === 'p2p' && quoteDirectMessage) return msg || null;
+  // Without the explicit DM opt-in, only groups use reply-to.
   if (type !== 'group' && type !== 'topic_group') return null;
   // A topic/thread root: keep every chunk inside the thread.
   if (thread || root) return parent || root || msg || null;

@@ -981,7 +981,7 @@ async function openConversationResponse({ chatId, chatType, messageId, rootId, p
         chatType,
         replyToMessageId: chatType === 'group'
           ? (parentId || rootId || messageId)
-          : null,
+          : (messageId || null),
       },
       ...(initialPhase ? { initialPhase } : {}),
     });

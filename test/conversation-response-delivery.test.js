@@ -21,7 +21,7 @@ test('derives the exact Feishu reply target from a durable C4 route', () => {
   }), {
     chatId: 'oc_dm',
     chatType: 'p2p',
-    replyToMessageId: null,
+    replyToMessageId: 'om_message',
   });
 });
 test('a durable Core delivery recreates a missing placeholder before applying events', async () => {
@@ -68,7 +68,12 @@ test('a durable Core delivery recreates a missing placeholder before applying ev
     target: {
       chatId: 'oc_dm',
       chatType: 'p2p',
-      replyToMessageId: null,
+      replyToMessageId: 'om_recover',
     },
   });
+});
+
+test('DM durable routes quote the trigger, never inherited topic facts', () => {
+  assert.equal(targetFromC4Route({channel: 'feishu', endpointId: 'oc_dm|type:p2p|root:om_old|parent:om_parent|msg:om_new'}).replyToMessageId, 'om_new');
+  assert.equal(targetFromC4Route({channel: 'feishu', endpointId: 'oc_dm|type:p2p|root:om_old'}).replyToMessageId, null);
 });

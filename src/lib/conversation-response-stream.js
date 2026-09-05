@@ -417,11 +417,20 @@ function normalizeTarget(value) {
 
 async function sendMessage(client, target, msgType, content, uuid) {
   const data = { msg_type: msgType, content, uuid };
-  if (target.chatType === 'group' && target.replyToMessageId) {
-    return requireSuccess(await client.im.message.reply({
-      path: { message_id: target.replyToMessageId },
-      data,
-    }), 'Feishu conversation response reply');
+  if (target.replyToMessageId) {
+    // A DM quotes its triggering message in the main chat, never an inherited
+    // thread/root. Leave group behavior unchanged.
+    try {
+      return requireSuccess(await client.im.message.reply({
+        path: { message_id: target.replyToMessageId },
+        data: { ...data, ...(target.chatType === 'p2p' ? { reply_in_thread: false } : {}) },
+      }), 'Feishu conversation response reply');
+    } catch (error) {
+      // Deleted/unavailable sources or unsupported DM quotes must not lose the
+      // answer. Only an explicit rejection allows a base-send fallback; an
+      // unknown transport outcome must retain normal idempotent retry behavior.
+      if (target.chatType !== 'p2p' || deliveryError(error).deliveryOutcome !== 'rejected') throw error;
+    }
   }
   return requireSuccess(await client.im.message.create({
     params: { receive_id_type: 'chat_id' },
