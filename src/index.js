@@ -1026,6 +1026,21 @@ function responseProjectionEvent(event, operationId) {
 function createConversationResponseProjectionPort() {
   const stream = getConversationResponseStream();
 
+  // Decode the originating message id from the presentation route so the
+  // typing reaction on the user's own message can be settled when the reply
+  // reaches a terminal state (the legacy 2s typing-drain is disabled under
+  // the refactor composition).
+  function sourceMessageIdFromTargetRef(targetRef) {
+    try {
+      const match = String(targetRef || '').match(/^feishu-(?:route|source):v1:([A-Za-z0-9_-]+)$/);
+      if (!match) return null;
+      const route = JSON.parse(Buffer.from(match[1], 'base64url').toString('utf8'));
+      return route?.messageId ? String(route.messageId) : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function apply(operation, outcome) {
     const snapshot = replyComposition?.inspect(operation.requestId);
     if (!snapshot?.handle) {
@@ -1058,6 +1073,14 @@ function createConversationResponseProjectionPort() {
           errorCode: projected?.reason || 'CARD_PROJECTION_REJECTED',
           retryable: true,
         };
+      }
+      if (terminalTypes.length) {
+        const sourceMessageId = sourceMessageIdFromTargetRef(snapshot.handle.route?.targetRef);
+        if (sourceMessageId) {
+          await settleTypingIndicator(sourceMessageId).catch(error => {
+            console.warn(`[feishu] Failed to settle typing indicator for ${sourceMessageId}: ${error.message}`);
+          });
+        }
       }
     }
     return { outcome, cardId };
