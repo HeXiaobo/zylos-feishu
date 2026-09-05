@@ -209,6 +209,7 @@ async function sendText(endpoint, text) {
           client: getClient(),
           processDisplay: getStreamProcessDisplay(config),
           mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
+          preferPlainPlaceholder: config.message?.useMarkdownCard === false,
         });
         await responseStream.sendCompleted({
           requestId,
@@ -471,6 +472,7 @@ async function send() {
             client: getClient(),
             processDisplay: getStreamProcessDisplay(config),
             mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
+            preferPlainPlaceholder: config.message?.useMarkdownCard === false,
           });
           const result = await responseStream.completeWithFullAnswer({
             requestId: assistantRequestId,
