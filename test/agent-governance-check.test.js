@@ -143,7 +143,7 @@ function writeManifestFile(manifestPath, manifest, { receipt = 'publish' } = {})
   fs.writeFileSync(manifestPath, JSON.stringify(manifest));
 }
 
-function globalV2Manifest({ headSha = git(ROOT, 'rev-parse', 'HEAD'), version = '0.3.7-rc.19', ...overrides } = {}) {
+function globalV2Manifest({ headSha = git(ROOT, 'rev-parse', 'HEAD'), version = '0.3.7-rc.20', ...overrides } = {}) {
   return {
     schema: 'zylos.release-manifest/v2',
     releaseId: 'ZYL-TEST-V2-FEISHU',
@@ -232,7 +232,7 @@ function runGovernanceCli(root, mode, manifestPath) {
       'scripts/agent-governance-check.js',
       mode,
       '--branch',
-      'release/0.3.7-rc.19',
+      'release/0.3.7-rc.20',
       '--manifest',
       manifestPath,
     ],
@@ -265,20 +265,20 @@ function governanceCliFixture() {
   const fixtureHead = git(root, 'rev-parse', 'HEAD');
   git(root, 'remote', 'add', 'origin', 'https://github.com/HeXiaobo/zylos-feishu.git');
   git(root, 'update-ref', 'refs/remotes/origin/main', fixtureHead);
-  git(root, 'checkout', '-qb', 'release/0.3.7-rc.19');
+  git(root, 'checkout', '-qb', 'release/0.3.7-rc.20');
   return root;
 }
 
 function pullRequestMergeFixture() {
   const root = tempDirectory('zylos-feishu-pull-request-merge-');
-  writeFixtureMetadata(root, '0.3.7-rc.19');
+  writeFixtureMetadata(root, '0.3.7-rc.20');
   git(root, 'init', '-q', '-b', 'main');
   git(root, 'config', 'user.email', 'governance-tests@example.invalid');
   git(root, 'config', 'user.name', 'Governance Tests');
   git(root, 'add', '.');
   git(root, 'commit', '-qm', 'base');
   const baseSha = git(root, 'rev-parse', 'HEAD');
-  git(root, 'checkout', '-qb', 'release/0.3.7-rc.19');
+  git(root, 'checkout', '-qb', 'release/0.3.7-rc.20');
   fs.writeFileSync(path.join(root, 'candidate.txt'), 'candidate\n');
   git(root, 'add', 'candidate.txt');
   git(root, 'commit', '-qm', 'candidate');
@@ -288,7 +288,7 @@ function pullRequestMergeFixture() {
   git(root, 'add', 'base-update.txt');
   git(root, 'commit', '-qm', 'advance base');
   const baseTipSha = git(root, 'rev-parse', 'HEAD');
-  git(root, 'merge', '--no-ff', '-m', 'merge candidate', 'release/0.3.7-rc.19');
+  git(root, 'merge', '--no-ff', '-m', 'merge candidate', 'release/0.3.7-rc.20');
   const mergeSha = git(root, 'rev-parse', 'HEAD');
   git(root, 'update-ref', 'refs/remotes/origin/main', baseTipSha);
   git(root, 'checkout', '--detach', mergeSha);
@@ -297,7 +297,7 @@ function pullRequestMergeFixture() {
     eventPath,
     JSON.stringify({
       pull_request: {
-        head: { ref: 'release/0.3.7-rc.19', sha: headSha },
+        head: { ref: 'release/0.3.7-rc.20', sha: headSha },
         base: { ref: 'main', sha: baseSha },
         merge_commit_sha: mergeSha,
       },
@@ -306,10 +306,10 @@ function pullRequestMergeFixture() {
   return { root, eventPath, baseSha, baseTipSha, headSha, mergeSha };
 }
 
-test('repository release metadata is aligned at the release 0.3.7-rc.19 baseline', () => {
+test('repository release metadata is aligned at the release 0.3.7-rc.20 baseline', () => {
   const result = validateReleaseMetadata(ROOT);
   assert.deepEqual(result.failures, []);
-  assert.equal(result.packageVersion, '0.3.7-rc.19');
+  assert.equal(result.packageVersion, '0.3.7-rc.20');
 });
 
 test('classifies protected, release, and feature branches', () => {
@@ -335,13 +335,13 @@ test('pull_request governance uses signed event refs and merge topology over CI 
         GITHUB_EVENT_PATH: fixture.eventPath,
         GITHUB_REF: 'refs/pull/46/merge',
         GITHUB_REF_NAME: 'merge',
-        GITHUB_HEAD_REF: 'release/0.3.7-rc.19',
+        GITHUB_HEAD_REF: 'release/0.3.7-rc.20',
         GITHUB_BASE_REF: 'main',
         GITHUB_SHA: fixture.mergeSha,
       },
     });
     assert.equal(result.status, 'PASS', result.failures.join('\n'));
-    assert.equal(result.branch, 'release/0.3.7-rc.19');
+    assert.equal(result.branch, 'release/0.3.7-rc.20');
     assert.equal(result.base, 'origin/main');
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
@@ -523,7 +523,7 @@ test('release CLI accepts a global v2 manifest without a per-agent target', () =
         'scripts/agent-governance-check.js',
         'release',
         '--branch',
-        'release/0.3.7-rc.19',
+        'release/0.3.7-rc.20',
       '--manifest',
       manifestPath,
     ],
@@ -762,7 +762,7 @@ test('global v2 accepts legitimate GitHub repository URL forms', () => {
         manifestPath,
         headSha,
         packageName: 'zylos-feishu',
-        packageVersion: '0.3.7-rc.19',
+        packageVersion: '0.3.7-rc.20',
       });
       assert.deepEqual(result.failures, [], `${repo}: ${result.failures.join('; ')}`);
     }
@@ -786,7 +786,7 @@ test('global v2 deploy keeps status, evidence, and identity gates', () => {
     const result = runGovernance({
       root: fixtureRoot,
       mode: 'deploy',
-      branch: 'release/0.3.7-rc.19',
+      branch: 'release/0.3.7-rc.20',
       manifestPath,
     });
     assert.equal(result.status, 'HOLD');
@@ -996,7 +996,7 @@ test('v2 release and deploy read the actual symbolic branch and reject conflicti
     });
     assert.equal(conflicting.status, 'HOLD');
     assert.ok(conflicting.failures.some(message => message.includes('CI branch ref')));
-    assert.equal(conflicting.branch, 'release/0.3.7-rc.19');
+    assert.equal(conflicting.branch, 'release/0.3.7-rc.20');
   } finally {
     fs.rmSync(manifestDir, { recursive: true, force: true });
     fs.rmSync(fixtureRoot, { recursive: true, force: true });

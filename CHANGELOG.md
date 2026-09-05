@@ -7,10 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.20] - 2026-09-05
+
+### Added
+- Task status card for `create_task` intake: a create-task message opens a status
+  card at 「📋 马上创建飞书任务…」, driven by the core task-stream projection
+  (task lifecycle events mapped onto the two-card stream). `open()`/
+  `openConversationResponse()` accept an optional `initialPhase`.
+
+### Fixed
+- The ⌨️ typing reaction stayed on the user's message after the reply completed
+  under `C4_REPLY_REFACTOR_V1=1`: the legacy typing drain is disabled in the
+  refactor composition, so the reply now clears Typing reactions by message id
+  directly via the Feishu API at the terminal delivery hook (also recovers
+  orphaned reactions).
+
 ### Changed
-- Archive the 2026-02-15 improvement plan under `docs/archive/plan-2026-02-15.md`;
-  add `ROADMAP.md` to reflect the current native Task / CardKit / Smart-mode
-  direction.
+- Two-card replies (status card + answer as a new re-notifying message) from
+  0.3.7-rc.19 are now enabled via the `C4_REPLY_REFACTOR_V1=1` deployment flag.
 
 ## [0.3.7-rc.19] - 2026-09-04
 
