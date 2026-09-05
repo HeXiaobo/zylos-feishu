@@ -155,7 +155,7 @@ test('opaque Feishu route facts resolve without shifting DM or topic replies', (
     .toString('base64url')}`;
   assert.deepEqual(resolveFeishuRouteTarget(encode('feishu-route', {
     chatType: 'p2p', chatId: 'oc-dm', messageId: 'om-dm', rootId: null, parentId: null,
-  })), { chatId: 'oc-dm', chatType: 'p2p', replyToMessageId: null });
+  })), { chatId: 'oc-dm', chatType: 'p2p', replyToMessageId: 'om-dm' });
   assert.deepEqual(resolveFeishuRouteTarget(encode('feishu-source', {
     chatType: 'topic_group', chatId: 'oc-topic', messageId: 'om-topic',
     rootId: 'om-root', parentId: 'om-parent',

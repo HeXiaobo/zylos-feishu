@@ -96,3 +96,11 @@ test('unknown/undefined chat type never replies (safe default = base send)', () 
   assert.equal(chooseReplyTarget({}), null);
   assert.equal(chooseReplyTarget(), null);
 });
+
+test('inline DM quotes opt in to the exact trigger for every answer chunk', () => {
+  const endpoint = { type: 'p2p', msg: 'om_new', root: 'om_old', parent: 'om_parent' };
+  for (const isFirstChunk of [true, false]) {
+    assert.equal(chooseReplyTarget(endpoint, { quoteDirectMessage: true, isFirstChunk }), 'om_new');
+  }
+  assert.equal(chooseReplyTarget({type: 'p2p', root: 'om_old'}, {quoteDirectMessage: true}), null);
+});

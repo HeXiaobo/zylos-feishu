@@ -54,6 +54,7 @@ export async function sendMessage(
       content: messageContent,
     };
     if (typeof options.uuid === 'string' && options.uuid !== '') data.uuid = options.uuid;
+    if (typeof options.replyInThread === 'boolean') data.reply_in_thread = options.replyInThread;
     const res = await client.im.message.create({
       params: { receive_id_type: receiveIdType },
       data,

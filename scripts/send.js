@@ -202,7 +202,7 @@ async function sendText(endpoint, text) {
     if (!requestId) {
       console.warn('[feishu] Unified card skipped: Core did not provide a stable C4 delivery identity');
     } else {
-      const replyToMessageId = chooseReplyTarget(parsedEndpoint, { isFirstChunk: true }) || null;
+      const replyToMessageId = chooseReplyTarget(parsedEndpoint, { isFirstChunk: true, quoteDirectMessage: true }) || null;
       const cardText = convertAtMentionsForCard(buildMentionMarkdown(text));
       try {
         const responseStream = createConversationResponseStream({
@@ -257,8 +257,8 @@ initMention();
 async function sendPlainTextChunk(endpoint, chunk, isFirstChunk) {
   const { chatId, type } = parsedEndpoint;
   const isDM = type === 'p2p';
-  // p2p DMs never reply-to (invisible in the 1:1 view); only groups reply.
-  const replyTarget = chooseReplyTarget(parsedEndpoint, { isFirstChunk });
+  // Quote the triggering DM message inline; never inherit its old thread.
+  const replyTarget = chooseReplyTarget(parsedEndpoint, { isFirstChunk, quoteDirectMessage: true });
   // Resolve configured @names before choosing the transport. Plain text stays
   // `text`; resolved mentions use Feishu's rich-text `post` representation.
   const { msgType, content } = buildMentionContent(chunk);
@@ -266,7 +266,7 @@ async function sendPlainTextChunk(endpoint, chunk, isFirstChunk) {
 
   if (replyTarget) {
     try {
-      result = await replyToMessage(replyTarget, content, msgType);
+      result = await replyToMessage(replyTarget, content, msgType, isDM ? { replyInThread: false } : {});
     } catch (err) {
       console.log('[feishu] Reply threw, falling back:', err.message);
       result = { success: false };

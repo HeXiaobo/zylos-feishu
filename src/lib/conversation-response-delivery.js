@@ -32,7 +32,7 @@ export function targetFromC4Route(input) {
   }
   const replyToMessageId = metadata.type === 'group'
     ? requireText(metadata.parent || metadata.root || metadata.msg, 'Feishu response reply messageId')
-    : null;
+    : (metadata.msg ? requireText(metadata.msg, 'Feishu direct reply messageId') : null);
   return Object.freeze({ chatId, chatType: metadata.type, replyToMessageId });
 }
 

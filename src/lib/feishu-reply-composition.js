@@ -66,7 +66,7 @@ export function resolveFeishuRouteTarget(targetRef) {
       route.parentId || route.rootId || route.messageId,
       'Feishu group route reply target',
     )
-    : null;
+    : (route.messageId ? requireText(route.messageId, 'Feishu direct reply target') : null);
   return Object.freeze({ chatId, chatType, replyToMessageId });
 }
 
