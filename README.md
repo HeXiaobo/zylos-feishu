@@ -129,3 +129,9 @@ Want a managed experience? [Coco](https://coco.xyz/) gives you a ready-to-work A
 ## License
 
 [MIT](./LICENSE)
+
+## Upgrading this fork
+
+Give your resident Agent this repository link and request latest or a named version.
+The [upgrade entrypoint](UPGRADE.md) selects **only feishu**, preserves the installed
+companions, and reuses the shared operator tools without installing Core.
