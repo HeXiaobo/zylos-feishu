@@ -158,3 +158,8 @@ Zylos 是 [Coco](https://coco.xyz/)（AI 员工平台）的开源核心基础设
 ## 许可证
 
 [MIT](./LICENSE)
+
+## 升级此 fork
+
+给 Agent 本仓库链接，并说明最新版或目标版本即可。按 [UPGRADE.md](UPGRADE.md)
+只升级 Feishu，保留 Core/HXA；共享工具由 Agent 自行获取，不需要另发升级包。
