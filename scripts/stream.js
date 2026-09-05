@@ -38,6 +38,7 @@ async function main() {
       client: getClient(),
       processDisplay: getStreamProcessDisplay(config),
       mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
+      preferPlainPlaceholder: config.message?.useMarkdownCard === false,
     });
     const result = await createConversationResponseRuntimeAdapter({
       stream,

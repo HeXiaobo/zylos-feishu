@@ -1679,3 +1679,41 @@ test('open() renders a custom initial phase for a task status card', () => withS
   assert.equal(cardElement(initialCard, 'zylos_answer'), undefined);
   assert.equal(initialCard.config.streaming_mode, true);
 }));
+
+test('explicit plain preference sends completed replies as text and replays without duplicate delivery', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, preferPlainPlaceholder: true });
+  const request = { requestId: 'plain-completed', target: target(), output: 'Keep this reply plain.' };
+  const sent = await stream.sendCompleted(request);
+  const replay = await stream.sendCompleted(request);
+  assert.equal(sent.mode, 'plain_text');
+  assert.equal(replay.replayed, true);
+  const sends = calls.filter(([name]) => name === 'send');
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0][1].data.msg_type, 'text');
+  assert.equal(JSON.parse(sends[0][1].data.content).text, request.output);
+  assert.ok(sends[0][1].data.uuid);
+  assert.equal(calls.some(([name]) => ['convert','update','close'].includes(name)), false);
+}));
+
+test('plain completed delivery retries its persisted UUID even after the preference changes', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const send = client.im.message.create;
+  const attempts = [];
+  client.im.message.create = async payload => {
+    attempts.push(payload.data);
+    if (attempts.length === 1) throw new Error('network outcome unknown');
+    return send(payload);
+  };
+  let plain = true;
+  const stream = createConversationResponseStream({ client, stateDirectory, preferPlainPlaceholder: () => plain });
+  const request = { requestId: 'plain-completed-retry', target: target(), output: 'One logical plain reply.' };
+  await assert.rejects(stream.sendCompleted(request), /network outcome unknown/);
+  plain = false;
+  await stream.sendCompleted(request);
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].uuid, attempts[1].uuid);
+  assert.equal(attempts[1].msg_type, 'text');
+  await stream.sendCompleted({ ...request, requestId: 'new-card-request' });
+  assert.equal(calls.at(-1)[1].data.msg_type, 'interactive');
+}));

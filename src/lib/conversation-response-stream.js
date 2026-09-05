@@ -1162,12 +1162,15 @@ export function createConversationResponseStream({
         }
 
         if (!state) {
+          const plain = prefersPlainPlaceholder();
           state = {
             version: 1,
             requestId,
             target,
-            mode: 'ordinary_card',
-            delivery: { kind: 'completed_cards', status: 'pending' },
+            mode: plain ? 'plain_text' : 'ordinary_card',
+            delivery: plain
+              ? { kind: 'completed_plain', status: 'pending', uuid: stableToken(requestId, 'completed-plain') }
+              : { kind: 'completed_cards', status: 'pending' },
             status: 'completed',
             phase: '',
             progress: [],
