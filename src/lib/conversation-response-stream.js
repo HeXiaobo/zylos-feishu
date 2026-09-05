@@ -17,6 +17,8 @@ const DEFAULT_MAIN_TIMEOUT_MS = 900_000;
 const MAX_CHAT_LIST_SUMMARY_BYTES = 120;
 const SUMMARY_ELLIPSIS = '…';
 const DEFAULT_THROTTLE_MS = 250;
+const STATUS_CLEANUP_RETRY_MS = 30_000;
+const STATUS_CLEANUP_MAX_ATTEMPTS = 5;
 const RETRYABLE_FAILURE_PHASE = '⚠️ 回复暂时中断';
 const NON_RETRYABLE_FAILURE_PHASE = '⚠️ 回复中断';
 const RETRYABLE_FAILURE_ANSWER = '⚠️ 回复暂时中断，消息已记录。';
@@ -780,6 +782,53 @@ export function createConversationResponseStream({
     }
   }
 
+  // Recall only this request's temporary receipt, after every answer segment
+  // is acknowledged. Cleanup has its own durable retry state: it must never
+  // turn a delivered answer into a failed/repeated delivery.
+  async function cleanupSuccessfulStatus(state, { initialize = false } = {}) {
+    if (state.status !== 'completed') return;
+    const messageId = state.cards[0]?.messageId || state.plainMessageId;
+    if (!messageId) return;
+    if (!state.statusCleanup && initialize) {
+      state.statusCleanup = { status: 'pending', messageId, attempts: 0, retryAt: 0 };
+      save(state);
+    }
+    const cleanup = state.statusCleanup;
+    if (!cleanup || cleanup.status !== 'pending' || cleanup.retryAt > clock()) return;
+    // Persist the attempt before the API call, including a backoff in case
+    // the process dies after Feishu accepts the recall but before we save.
+    if (cleanup.attempts >= STATUS_CLEANUP_MAX_ATTEMPTS) {
+      cleanup.status = 'abandoned';
+      save(state);
+      return;
+    }
+    cleanup.attempts += 1;
+    cleanup.retryAt = clock() + STATUS_CLEANUP_RETRY_MS;
+    save(state);
+    try {
+      const result = await client.im.message.delete({ path: { message_id: cleanup.messageId } });
+      // A previous attempt may have succeeded before a connection/process loss.
+      if (result?.code !== 230011) requireSuccess(result, 'Feishu temporary status recall');
+      cleanup.status = 'recalled';
+      delete cleanup.lastError;
+    } catch (error) {
+      if (error?.response?.data?.code === 230011 || error?.code === 230011) {
+        cleanup.status = 'recalled';
+        delete cleanup.lastError;
+      } else {
+        cleanup.lastError = error.message;
+        if (cleanup.attempts >= STATUS_CLEANUP_MAX_ATTEMPTS) cleanup.status = 'abandoned';
+        logger.warn?.('Temporary response status cleanup failed; final answer remains delivered', {
+          requestId: state.requestId,
+          messageId: cleanup.messageId,
+          attempts: cleanup.attempts,
+          error: error.message,
+        });
+      }
+    }
+    save(state);
+  }
+
   async function render(state, { terminal = false, purpose = 'event' } = {}) {
     if (state.mode === 'plain_text') {
       const terminalFingerprint = terminal
@@ -809,7 +858,7 @@ export function createConversationResponseStream({
     // The answer is never rendered here — deliverTerminalAnswer sends it as
     // new message(s) at the terminal so the chat list re-notifies.
     const [cardState] = state.cards;
-    if (cardState) {
+    if (cardState && state.statusCleanup?.status !== 'recalled') {
       const card = renderStatusCard({
         phase: terminal && state.status === 'completed' ? '✅ 已完成' : state.phase,
         summary: terminal ? statusCardTerminalSummary(state) : null,
@@ -837,6 +886,7 @@ export function createConversationResponseStream({
     state.terminalRenderPending = true;
     save(state);
     await render(state, { terminal: true, purpose });
+    await cleanupSuccessfulStatus(state, { initialize: true });
     delete state.terminalRenderPending;
   }
 
@@ -846,6 +896,7 @@ export function createConversationResponseStream({
     if (state.mode === 'delivery_pending') await finishOpening(state);
     if (['completed', 'failed'].includes(state.status)) {
       if (state.status === status && terminalOutputMatches(state, output)) {
+        await cleanupSuccessfulStatus(state);
         return { handled: true, replayed: true, messageId: terminalMessageId(state) };
       }
       const error = new Error('conversation response stream already has a different terminal result');
@@ -1385,6 +1436,7 @@ export function createConversationResponseStream({
             parts: state.answerCards.length || state.cards.length || 1,
           };
         }
+        await cleanupSuccessfulStatus(state);
         if (state.terminalTombstone && !state.compatibilityTerminal) {
           if (events.every(event => event.sequence <= state.lastEventSequence)) {
             return { handled: true, replayed: true, status: state.status };
@@ -1637,7 +1689,9 @@ export function createConversationResponseStream({
         if (state.presenceCompletionPending === true) {
           presenceCompletionRequestIds.push(state.requestId);
         }
-        if (!['queued', 'started'].includes(state.status)) continue;
+        if (!['queued', 'started'].includes(state.status)
+          && !(state.status === 'completed' && state.statusCleanup?.status === 'pending'
+            && state.statusCleanup.retryAt <= clock())) continue;
         checked += 1;
         try {
           const result = await stream.apply({ requestId: state.requestId, events: [] });
