@@ -15,6 +15,7 @@ import {
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
 import { createConversationResponseRuntimeAdapter } from '../src/lib/conversation-response-runtime-adapter.js';
 import { openTypingDoneMarkerStore } from '../src/lib/typing-done-marker.js';
+import { clearTypingReactions } from '../src/lib/message.js';
 
 dotenv.config({ path: path.join(process.env.HOME || os.homedir(), 'zylos/.env') });
 
@@ -41,6 +42,12 @@ async function main() {
     const result = await createConversationResponseRuntimeAdapter({
       stream,
       markers: openTypingDoneMarkerStore({ directory: path.join(DATA_DIR, 'typing') }),
+      onTerminalMark: async (messageId) => {
+        const cleared = await clearTypingReactions(messageId, { client: getClient() });
+        if (cleared?.removed > 0) {
+          console.log(`[feishu] Cleared ${cleared.removed} typing reaction(s) for ${messageId}`);
+        }
+      },
     }).deliver(delivery);
     process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);
   } catch (error) {
