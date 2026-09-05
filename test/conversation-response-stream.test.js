@@ -38,6 +38,10 @@ function createClient({ conversion = true, interactiveFailure = false } = {}) {
   const client = {
     im: {
       message: {
+        async delete(payload) {
+          calls.push(['recall', payload]);
+          return { code: 0 };
+        },
         create: payload => send('send', payload),
         reply: payload => send('reply', payload),
       },
@@ -1221,7 +1225,8 @@ test('falls back to plain text when interactive creation fails and sends one ter
       event(4, 'RunCompleted', { output: '纯文本降级答案' }),
     ],
   });
-  const textSends = calls.filter(([, payload]) => {
+  const textSends = calls.filter(([name, payload]) => {
+    if (!['send', 'reply'].includes(name)) return false;
     const content = JSON.parse(payload.data.content);
     return Object.hasOwn(content, 'text');
   });
@@ -1678,4 +1683,111 @@ test('open() renders a custom initial phase for a task status card', () => withS
   assert.equal(cardElement(initialCard, 'zylos_phase').content, '📋 马上创建飞书任务…');
   assert.equal(cardElement(initialCard, 'zylos_answer'), undefined);
   assert.equal(initialCard.config.streaming_mode, true);
+}));
+
+// Issue #73: successful temporary receipts disappear only after the answer is safe.
+for (const mode of ['cardkit', 'ordinary', 'plain', 'plain-fallback']) {
+  test(`recalls ${mode} status after final delivery and preserves replay idempotency`, () => withState(async stateDirectory => {
+    const { client, calls } = createClient({ conversion: mode !== 'ordinary', interactiveFailure: mode === 'plain-fallback' });
+    const options = { client, stateDirectory, preferPlainPlaceholder: mode === 'plain', throttleMs: 0, logger: { warn() {} } };
+    let stream = createConversationResponseStream(options);
+    const opened = await stream.open({ requestId: 'assistant.feishu.om_1', target: target('group') });
+    const events = [event(1, 'RunCompleted', { output: '最终结果' })];
+    await stream.apply({ requestId: 'assistant.feishu.om_1', events });
+    const recalls = calls.filter(([name]) => name === 'recall');
+    assert.deepEqual(recalls, [['recall', { path: { message_id: opened.messageId } }]]);
+    assert.equal(calls.at(-1)[0], 'recall', 'answer and stream closure precede recall');
+    const before = calls.length;
+    stream = createConversationResponseStream(options);
+    await stream.apply({ requestId: 'assistant.feishu.om_1', events });
+    await stream.sweepExpired();
+    assert.equal(calls.length, before, 'restart and replay do not resend or recall again');
+  }));
+}
+
+test('partial/unknown answer delivery keeps status until all segments are acknowledged', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, answerBytesPerCard: 256, throttleMs: 0 });
+  const opened = await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  const send = client.im.message.create;
+  let part = 0;
+  client.im.message.create = async payload => {
+    part += 1;
+    if (part === 2) throw new Error('unknown delivery outcome');
+    return send(payload);
+  };
+  const events = [event(1, 'RunCompleted', { output: 'x'.repeat(700) })];
+  await assert.rejects(stream.apply({ requestId: 'assistant.feishu.om_1', events }), /unknown delivery outcome/);
+  assert.equal(calls.filter(([name]) => name === 'recall').length, 0);
+  await stream.apply({ requestId: 'assistant.feishu.om_1', events });
+  assert.equal(calls.filter(([name]) => name === 'send').length, 4, 'placeholder plus three acknowledged answer parts');
+  assert.deepEqual(calls.at(-1), ['recall', { path: { message_id: opened.messageId } }]);
+}));
+
+for (const recoveredCode of [0, 230011, 'http-already-recalled']) {
+  test(`cleanup retries survive restart without redelivery (recall response ${recoveredCode})`, () => withState(async stateDirectory => {
+    const { client, calls } = createClient();
+    let now = 1000;
+    let attempts = 0;
+    client.im.message.delete = async payload => {
+      calls.push(['recall', payload]);
+      if (++attempts === 1) throw new Error('lost recall response');
+      if (recoveredCode === 'http-already-recalled') {
+        const error = new Error('already recalled');
+        error.response = { data: { code: 230011 } };
+        throw error;
+      }
+      return { code: recoveredCode };
+    };
+    const options = { client, stateDirectory, clock: () => now, throttleMs: 0, logger: { warn() {} } };
+    let stream = createConversationResponseStream(options);
+    await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+    await stream.apply({ requestId: 'assistant.feishu.om_1', events: [event(1, 'RunCompleted', { output: '结果' })] });
+    const sends = calls.filter(([name]) => name === 'send').length;
+    stream = createConversationResponseStream(options);
+    await stream.sweepExpired();
+    assert.equal(attempts, 1, 'backoff survives restart');
+    now += 30_000;
+    await stream.sweepExpired();
+    now += 30_000;
+    await stream.sweepExpired();
+    assert.equal(attempts, 2);
+    assert.equal(calls.filter(([name]) => name === 'send').length, sends);
+  }));
+}
+
+test('recall permission errors are bounded and do not fail successful delivery', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  let now = 1000;
+  let attempts = 0;
+  client.im.message.delete = async () => { attempts += 1; return { code: 230027, msg: 'permission denied' }; };
+  const stream = createConversationResponseStream({ client, stateDirectory, clock: () => now, logger: { warn() {} } });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.completeWithFullAnswer({ requestId: 'assistant.feishu.om_1', output: '结果' });
+  for (let n = 0; n < 8; n++) { now += 30_000; await stream.sweepExpired(); }
+  assert.equal(attempts, 5);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 2);
+}));
+
+test('failure and another active request keep their own status messages', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory });
+  const first = await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.open({ requestId: 'assistant.feishu.om_2', target: target() });
+  await stream.fail({ requestId: 'assistant.feishu.om_1' });
+  assert.equal(calls.filter(([name]) => name === 'recall').length, 0);
+  await stream.apply({ requestId: 'assistant.feishu.om_1', events: [event(1, 'RunCompleted', { output: '修复后的结果' })] });
+  assert.deepEqual(calls.filter(([name]) => name === 'recall'), [['recall', { path: { message_id: first.messageId } }]]);
+}));
+
+test('canonical correction delivers its answer without patching an already recalled card', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.completeWithFullAnswer({ requestId: 'assistant.feishu.om_1', output: '兼容答案' });
+  client.cardkit.v1.card.update = async () => { throw new Error('cannot update recalled card'); };
+  await stream.apply({ requestId: 'assistant.feishu.om_1', events: [event(1, 'RunFailed', { retryable: true })] });
+  assert.equal(calls.filter(([name]) => name === 'recall').length, 1);
+  const lastAnswer = calls.filter(([name]) => name === 'send').at(-1)[1];
+  assert.match(JSON.parse(lastAnswer.data.content).text, /回复暂时中断/);
 }));
