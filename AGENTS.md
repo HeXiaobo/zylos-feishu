@@ -13,9 +13,11 @@ Zylos governance policy.
   production canary.
 - A review agent may inspect, test, and comment. It may not change a frozen
   release SHA or deploy.
-- Only an explicitly authorized release manager may change a release version,
-  prepare a release candidate, or update the frozen external manifest. Only an
-  explicitly authorized deploy operator may deploy.
+- Any agent with explicit owner release authorization may change release
+  metadata or prepare the external candidate; a separate release-manager role
+  is not required. An explicit runtime upgrade request includes preparation of
+  its external candidate and evidence, not an unrelated package version bump.
+  Deployment still requires owner authorization and every existing gate.
 - A version label is not an immutable release identity. Name a release by its
   repository, package version, and complete 40-character commit SHA.
 
@@ -61,6 +63,10 @@ Use a separate worktree for concurrent work and preserve unrelated changes.
   identity probe and verify that the target Agent name, `profileId`, and
   hostname match the intended runtime. Never trust an `--agent` argument as
   proof of identity; a mismatch is `HOLD` before any service stop or write.
+  Record the verified identity in the execution receipt. The shared portable
+  global v2 gate does not require a per-agent ledger target; scoped and legacy
+  gates retain their own requirements. Do not remove fields required by the
+  gate actually being used.
 
 ## Required task finish
 
@@ -90,3 +96,8 @@ verified installed versions and full SHAs, verify compatibility and unchanged
 source/configuration, and use the scoped native updater after the deployment
 gate. Only an explicit request for the complete bundle selects `--only all`.
 Routine preparation is the Agent's responsibility, not an extra owner approval.
+Follow the shared WORKFLOW.md recovery steps for historical task mappings,
+source evidence and retained quarantine. Reuse existing authorization for the
+same exact repair; do not infer task cancellation or backup deletion authority
+from an upgrade request. After verified repair, continue through the original
+gates and final acceptance without another routine approval handoff.
