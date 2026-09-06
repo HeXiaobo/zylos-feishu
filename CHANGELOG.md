@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.21] - 2026-09-06
+
+### Fixed
+- Passive Smart-group traffic stayed visible under `C4_REPLY_REFACTOR_V1=1`:
+  the refactored path skipped the shared Smart policy prompt, bound reply
+  presentation (⌨️ typing reaction) at message acceptance, and auto-opened a
+  CardKit card for every Core delivery, so unmentioned messages could produce
+  cards, visible `[SKIP]` answers, or error cards. Admission now stays separate
+  from presentation: passive requests carry the Smart prompt and a durable
+  silent-disposition marker; the response hook resolves `[SKIP]` and failures
+  with zero outbound and releases only substantive answers into the normal
+  reply projection. (#77, #78)
+- With `message.useMarkdownCard=false`, the C4 stream/send subprocesses ignored
+  the plain text preference and completed responses hardcoded cards. The
+  preference now flows through all CLI stream constructions and new completed
+  responses deliver plain text, with the plain UUID persisted before sending to
+  avoid duplicate delivery on unknown outcomes. (#75)
+- DM status cards and final answers now quote the triggering user message
+  (native source quote, `reply_in_thread: false`); group routing is unchanged
+  and explicit quote rejection falls back to a base send. (#66, #76)
+
+### Docs
+- Added a Feishu-only repository upgrade entry. (#72)
+
 ## [0.3.7-rc.20] - 2026-09-05
 
 ### Added
