@@ -1,6 +1,6 @@
 ## Task role and scope
 
-- Role: `feature` / `review` / `release-manager` / `deploy`
+- Role: `feature` / `review` / `release operator` / `deploy`
 - Issue/task: <!-- link or N/A -->
 - Base full SHA: <!-- 40 hexadecimal characters -->
 - Head full SHA: <!-- 40 hexadecimal characters -->
