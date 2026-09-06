@@ -57,6 +57,8 @@ import {
   resolveFeishuRouteTarget,
   TERMINAL_RUN_EVENTS,
 } from './lib/feishu-reply-composition.js';
+import { normalizedCommandMentionsBot } from './lib/feishu-inbound-normalizer.js';
+import { openSmartSilentMarkerStore } from './lib/smart-silent-marker.js';
 import {
   createTypingDoneMarkerConsumer,
   createTypingPresenceCoordinator,
@@ -172,6 +174,7 @@ let inboundDrainPromise = null;
 let inboundDrainInterval = null;
 let replyComposition = null;
 let replyMaintenanceInterval = null;
+let smartSilentMarkers = null;
 
 // Initialize
 let config = getConfig();
@@ -1199,9 +1202,28 @@ async function authorizeReplyRefactorMessage(rawEvent) {
   }).allowed;
 }
 
+/**
+ * A Smart-group message accepted without an explicit mention is evaluated but
+ * must stay invisible until a substantive answer exists: it carries the shared
+ * Smart policy prompt and registers a silent-disposition marker so the C4
+ * response hook suppresses [SKIP] answers and failures with zero outbound.
+ */
+function isPassiveSmartRefactorMessage(target, command) {
+  if (target.chatType !== 'group') return false;
+  if (normalizedCommandMentionsBot(command, { botOpenId, botAppId })) return false;
+  return isSmartGroup(target.chatId);
+}
+
 async function acceptReplyRefactorMessage(command, acceptance) {
   const target = resolveFeishuRouteTarget(command.source.targetRef);
+  const smartPassive = isPassiveSmartRefactorMessage(target, command);
   const assistantRequest = buildAssistantRequest(command.source.messageId, { requireIdle: false });
+  if (smartPassive) {
+    smartSilentMarkers?.mark(assistantRequest.requestId, {
+      messageId: command.source.messageId,
+      chatId: target.chatId,
+    });
+  }
   const endpoint = buildEndpoint(target.chatId, {
     chatType: target.chatType,
     messageId: command.source.messageId,
@@ -1210,7 +1232,7 @@ async function acceptReplyRefactorMessage(command, acceptance) {
   const response = await sendToC4(
     'feishu',
     endpoint,
-    command.content.text,
+    smartPassive ? `${buildSmartModePrompt()}${command.content.text}` : command.content.text,
     null,
     { assistantRequest },
   );
@@ -1227,12 +1249,34 @@ async function acceptReplyRefactorMessage(command, acceptance) {
   });
 }
 
+/**
+ * Presentation policy for the refactor composition: Smart-group traffic without
+ * an explicit mention stays presentation-free at acceptance so no typing
+ * reaction or card state can leak before the Smart decision is known.
+ */
+function shouldPresentReplyRefactorMessage(rawEvent, normalized) {
+  try {
+    const target = resolveFeishuRouteTarget(normalized.message.reply.targetRef);
+    return !isPassiveSmartRefactorMessage(target, normalized.message);
+  } catch {
+    return true;
+  }
+}
+
 function initializeReplyRefactorComposition(creds) {
   const stream = getConversationResponseStream();
   const delivery = createConversationResponseFinalReplyCompatibility({
     stream,
     resolveTarget: resolveFeishuRouteTarget,
   });
+  smartSilentMarkers = openSmartSilentMarkerStore({
+    directory: path.join(DATA_DIR, 'smart-silent'),
+  });
+  try {
+    smartSilentMarkers.prune();
+  } catch (error) {
+    console.warn(`[feishu] Smart silent marker prune failed: ${error.message}`);
+  }
   const coreIntake = createCoreMessageIntakeAdapter({ accept: acceptReplyRefactorMessage });
   return openFeishuReplyComposition({
     inboundDbPath: path.join(DATA_DIR, 'inbound-events.db'),
@@ -1240,6 +1284,7 @@ function initializeReplyRefactorComposition(creds) {
     accountRef: creds.app_id,
     coreIntake,
     authorize: authorizeReplyRefactorMessage,
+    present: shouldPresentReplyRefactorMessage,
     reactionPort: createReplyReactionPort(),
     cardPort: createConversationResponseProjectionPort(),
     delivery,

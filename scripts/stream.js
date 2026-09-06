@@ -14,6 +14,7 @@ import {
 } from '../src/lib/config.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
 import { createConversationResponseRuntimeAdapter } from '../src/lib/conversation-response-runtime-adapter.js';
+import { openSmartSilentMarkerStore } from '../src/lib/smart-silent-marker.js';
 import { openTypingDoneMarkerStore } from '../src/lib/typing-done-marker.js';
 import { clearTypingReactions } from '../src/lib/message.js';
 
@@ -40,6 +41,13 @@ async function main() {
       mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
       preferPlainPlaceholder: config.message?.useMarkdownCard === false,
     });
+    // Passive Smart-group requests are registered by the Feishu service before
+    // they reach Core. Their delivery must resolve the Smart silent disposition
+    // (zero outbound on [SKIP], no error card on failure) before any visible
+    // projection happens.
+    const silentMarkers = openSmartSilentMarkerStore({
+      directory: path.join(DATA_DIR, 'smart-silent'),
+    });
     const result = await createConversationResponseRuntimeAdapter({
       stream,
       markers: openTypingDoneMarkerStore({ directory: path.join(DATA_DIR, 'typing') }),
@@ -48,6 +56,18 @@ async function main() {
         if (cleared?.removed > 0) {
           console.log(`[feishu] Cleared ${cleared.removed} typing reaction(s) for ${messageId}`);
         }
+      },
+      silentGuard: {
+        isSilentEligible: async (requestId) => {
+          try {
+            return silentMarkers.get(requestId) !== null;
+          } catch {
+            return false;
+          }
+        },
+        release: async (requestId) => {
+          silentMarkers.release(requestId);
+        },
       },
     }).deliver(delivery);
     process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`);

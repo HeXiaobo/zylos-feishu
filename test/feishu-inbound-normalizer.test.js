@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { normalizeFeishuInboundMessage } from '../src/lib/feishu-inbound-normalizer.js';
+import { normalizedCommandMentionsBot, normalizeFeishuInboundMessage } from '../src/lib/feishu-inbound-normalizer.js';
 
 function inboundMessage(messageOverrides = {}, eventOverrides = {}) {
   return {
@@ -176,4 +176,26 @@ test('normalizes the real webhook event envelope and accepts only contract prior
       /priority must be one of 1, 2, or 3/,
     );
   }
+});
+
+test('normalized commands recover the exact bot-mention decision from opaque mention refs', () => {
+  const group = inboundMessage({
+    chat_type: 'group',
+    mentions: [
+      { key: '@_user_1', id: { open_id: 'ou-human' }, name: 'Alice' },
+      { key: '@_user_2', id: { open_id: 'ou-bot' }, name: 'Bot' },
+    ],
+  }, { eventId: 'evt-mention-decode' });
+  const command = normalizeFeishuInboundMessage(group, { accountRef: 'cli_app_a' }).message;
+
+  assert.equal(normalizedCommandMentionsBot(command, { botOpenId: 'ou-bot' }), true);
+  assert.equal(normalizedCommandMentionsBot(command, { botOpenId: 'ou-other' }), false);
+  assert.equal(normalizedCommandMentionsBot(command, {}), false);
+  assert.equal(normalizedCommandMentionsBot(null, { botOpenId: 'ou-bot' }), false);
+
+  const plain = normalizeFeishuInboundMessage(
+    inboundMessage({ chat_type: 'group' }, { eventId: 'evt-mention-plain' }),
+    { accountRef: 'cli_app_a' },
+  ).message;
+  assert.equal(normalizedCommandMentionsBot(plain, { botOpenId: 'ou-bot' }), false);
 });

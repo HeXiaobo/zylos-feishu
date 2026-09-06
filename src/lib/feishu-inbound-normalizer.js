@@ -123,6 +123,35 @@ function laneKey({ accountRef, chatType, chatId, threadId, rootId }) {
   return `${prefix}:chat`;
 }
 
+const MENTION_REF_PREFIX = 'feishu-mention:v1:';
+
+/**
+ * Return whether a normalized inbound command mentions one of the given bot
+ * identities. The normalized command only carries opaque mention refs, so the
+ * adapter-owned ref encoding is decoded here; consumers use this to recover
+ * the exact-mention decision the authorization step made on the raw event.
+ */
+export function normalizedCommandMentionsBot(command, { botOpenId, botAppId } = {}) {
+  const refs = command?.contextHints?.mentionRefs;
+  if (!Array.isArray(refs)) return false;
+  const trustedIds = new Set([botOpenId, botAppId]
+    .filter((id) => typeof id === 'string' && id !== '')
+    .map(String));
+  if (trustedIds.size === 0) return false;
+  return refs.some((ref) => {
+    if (typeof ref !== 'string' || !ref.startsWith(MENTION_REF_PREFIX)) return false;
+    try {
+      const decoded = JSON.parse(
+        Buffer.from(ref.slice(MENTION_REF_PREFIX.length), 'base64url').toString('utf8'),
+      );
+      const externalId = decoded?.externalId;
+      return typeof externalId === 'string' && trustedIds.has(externalId);
+    } catch {
+      return false;
+    }
+  });
+}
+
 /** Normalize authenticated Feishu facts without applying Core context policy. */
 export function normalizeFeishuInboundMessage(data, {
   accountRef,

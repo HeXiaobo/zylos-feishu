@@ -444,3 +444,115 @@ test('TaskEffect and NativeTask backflow stay on independent composition ports',
   ]);
   await composition.close();
 });
+
+function createStubPorts(calls, { handles = false } = {}) {
+  return {
+    gateway: {
+      async accept(rawEvent) {
+        calls.push(['gateway-accept', rawEvent]);
+        return {
+          status: 'accepted',
+          receipt: { requestId: 'req-present-1', type: 'MessageAccepted', schemaVersion: 1 },
+        };
+      },
+      async recover() { return { claimed: 0 }; },
+      async close() {},
+    },
+    presentation: {
+      async accept(input) {
+        calls.push(['presentation-accept', structuredClone(input)]);
+        return { created: true, handle: handles ? { presentationId: 'p1' } : undefined };
+      },
+      recordProgress() { throw new Error('must not record progress'); },
+      observeDeliveryReceipt() {},
+      async reconcile() { return {}; },
+      inspect() { return handles ? { handle: { presentationId: 'p1' } } : null; },
+      close() {},
+    },
+    finalReply: {
+      async deliver(value) { calls.push(['deliver', value]); return value; },
+      settle(value) { calls.push(['settle', value]); return value; },
+      suppress(value) { calls.push(['suppress', value]); return value; },
+    },
+  };
+}
+
+test('the present policy separates passive admission from reply presentation', async () => {
+  const calls = [];
+  const ports = createStubPorts(calls);
+  const rawEvent = event({ eventId: 'evt-present-1', messageId: 'om-present-1' });
+  const composition = createFeishuReplyComposition({
+    enabled: true,
+    accountRef: 'cli_app_a',
+    present: (seen, normalized) => {
+      calls.push(['present', seen, typeof normalized?.message?.commandId]);
+      return false;
+    },
+    ...ports,
+  });
+
+  const accepted = await composition.acceptMessage(rawEvent);
+  assert.equal(accepted.presentation, null);
+  assert.deepEqual(
+    calls.filter(([name]) => name === 'present'),
+    [['present', rawEvent, 'string']],
+  );
+  assert.equal(calls.some(([name]) => name === 'presentation-accept'), false);
+
+  await composition.maintain();
+  assert.deepEqual(await composition.suppressFinal({ requestId: 'req-present-1' }), {
+    suppressed: true,
+    presence: 'unbound',
+  });
+  assert.deepEqual(await composition.settleFinal({ requestId: 'req-present-1' }), {
+    settled: true,
+    presence: 'unbound',
+  });
+  assert.equal(calls.some(([name]) => name === 'suppress'), false);
+  assert.equal(calls.some(([name]) => name === 'settle'), false);
+  assert.throws(
+    () => composition.recordProgress({ requestId: 'req-present-1', sequence: 1, type: 'RunQueued' }),
+    error => error?.code === 'PRESENTATION_NOT_FOUND',
+  );
+  await composition.close();
+});
+
+test('presented traffic binds presentation and final settlements reach the FinalReply port', async () => {
+  const calls = [];
+  const ports = createStubPorts(calls, { handles: true });
+  const composition = createFeishuReplyComposition({
+    enabled: true,
+    accountRef: 'cli_app_a',
+    present: () => true,
+    ...ports,
+  });
+
+  const accepted = await composition.acceptMessage(event({
+    eventId: 'evt-present-2', messageId: 'om-present-2',
+  }));
+  assert.equal(accepted.presentation.created, true);
+  assert.equal(calls.some(([name]) => name === 'presentation-accept'), true);
+
+  const suppressed = await composition.suppressFinal({ requestId: 'req-present-1' });
+  assert.deepEqual(suppressed, { requestId: 'req-present-1' });
+  assert.equal(calls.some(([name]) => name === 'suppress'), true);
+  const settled = await composition.settleFinal({ requestId: 'req-present-1' });
+  assert.deepEqual(settled, { requestId: 'req-present-1' });
+  assert.equal(calls.some(([name]) => name === 'settle'), true);
+  await composition.close();
+});
+
+test('the present policy defaults to presenting every accepted message', async () => {
+  const calls = [];
+  const ports = createStubPorts(calls, { handles: true });
+  const composition = createFeishuReplyComposition({
+    enabled: true,
+    accountRef: 'cli_app_a',
+    ...ports,
+  });
+  const accepted = await composition.acceptMessage(event({
+    eventId: 'evt-present-3', messageId: 'om-present-3',
+  }));
+  assert.equal(accepted.presentation.created, true);
+  await composition.close();
+});
