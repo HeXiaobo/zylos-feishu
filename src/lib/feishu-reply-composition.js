@@ -143,6 +143,7 @@ export function createFeishuReplyComposition({
   taskEffects = null,
   nativeTasks = null,
   normalizeInbound = normalizeFeishuInboundMessage,
+  present = null,
   clock = Date.now,
   logger = console,
 } = {}) {
@@ -150,6 +151,9 @@ export function createFeishuReplyComposition({
 
   const normalizedAccountRef = requireText(accountRef, 'Feishu composition accountRef');
   const inbound = requireMethods(gateway, ['accept', 'recover', 'close'], 'Feishu gateway');
+  if (present !== null && typeof present !== 'function') {
+    throw new TypeError('present must be a function or null');
+  }
   const replyPresentation = requireMethods(presentation, [
     'accept',
     'recordProgress',
@@ -217,17 +221,24 @@ export function createFeishuReplyComposition({
         if (!accepted?.receipt) return accepted;
         const normalized = normalizedInbound(rawEvent, options);
         const requestId = requireText(accepted.receipt.requestId, 'MessageAccepted.requestId');
-        const bound = await replyPresentation.accept({
-          ingressId: normalized.message.commandId,
-          requestId,
-          sourceMessageId: normalized.message.source.messageId,
-          route: Object.freeze({
-            adapterId: 'feishu',
-            targetRef: normalized.message.reply.targetRef,
-          }),
-          presentationId: `presentation:${requestId}`,
-          presenceId: `presence:${requestId}`,
-        });
+        // Presentation is bound only for traffic allowed to show an immediate
+        // response. Passive Smart-group admission stays authorized, but no
+        // presence or card state may open before a substantive answer exists;
+        // the silent disposition is resolved before any visible projection.
+        const shouldPresent = present ? present(rawEvent, normalized) !== false : true;
+        const bound = shouldPresent
+          ? await replyPresentation.accept({
+            ingressId: normalized.message.commandId,
+            requestId,
+            sourceMessageId: normalized.message.source.messageId,
+            route: Object.freeze({
+              adapterId: 'feishu',
+              targetRef: normalized.message.reply.targetRef,
+            }),
+            presentationId: `presentation:${requestId}`,
+            presenceId: `presence:${requestId}`,
+          })
+          : null;
         return Object.freeze({
           status: accepted.status,
           receipt: accepted.receipt,
@@ -277,12 +288,24 @@ export function createFeishuReplyComposition({
       if (state !== 'open') {
         throw domainError('COMPOSITION_DRAINING', 'Feishu reply composition is draining');
       }
+      const requestId = requireText(settlement?.requestId, 'DeliverySettlement.requestId');
+      if (!replyPresentation.inspect(requestId)?.handle) {
+        // A passive request never opened presence state, so there is nothing
+        // to settle; acknowledge instead of failing the delivery contract.
+        return Promise.resolve(Object.freeze({ settled: true, presence: 'unbound' }));
+      }
       return finalPort.settle(settlement);
     },
 
     suppressFinal(outcome) {
       if (state !== 'open') {
         throw domainError('COMPOSITION_DRAINING', 'Feishu reply composition is draining');
+      }
+      const requestId = requireText(outcome?.requestId, 'ReplyOutcome.requestId');
+      if (!replyPresentation.inspect(requestId)?.handle) {
+        // Passive silent disposition: no presence was bound, so suppressing is
+        // already the settled state and zero outbound must stay zero outbound.
+        return Promise.resolve(Object.freeze({ suppressed: true, presence: 'unbound' }));
       }
       return finalPort.suppress(outcome);
     },
@@ -367,6 +390,7 @@ export function openFeishuReplyComposition({
   accountRef,
   coreIntake,
   authorize,
+  present = null,
   reactionPort,
   cardPort,
   delivery,
@@ -420,6 +444,7 @@ export function openFeishuReplyComposition({
       finalReply,
       taskEffects,
       nativeTasks,
+      present,
       clock,
       logger,
     });

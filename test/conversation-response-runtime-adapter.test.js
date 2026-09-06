@@ -13,6 +13,7 @@ import {
   persistTimeoutPresenceCompletions,
   settlementMessageIdFromEndpoint,
 } from '../src/lib/typing-done-marker.js';
+import { openSmartSilentMarkerStore } from '../src/lib/smart-silent-marker.js';
 
 function delivery(type, sequence = 1) {
   return {
@@ -501,4 +502,171 @@ test('timeout completion acknowledges only after its exact durable presence mark
   assert.deepEqual(acknowledgements, []);
   assert.deepEqual(await persistTimeoutPresenceCompletions(input), { settled: 1, unresolved: 0 });
   assert.deepEqual(acknowledgements, ['assistant.feishu.hash-1']);
+});
+
+function silentDelivery({ type = 'RunCompleted', sequence = 1, output = 'done' } = {}) {
+  return {
+    schemaVersion: 1,
+    requestId: 'assistant.feishu.om-silent-1',
+    route: {
+      channel: 'feishu',
+      endpointId: 'oc-1|type:group|msg:om-silent-1',
+    },
+    events: [{
+      schemaVersion: 1,
+      eventId: `event-${sequence}`,
+      requestId: 'assistant.feishu.om-silent-1',
+      sequence,
+      type,
+      payload: type === 'RunCompleted' ? { output } : { stage: 'tool' },
+    }],
+  };
+}
+
+function createRecordingStream(calls) {
+  return {
+    async open(input) { calls.push(['open', structuredClone(input)]); return { messageId: 'card-1' }; },
+    async apply(input) {
+      calls.push(['apply', structuredClone(input)]);
+      const terminal = input.events.some(event => ['RunCompleted', 'RunFailed'].includes(event.type));
+      return { handled: true, pending: false, status: terminal ? 'completed' : 'started' };
+    },
+  };
+}
+
+test('a silent-eligible request drops pre-terminal and failed deliveries with zero projection', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-silent-guard-'));
+  try {
+    const markers = openTypingDoneMarkerStore({ directory: path.join(directory, 'typing') });
+    const silentMarkers = openSmartSilentMarkerStore({
+      directory: path.join(directory, 'smart-silent'),
+    });
+    silentMarkers.mark('assistant.feishu.om-silent-1', { messageId: 'om-silent-1', chatId: 'oc-1' });
+    const streamCalls = [];
+    const terminalMarks = [];
+    const runtime = createConversationResponseRuntimeAdapter({
+      stream: createRecordingStream(streamCalls),
+      markers,
+      onTerminalMark: async (messageId) => { terminalMarks.push(messageId); },
+      silentGuard: {
+        isSilentEligible: async (requestId) => silentMarkers.get(requestId) !== null,
+        release: async (requestId) => { silentMarkers.release(requestId); },
+      },
+    });
+
+    const queued = await runtime.deliver(silentDelivery({ type: 'RunQueued' }));
+    assert.deepEqual(queued, {
+      handled: true, pending: false, status: 'suppressed', reason: 'smart_silent_eligible',
+    });
+    const failed = await runtime.deliver(silentDelivery({ type: 'RunFailed' }));
+    assert.equal(failed.status, 'suppressed');
+    assert.deepEqual(streamCalls, []);
+    assert.deepEqual(markers.claim(), []);
+    assert.deepEqual(terminalMarks, []);
+    // The marker stays as a tombstone so late replays stay suppressed.
+    assert.notEqual(silentMarkers.get('assistant.feishu.om-silent-1'), null);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a silent-eligible terminal [SKIP] resolves with zero outbound and cleans transient state', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-silent-skip-'));
+  try {
+    const markers = openTypingDoneMarkerStore({ directory: path.join(directory, 'typing') });
+    const silentMarkers = openSmartSilentMarkerStore({
+      directory: path.join(directory, 'smart-silent'),
+    });
+    silentMarkers.mark('assistant.feishu.om-silent-1', { messageId: 'om-silent-1', chatId: 'oc-1' });
+    const streamCalls = [];
+    const terminalMarks = [];
+    const runtime = createConversationResponseRuntimeAdapter({
+      stream: createRecordingStream(streamCalls),
+      markers,
+      onTerminalMark: async (messageId) => { terminalMarks.push(messageId); },
+      silentGuard: {
+        isSilentEligible: async (requestId) => silentMarkers.get(requestId) !== null,
+        release: async (requestId) => { silentMarkers.release(requestId); },
+      },
+    });
+
+    const exact = await runtime.deliver(silentDelivery({ output: '[SKIP]' }));
+    assert.deepEqual(exact, { handled: true, pending: false, status: 'completed', silent: true });
+    const trailing = await runtime.deliver(silentDelivery({
+      sequence: 2,
+      output: '这个问题不需要我补充，前面的回答已经准确了。\n[SKIP]',
+    }));
+    assert.equal(trailing.silent, true);
+
+    assert.deepEqual(streamCalls, []);
+    assert.deepEqual(markers.claim(), ['om-silent-1']);
+    assert.deepEqual(terminalMarks, ['om-silent-1', 'om-silent-1']);
+    // The tombstone survives so a replayed terminal delivery stays suppressed.
+    assert.notEqual(silentMarkers.get('assistant.feishu.om-silent-1'), null);
+    assert.equal(
+      (await runtime.deliver(silentDelivery({ sequence: 3, output: '[SKIP]' }))).silent,
+      true,
+    );
+    assert.deepEqual(streamCalls, []);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a silent-eligible substantive answer releases the guard and projects one normal reply', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-silent-substantive-'));
+  try {
+    const markers = openTypingDoneMarkerStore({ directory: path.join(directory, 'typing') });
+    const silentMarkers = openSmartSilentMarkerStore({
+      directory: path.join(directory, 'smart-silent'),
+    });
+    silentMarkers.mark('assistant.feishu.om-silent-1', { messageId: 'om-silent-1', chatId: 'oc-1' });
+    const streamCalls = [];
+    const terminalMarks = [];
+    const runtime = createConversationResponseRuntimeAdapter({
+      stream: createRecordingStream(streamCalls),
+      markers,
+      onTerminalMark: async (messageId) => { terminalMarks.push(messageId); },
+      silentGuard: {
+        isSilentEligible: async (requestId) => silentMarkers.get(requestId) !== null,
+        release: async (requestId) => { silentMarkers.release(requestId); },
+      },
+    });
+
+    const result = await runtime.deliver(silentDelivery({ output: '实质性回答' }));
+    assert.equal(result.status, 'completed');
+    assert.equal(result.silent, undefined);
+    assert.equal(silentMarkers.get('assistant.feishu.om-silent-1'), null);
+    assert.deepEqual(streamCalls.map(([kind]) => kind), ['apply']);
+    assert.equal(streamCalls[0][1].events[0].payload.output, '实质性回答');
+    assert.deepEqual(markers.claim(), ['om-silent-1']);
+    assert.deepEqual(terminalMarks, ['om-silent-1']);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('requests without a silent marker keep the unguarded delivery path', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zylos-feishu-silent-unmarked-'));
+  try {
+    const markers = openTypingDoneMarkerStore({ directory: path.join(directory, 'typing') });
+    const silentMarkers = openSmartSilentMarkerStore({
+      directory: path.join(directory, 'smart-silent'),
+    });
+    const streamCalls = [];
+    const runtime = createConversationResponseRuntimeAdapter({
+      stream: createRecordingStream(streamCalls),
+      markers,
+      silentGuard: {
+        isSilentEligible: async (requestId) => silentMarkers.get(requestId) !== null,
+        release: async (requestId) => { silentMarkers.release(requestId); },
+      },
+    });
+
+    const result = await runtime.deliver(silentDelivery({ type: 'RunQueued' }));
+    assert.equal(result.status, 'started');
+    assert.deepEqual(streamCalls.map(([kind]) => kind), ['apply']);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
