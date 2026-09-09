@@ -4,6 +4,22 @@ Ask the resident Agent to upgrade this component to latest or a specific version
 using https://github.com/HeXiaobo/zylos-feishu. No separate ZIP, Markdown attachment,
 or owner-written ledger is needed.
 
+## Verified releases
+
+`latest` means the newest qualified **stable** bundle from the shared Core release
+catalog, not the newest Git tag or the current default branch. The published
+`zylos-release.json` asset binds all three repositories, package versions, full
+commit SHAs and the passing qualification matrix. The shared resolver checks the
+asset digest and release tag before selecting a source. This repository's machine
+entry is [UPGRADE.json](UPGRADE.json).
+
+Use `--channel preview` only when the owner explicitly asks for previews; naming
+an exact RC version also opts into previews. A preview still needs qualification.
+Missing or failed qualification is a publisher problem: do not ask the installer
+to recreate release evidence, switch to main, or bypass a local safety check.
+The latest compatible qualified component is selected with the verified installed
+companions; an incompatible request never upgrades another component implicitly.
+
 ## Scope
 
 An upgrade request for this repository means **only feishu**. Keep the other two
@@ -28,7 +44,7 @@ node tools/upgrade/prepare.mjs --only feishu --feishu latest --installed /absolu
 
 For a named version, replace latest with that exact version (for example 0.3.7-rc.20).
 The paths and message reference are filled by the Agent, not the owner.
-Continue with the generated WORKFLOW.md. Use `command.mjs` to obtain just the
+Continue with the generated WORKFLOW.md. Import its published qualification for the verified host environment; keep local backup, source, compatibility and host smoke checks fresh. Use `command.mjs` to obtain just the
 selected component's native update command after the existing deployment gate.
 Do not run a full Core/Feishu pair installation for this single-component request.
 
@@ -73,3 +89,12 @@ component must follow these rules:
   reifies the same shared plan, so the predicted delete set and the actually
   deleted set cannot drift apart, and it labels the untracked worst-case class
   explicitly.
+
+## Publisher responsibility
+
+Version tags are source labels, not installation approval. After the complete
+bundle passes qualification on its supported environment matrix, use the shared
+Core `tools/upgrade/publish.mjs` procedure to publish the qualified bundle. Do not
+mark an installed-but-HOLD candidate as a stable/latest distribution. Users keep
+using this repository link; they do not need an employee registry or the
+publisher's internal ledger. Managed employee upgrades retain their local gates.
