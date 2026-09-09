@@ -1965,3 +1965,249 @@ test('canonical correction delivers its answer without patching an already recal
   const lastAnswer = calls.filter(([name]) => name === 'send').at(-1)[1];
   assert.match(JSON.parse(lastAnswer.data.content).text, /回复暂时中断/);
 }));
+
+test('a task stream renders task lifecycle phases in place', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  await stream.open({
+    requestId: 'assistant.feishu.om_task',
+    target: target(),
+    initialPhase: '📋 马上创建飞书任务…',
+    streamKind: 'task',
+  });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [eventFor('assistant.feishu.om_task', 1, 'AssistantRequestAccepted')],
+  });
+  const acceptedCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(acceptedCard, 'zylos_phase').content, '📋 任务已登记');
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [eventFor('assistant.feishu.om_task', 2, 'RunStarted')],
+  });
+  const startedCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(startedCard, 'zylos_progress').header.title.content, '🚀 任务执行中');
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [
+      eventFor('assistant.feishu.om_task', 3, 'ProgressUpdated', {
+        stage: 'executing',
+        action: 'execute_operation',
+        status: 'started',
+      }),
+    ],
+  });
+  const runningCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(runningCard, 'zylos_progress').header.title.content, '正在执行所需操作');
+  assert.match(processDetail(runningCard), /正在分析问题/);
+  assert.equal(cardElement(runningCard, 'zylos_answer'), undefined);
+}));
+
+test('task completion delivers the result as a new card and recalls the temporary status', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  const opened = await stream.open({
+    requestId: 'assistant.feishu.om_task',
+    target: target(),
+    initialPhase: '📋 马上创建飞书任务…',
+    streamKind: 'task',
+  });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [
+      eventFor('assistant.feishu.om_task', 1, 'AssistantRequestAccepted'),
+      eventFor('assistant.feishu.om_task', 2, 'RunStarted'),
+      eventFor('assistant.feishu.om_task', 3, 'RunCompleted', { output: '✅ 任务「编译发布」已完成。' }),
+    ],
+  });
+
+  const statusId = opened.messageId;
+  const closed = calls.filter(([name]) => name === 'close');
+  assert.equal(closed.length, 1, 'the temporary status card is closed at the terminal');
+  const answerSends = calls.filter(([name]) => name === 'send').slice(-1);
+  assert.equal(answerSends.length, 1, 'the task result arrives as exactly one new card message');
+  assert.equal(calls.filter(([name]) => name === 'send').length, 2, 'open placeholder + answer card only');
+  const answerCard = JSON.parse(answerSends[0][1].data.content);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '✅ 任务「编译发布」已完成。');
+  assert.deepEqual(calls.filter(([name]) => name === 'recall'), [['recall', { path: { message_id: statusId } }]]);
+  const replay = await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [eventFor('assistant.feishu.om_task', 3, 'RunCompleted', { output: '✅ 任务「编译发布」已完成。' })],
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 2, 'a replay never re-sends the task result');
+}));
+
+test('task cancellation renders the cancelled phase and notifies with a plain message', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  await stream.open({
+    requestId: 'assistant.feishu.om_task',
+    target: target(),
+    initialPhase: '📋 马上创建飞书任务…',
+    streamKind: 'task',
+  });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [
+      eventFor('assistant.feishu.om_task', 1, 'AssistantRequestAccepted'),
+      eventFor('assistant.feishu.om_task', 2, 'RunStarted'),
+      eventFor('assistant.feishu.om_task', 3, 'RunFailed', { code: 'TASK_CANCELLED', retryable: false }),
+    ],
+  });
+
+  const statusCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const panel = cardElement(statusCard, 'zylos_progress');
+  const phase = panel ? panel.header.title.content : cardElement(statusCard, 'zylos_phase').content;
+  assert.equal(phase, '🚫 任务已取消');
+  const notice = calls.filter(([name]) => name === 'send').at(-1)[1];
+  assert.equal(notice.data.msg_type, 'text');
+  assert.equal(JSON.parse(notice.data.content).text, '任务已取消。');
+  assert.equal(calls.filter(([name]) => name === 'recall').length, 0);
+}));
+
+test('a failed task run notifies with task failure wording, distinct from chat failures', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  await stream.open({
+    requestId: 'assistant.feishu.om_task',
+    target: target(),
+    initialPhase: '📋 马上创建飞书任务…',
+    streamKind: 'task',
+  });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [
+      eventFor('assistant.feishu.om_task', 1, 'RunStarted'),
+      eventFor('assistant.feishu.om_task', 2, 'RunFailed', { code: 'RUN_STALE_AFTER_RESTART', retryable: true }),
+    ],
+  });
+
+  const statusCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const phase = cardElement(statusCard, 'zylos_progress')?.header.title.content
+    ?? cardElement(statusCard, 'zylos_phase').content;
+  assert.equal(phase, '⚠️ 任务暂时中断');
+  const notice = calls.filter(([name]) => name === 'send').at(-1)[1];
+  assert.equal(JSON.parse(notice.data.content).text, '⚠️ 任务暂时中断，请留意后续通知。');
+}));
+
+test('chat streams keep their historical phases and failure wording', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'AssistantRequestAccepted')],
+  });
+
+  const acceptedCard = JSON.parse(calls.filter(([name]) => name === 'update')[0][1].data.card.data);
+  assert.equal(cardElement(acceptedCard, 'zylos_phase').content, '✅ 已接收');
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(2, 'RunFailed', { retryable: false })],
+  });
+  const failedCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(failedCard, 'zylos_phase').content, '⚠️ 回复中断');
+  const notice = calls.filter(([name]) => name === 'send').at(-1)[1];
+  assert.equal(JSON.parse(notice.data.content).text, '⚠️ 回复中断，消息已记录。');
+}));
+
+test('a task receipt upgrades a lazily opened chat-kind stream without resending the card', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  await stream.open({ requestId: 'assistant.feishu.om_task', target: target() });
+  assert.equal(calls.filter(([name]) => name === 'send').length, 1);
+  const upgraded = await stream.open({
+    requestId: 'assistant.feishu.om_task',
+    target: target(),
+    initialPhase: '📋 马上创建飞书任务…',
+    streamKind: 'task',
+  });
+  assert.equal(upgraded.replayed, true);
+  assert.equal(calls.filter(([name]) => name === 'send').length, 1, 'the upgrade must never send a second card');
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [eventFor('assistant.feishu.om_task', 1, 'RunStarted')],
+  });
+  const runningCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const panel = cardElement(runningCard, 'zylos_progress');
+  assert.equal(panel.header.title.content, '🚀 任务执行中');
+  const persisted = readPersistedState(stateDirectory);
+  assert.equal(persisted.kind, 'task');
+}));
+
+test('task streams observe their own longer timeout window', () => withState(async stateDirectory => {
+  const { client } = createClient();
+  let now = 1_000;
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    clock: () => now,
+    throttleMs: 0,
+    queuedTimeoutMs: 1_000,
+    taskQueuedTimeoutMs: 1_000_000,
+    logger: { warn() {} },
+  });
+
+  await stream.open({
+    requestId: 'assistant.feishu.om_task',
+    target: target(),
+    streamKind: 'task',
+  });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [eventFor('assistant.feishu.om_task', 1, 'RunQueued')],
+  });
+
+  now = 2_001;
+  const result = await stream.apply({ requestId: 'assistant.feishu.om_task', events: [] });
+  assert.equal(result.reason, undefined, 'the chat queued window must not time out a task stream');
+  assert.equal(result.status, 'queued');
+}));
+
+test('a plain-mode task receipt opens with the original plain receipt text', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({
+    client,
+    stateDirectory,
+    throttleMs: 0,
+    preferPlainPlaceholder: true,
+  });
+
+  await stream.open({
+    requestId: 'assistant.feishu.om_task',
+    target: target(),
+    initialPhase: '已登记任务：编译发布',
+    streamKind: 'task',
+  });
+  const receipt = calls.filter(([name]) => name === 'send')[0][1];
+  assert.equal(receipt.data.msg_type, 'text');
+  assert.equal(JSON.parse(receipt.data.content).text, '已登记任务：编译发布');
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [
+      eventFor('assistant.feishu.om_task', 1, 'AssistantRequestAccepted'),
+      eventFor('assistant.feishu.om_task', 2, 'RunCompleted', { output: '✅ 任务「编译发布」已完成。' }),
+    ],
+  });
+  const sends = calls.filter(([name]) => name === 'send');
+  assert.equal(sends.length, 2);
+  assert.equal(JSON.parse(sends[1][1].data.content).text, '✅ 任务「编译发布」已完成。');
+
+  await stream.open({
+    requestId: 'assistant.feishu.om_chat',
+    target: target(),
+  });
+  const chatPlaceholder = calls.filter(([name]) => name === 'send').at(-1)[1];
+  assert.equal(JSON.parse(chatPlaceholder.data.content).text, '已接收，正在处理…');
+}));

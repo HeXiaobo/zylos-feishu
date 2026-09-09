@@ -66,6 +66,10 @@ export const DEFAULT_CONFIG = {
     streamProcessDisplay: 'collapsible',
     responseStreamQueuedTimeoutMs: 60_000,
     responseStreamMainTimeoutMs: 900_000,
+    // Issue #65: task-driven status streams observe much longer windows,
+    // aligned with Core's 24h stale window for task streams.
+    responseStreamTaskQueuedTimeoutMs: 86_400_000,
+    responseStreamTaskMainTimeoutMs: 86_400_000,
   }
 };
 
@@ -155,6 +159,20 @@ export function getResponseStreamMainTimeoutMs(value = getConfig()) {
   return Number.isSafeInteger(configured) && configured > 0
     ? configured
     : DEFAULT_CONFIG.message.responseStreamMainTimeoutMs;
+}
+
+export function getResponseStreamTaskQueuedTimeoutMs(value = getConfig()) {
+  const configured = value?.message?.responseStreamTaskQueuedTimeoutMs;
+  return Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_CONFIG.message.responseStreamTaskQueuedTimeoutMs;
+}
+
+export function getResponseStreamTaskMainTimeoutMs(value = getConfig()) {
+  const configured = value?.message?.responseStreamTaskMainTimeoutMs;
+  return Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_CONFIG.message.responseStreamTaskMainTimeoutMs;
 }
 
 /**

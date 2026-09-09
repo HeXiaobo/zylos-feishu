@@ -10,6 +10,8 @@ import {
   DATA_DIR,
   getConfig,
   getResponseStreamMainTimeoutMs,
+  getResponseStreamTaskMainTimeoutMs,
+  getResponseStreamTaskQueuedTimeoutMs,
   getStreamProcessDisplay,
 } from '../src/lib/config.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
@@ -39,6 +41,8 @@ async function main() {
       client: getClient(),
       processDisplay: getStreamProcessDisplay(config),
       mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
+      taskQueuedTimeoutMs: getResponseStreamTaskQueuedTimeoutMs(config),
+      taskMainTimeoutMs: getResponseStreamTaskMainTimeoutMs(config),
       preferPlainPlaceholder: config.message?.useMarkdownCard === false,
     });
     // Passive Smart-group requests are registered by the Feishu service before
