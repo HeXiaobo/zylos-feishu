@@ -101,6 +101,12 @@ function withState(testFn) {
     .finally(() => fs.rmSync(directory, { recursive: true, force: true }));
 }
 
+function readPersistedState(stateDirectory) {
+  const [file] = fs.readdirSync(stateDirectory).filter(name => name.endsWith('.json'));
+  assert.ok(file, 'expected a persisted response stream state file');
+  return JSON.parse(fs.readFileSync(path.join(stateDirectory, file), 'utf8'));
+}
+
 test('opens once, coalesces real deltas, keeps sequence monotonic, and delivers the answer as a new card', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   let now = 1_000;
@@ -1721,6 +1727,98 @@ test('plain completed delivery retries its persisted UUID even after the prefere
   assert.equal(attempts[1].msg_type, 'text');
   await stream.sendCompleted({ ...request, requestId: 'new-card-request' });
   assert.equal(calls.at(-1)[1].data.msg_type, 'interactive');
+}));
+
+test('plain preference opens a text receipt and persists the configured reason (issues #61 #62)', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0, preferPlainPlaceholder: true });
+  const opened = await stream.open({ requestId: 'assistant.feishu.om_plain_open', target: target() });
+  assert.equal(opened.mode, 'plain_text');
+  const sends = calls.filter(([name]) => name === 'send');
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0][1].data.msg_type, 'text');
+  const state = readPersistedState(stateDirectory);
+  assert.equal(state.delivery.kind, 'plain_placeholder');
+  assert.equal(state.delivery.reason, 'configured');
+
+  // The final answer must stay plain too — a plain receipt never turns into
+  // a card answer on the completed-delivery path (issue #61 follow-up).
+  await stream.completeWithFullAnswer({ requestId: 'assistant.feishu.om_plain_open', output: '最终答案，保持纯文本。' });
+  assert.equal(calls.some(([, payload]) => payload.data?.msg_type === 'interactive'), false);
+  const answerIndex = calls.findIndex(([, payload]) => payload.data?.msg_type === 'text'
+    && JSON.parse(payload.data.content).text === '最终答案，保持纯文本。');
+  const recallIndex = calls.findIndex(([name]) => name === 'recall');
+  assert.ok(answerIndex !== -1);
+  assert.ok(recallIndex > answerIndex, 'the temporary plain receipt is recalled only after the answer is delivered');
+}));
+
+test('default opening persists an interactive placeholder without a plain reason (issue #61)', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  const opened = await stream.open({ requestId: 'assistant.feishu.om_card_open', target: target() });
+  assert.equal(opened.mode, 'cardkit');
+  const sends = calls.filter(([name]) => name === 'send');
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0][1].data.msg_type, 'interactive');
+  const state = readPersistedState(stateDirectory);
+  assert.equal(state.delivery.kind, 'interactive_placeholder');
+  assert.equal(state.delivery.reason, undefined);
+}));
+
+test('a rejected interactive placeholder degrades to a plain delivery marked degraded with evidence (issue #62)', () => withState(async stateDirectory => {
+  const { client, calls } = createClient({ interactiveFailure: true });
+  const baseCreate = client.im.message.create;
+  let persistedDuringFallback = null;
+  client.im.message.create = async payload => {
+    if (payload.data?.msg_type === 'text') {
+      // Observed while the fallback plain send is in flight: the degrade swap
+      // must already persist both the reason and the rejection evidence.
+      persistedDuringFallback = readPersistedState(stateDirectory);
+    }
+    return baseCreate(payload);
+  };
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  const opened = await stream.open({ requestId: 'assistant.feishu.om_degrade', target: target() });
+  assert.equal(opened.mode, 'plain_text');
+  const sends = calls.filter(([name]) => name === 'send');
+  assert.equal(sends[0][1].data.msg_type, 'interactive');
+  assert.equal(sends[1][1].data.msg_type, 'text');
+  assert.equal(persistedDuringFallback.delivery.reason, 'degraded');
+  assert.equal(persistedDuringFallback.delivery.lastError, 'interactive unavailable');
+  const state = readPersistedState(stateDirectory);
+  assert.equal(state.delivery.kind, 'plain_placeholder');
+  assert.equal(state.delivery.reason, 'degraded');
+  assert.equal(state.delivery.lastError, undefined);
+}));
+
+test('configured and degraded plain placeholders share one idempotency uuid (issue #62)', () => withState(async configuredDirectory => {
+  const degradedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-response-stream-'));
+  try {
+    const configured = createConversationResponseStream({
+      client: createClient().client,
+      stateDirectory: configuredDirectory,
+      preferPlainPlaceholder: true,
+    });
+    await configured.open({ requestId: 'assistant.feishu.om_provenance', target: target() });
+    const degraded = createConversationResponseStream({
+      client: createClient({ interactiveFailure: true }).client,
+      stateDirectory: degradedDirectory,
+    });
+    await degraded.open({ requestId: 'assistant.feishu.om_provenance', target: target() });
+    const configuredState = readPersistedState(configuredDirectory);
+    const degradedState = readPersistedState(degradedDirectory);
+    assert.equal(configuredState.delivery.kind, 'plain_placeholder');
+    assert.equal(configuredState.delivery.reason, 'configured');
+    assert.equal(degradedState.delivery.kind, 'plain_placeholder');
+    assert.equal(degradedState.delivery.reason, 'degraded');
+    // One idempotency key for both causes: a requestId that traverses
+    // "opened as a card, then degraded" and "opened plain" must collapse onto
+    // the same uuid instead of producing two messages (issue #62 forbids
+    // splitting it).
+    assert.equal(configuredState.delivery.uuid, degradedState.delivery.uuid);
+  } finally {
+    fs.rmSync(degradedDirectory, { recursive: true, force: true });
+  }
 }));
 
 for (const mode of ['cardkit', 'ordinary', 'plain']) {
