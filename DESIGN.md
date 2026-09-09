@@ -636,20 +636,22 @@ When the Feishu event clock is ahead of the local receipt clock, an operator
 may first create a same-host sender receipt for the exact canary comment:
 
 ```bash
+canary_nonce="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 npm run task-comments:canary -- \
   --task-id <task-guid> \
-  --content "Please close this canary." \
+  --content "Zylos native Task canary echo nonce=${canary_nonce}; reply with this exact nonce." \
   --output /absolute/path/sender-receipt.json
 ```
 
-The sender runs `lark-cli task +comment --dry-run --as user` first and checks
-the real success envelope (`ok: true`, `identity: "user"`), the Task v2
-comment request body, and `data.context.app_id`. It then reserves the output
-path with exclusive create before issuing the live command, and checks the
-live response's `ok`, `identity`, and returned `data.id`. The receipt contains
-the observed App context, returned comment ID, local request bounds, and the
-generating hostname. A failed live attempt leaves its response/error evidence
-in the reserved output and is not retried by the sender.
+The sender first reserves the output path with exclusive create when
+`--output` is supplied. It then runs `lark-cli task +comment --dry-run --as
+user` and checks the real success envelope (`ok: true`, `identity: "user"`),
+the Task v2 comment request body, and `data.context.app_id` before issuing the
+live command. It checks the live response's `ok`, `identity`, and returned
+`data.id`. The receipt contains the observed App context, returned comment ID,
+local request bounds, and the generating hostname. A failed live attempt
+leaves its response/error evidence in the reserved output and is not retried
+by the sender.
 
 Add the receipt path to its exact gate case:
 
