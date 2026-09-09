@@ -17,6 +17,10 @@ import { createTaskCommentWorker } from './task-comment-runtime.js';
 import { requireTaskCommentsEnabled } from './task-comment-runtime-policy.js';
 import { openTaskCommentStore } from './task-comment-store.js';
 import {
+  createTaskProgressProjector,
+  initializeTaskProgressProjection,
+} from './task-progress-projection.js';
+import {
   createFeishuNotificationAdapter,
   createRoutedNotificationSender,
   createSdkFeishuNotificationSender,
@@ -28,6 +32,7 @@ const DEFAULTS = Object.freeze({
   commentLimit: 25,
   reconciliationLimit: 50,
   notificationLimit: 50,
+  progressLimit: 25,
 });
 
 function requireRecord(value, field) {
@@ -166,10 +171,17 @@ export function createTaskCommentProductionRuntime({
       commentApi,
       taskMapping,
     });
+    const projector = createTaskProgressProjector({
+      appId,
+      core,
+      store,
+      commentApi,
+    });
     return Object.freeze({
       worker,
       reconciler,
       notifications,
+      projector,
       close() {
         store.close();
         queue.close();
@@ -188,13 +200,16 @@ export async function runTaskCommentCycle({
   worker,
   reconciler,
   notifications,
+  projector,
   commentLimit = DEFAULTS.commentLimit,
   reconciliationLimit = DEFAULTS.reconciliationLimit,
   notificationLimit = DEFAULTS.notificationLimit,
+  progressLimit = DEFAULTS.progressLimit,
 } = {}) {
   requireFunction(worker?.processOnce, 'Task comment worker.processOnce');
   requireFunction(reconciler?.runOnce, 'Task comment reconciler.runOnce');
   requireFunction(notifications?.flushOnce, 'Task notification adapter.flushOnce');
+  if (projector !== undefined) requireFunction(projector?.processOnce, 'Task progress projector.processOnce');
   async function settle(operation) {
     try {
       return await operation();
@@ -212,10 +227,14 @@ export async function runTaskCommentCycle({
   const notificationResult = await settle(
     () => notifications.flushOnce({ limit: notificationLimit }),
   );
+  const progress = projector === undefined
+    ? null
+    : await settle(() => projector.processOnce({ limit: progressLimit }));
   return Object.freeze({
     comments,
     reconciliation,
     notifications: notificationResult,
+    ...(progress === null ? {} : { progress }),
   });
 }
 
@@ -249,10 +268,21 @@ export async function superviseTaskComments({
 
 async function main(args = process.argv.slice(2), env = process.env) {
   dotenv.config({ path: path.join(env.HOME || os.homedir(), 'zylos/.env') });
+  if (args.length === 3 && args[0] === 'register' && args[1] === '--bootstrap-policy') {
+    const { openCore } = await loadTaskCommentCoreDependencies({ env });
+    const result = initializeTaskProgressProjection({
+      bootstrapPolicy: args[2],
+      openCore,
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
   requireTaskCommentsEnabled(env);
   const once = args.length === 2 && args[0] === 'run' && args[1] === '--once';
   if (!once && !(args.length === 1 && args[0] === 'run')) {
-    throw new TypeError('usage: task-comment-worker.js run [--once]');
+    throw new TypeError(
+      'usage: task-comment-worker.js register --bootstrap-policy <from_now|from_beginning> | run [--once]',
+    );
   }
   const dependencies = await loadTaskCommentCoreDependencies({ env });
   const runtime = createTaskCommentProductionRuntime({ env, dependencies });
