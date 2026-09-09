@@ -391,6 +391,16 @@ function clearTransientProcess(state) {
   state.publicReasoning = '';
 }
 
+// Issue #8: whether a rendered status card currently carries the collapsible
+// process panel. Panel-bearing deliveries double as the runtime capability
+// probe: Feishu documents no cross-client guarantee for combining
+// collapsible_panel with streaming updates (and the panel needs Feishu
+// V7.9+ clients), so support is judged at runtime, never assumed.
+function isPanelBearingCard(card) {
+  return Array.isArray(card?.body?.elements)
+    && card.body.elements.some(element => element?.element_id === PROGRESS_ELEMENT_ID);
+}
+
 // Two-card split: the status card streams phase/progress in place and never
 // carries the answer; the answer is delivered as new card message(s) at the
 // terminal so completion re-notifies the chat list (in-place updates never do).
@@ -593,7 +603,9 @@ function nextSequence(card) {
  * and apply channel-neutral lifecycle events; the implementation hides stable
  * message creation, CardKit conversion, coalescing, monotonic sequences, the
  * two-card split (in-place status card + answer delivered as new message(s)
- * so completion re-notifies), restart state, terminal close, and fallback.
+ * so completion re-notifies), the runtime collapsible-panel capability probe
+ * with its persisted answer-only degradation (issue #8), restart state,
+ * terminal close, and fallback.
  */
 export function createConversationResponseStream({
   client,
@@ -643,7 +655,14 @@ export function createConversationResponseStream({
   }
 
   function load(requestId) {
-    return readState(statePath(stateDirectory, requestId));
+    const state = readState(statePath(stateDirectory, requestId));
+    // Issue #8: a stream's effective process display is persisted so a probed
+    // answer-only decision survives restarts; states from older versions
+    // inherit the configured display.
+    if (state && !PROCESS_DISPLAYS.has(state.processDisplay)) {
+      state.processDisplay = processDisplay;
+    }
+    return state;
   }
 
   function save(state) {
@@ -735,6 +754,30 @@ export function createConversationResponseStream({
     }), 'Feishu ordinary response card patch');
   }
 
+  // Issue #8 runtime capability probe. An explicit Feishu rejection of a
+  // panel-bearing status card is the runtime's signal that the
+  // collapsible_panel + streaming combination is not usable for this stream.
+  // Chat streams record a durable answer-only decision and re-render without
+  // the panel — never a numbered phase list. Task streams (issue #86) keep
+  // their phase rendering untouched and never probe. Anything other than an
+  // explicit rejection (unknown transport outcome) keeps retrying and must
+  // not degrade.
+  function degradeProcessPanel(state, card, error) {
+    if (error?.deliveryOutcome !== 'rejected'
+      || state.kind === 'task'
+      || state.processDisplay !== 'collapsible'
+      || !isPanelBearingCard(card)) {
+      return false;
+    }
+    state.processDisplay = 'answer_only';
+    save(state);
+    logger.warn?.('Collapsible process panel was rejected; this stream continues answer-only', {
+      requestId: state.requestId,
+      error: error.message,
+    });
+    return true;
+  }
+
   async function settleInitialCardMode(state, { fallbackOnConversionError = false } = {}) {
     if (state.mode !== 'conversion_pending') return;
     const [initial] = state.cards;
@@ -760,7 +803,7 @@ export function createConversationResponseStream({
       publicReasoning: state.publicReasoning,
       streaming: false,
       running: true,
-      processDisplay,
+      processDisplay: state.processDisplay,
     });
     await patchOrdinary(initial.messageId, ordinary);
     initial.rendered = ordinary;
@@ -954,17 +997,28 @@ export function createConversationResponseStream({
     // new message(s) at the terminal so the chat list re-notifies.
     const [cardState] = state.cards;
     if (cardState && state.statusCleanup?.status !== 'recalled') {
-      const card = renderStatusCard({
+      const renderCard = () => renderStatusCard({
         phase: terminal && state.status === 'completed' ? '✅ 已完成' : state.phase,
         summary: terminal ? statusCardTerminalSummary(state) : null,
         progress: state.progress,
         publicReasoning: state.publicReasoning,
         streaming: state.mode === 'cardkit' && !terminal,
         running: !terminal,
-        processDisplay,
+        processDisplay: state.processDisplay,
       });
+      const card = renderCard();
       if (JSON.stringify(cardState.rendered) !== JSON.stringify(card)) {
-        await updateCard(state, cardState, card, purpose);
+        try {
+          await updateCard(state, cardState, card, purpose);
+        } catch (error) {
+          // Panel rejection is a capability signal, not a lost update: record
+          // the answer-only decision and re-render once without the panel.
+          if (!degradeProcessPanel(state, card, error)) throw error;
+          const fallbackCard = renderCard();
+          if (JSON.stringify(cardState.rendered) !== JSON.stringify(fallbackCard)) {
+            await updateCard(state, cardState, fallbackCard, `${purpose}:answer-only`);
+          }
+        }
       }
     }
     if (terminal) {
@@ -1046,6 +1100,9 @@ export function createConversationResponseStream({
       version: 1,
       requestId,
       kind,
+      // Issue #8: the effective process display. Starts at the configured
+      // value; a failed runtime probe records 'answer_only' here durably.
+      processDisplay,
       target,
       mode: 'delivery_pending',
       delivery: prefersPlainPlaceholder()
@@ -1084,10 +1141,13 @@ export function createConversationResponseStream({
   }
 
   async function finishOpening(state) {
+    // The opening placeholder never carries the process panel (no process
+    // state exists yet), so the first panel-bearing delivery — and thus the
+    // capability probe — happens on the first running status update.
     const initialCard = renderStatusCard({
       phase: state.phase || '正在接收消息…',
       streaming: true,
-      processDisplay,
+      processDisplay: state.processDisplay,
     });
     if (state.delivery.kind === 'interactive_placeholder') {
       let messageId;
