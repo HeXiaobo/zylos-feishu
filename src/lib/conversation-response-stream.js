@@ -20,8 +20,51 @@ const DEFAULT_MAIN_TIMEOUT_MS = 900_000;
 // for task-driven streams); exceeding a window is observability only.
 const DEFAULT_TASK_QUEUED_TIMEOUT_MS = 24 * 60 * 60_000;
 const DEFAULT_TASK_MAIN_TIMEOUT_MS = 24 * 60 * 60_000;
+// Issue #12: the chat-list preview of a completed answer must be a short,
+// readable, user-facing digest of the final answer, never a status word.
+// Feishu publishes no numeric cap for the Card JSON 2.0 config.summary.content
+// field (checked the card-json-v2-structure docs and the SDK types), so the
+// stream keeps this conservative byte budget, which is what the chat-list
+// preview realistically shows. Body cards are never truncated by this.
 const MAX_CHAT_LIST_SUMMARY_BYTES = 120;
 const SUMMARY_ELLIPSIS = '…';
+
+// Normalizes a completed answer into chat-list summary text: markdown is
+// stripped (images dropped, links reduced to their label, emphasis/code/
+// strikethrough markers removed, blockquote/heading/list/rule lines
+// flattened), newlines collapse to single spaces. Returns '' when nothing
+// user-facing remains, letting the caller apply its fallback copy.
+function normalizeChatListSummaryText(output) {
+  if (typeof output !== 'string') return '';
+  return output
+    .replace(/\r\n?/g, '\n')
+    // Images are decoration in a one-line preview; drop them before links.
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, ' ')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    // Inline code keeps its content, emphasis keeps its words.
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/(^|[\s(（])\*([^*\s][^*]*)\*/g, '$1$2')
+    .replace(/(^|[\s(（])__([^_]+)__/g, '$1$2')
+    .replace(/~~([^~]+)~~/g, '$1')
+    .split('\n')
+    .map(line => line
+      .replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s?)/, '')
+      // A line that is only a horizontal rule carries no text.
+      .replace(/^\s*(?:[-*_]\s*){3,}$/, '')
+      .trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function completedChatListSummary(output) {
+  const normalized = normalizeChatListSummaryText(output);
+  const summary = normalized || '处理完成。';
+  if (Buffer.byteLength(summary, 'utf8') <= MAX_CHAT_LIST_SUMMARY_BYTES) return summary;
+  return `${truncateUtf8(summary, MAX_CHAT_LIST_SUMMARY_BYTES - Buffer.byteLength(SUMMARY_ELLIPSIS, 'utf8'))}${SUMMARY_ELLIPSIS}`;
+}
 const DEFAULT_THROTTLE_MS = 250;
 const STATUS_CLEANUP_RETRY_MS = 30_000;
 const STATUS_CLEANUP_MAX_ATTEMPTS = 5;
@@ -224,23 +267,6 @@ function truncateUtf8(text, maxBytes) {
     bytes += characterBytes;
   }
   return result;
-}
-
-function completedChatListSummary(output) {
-  const normalized = typeof output === 'string'
-    ? output
-      .replace(/\r\n?/g, '\n')
-      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-      .split('\n')
-      .map(line => line.replace(/^\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)/, '').trim())
-      .filter(Boolean)
-      .join(' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-    : '';
-  const summary = normalized || '处理完成。';
-  if (Buffer.byteLength(summary, 'utf8') <= MAX_CHAT_LIST_SUMMARY_BYTES) return summary;
-  return `${truncateUtf8(summary, MAX_CHAT_LIST_SUMMARY_BYTES - Buffer.byteLength(SUMMARY_ELLIPSIS, 'utf8'))}${SUMMARY_ELLIPSIS}`;
 }
 
 // The terminal notice is a new plain message. Chat failures keep the

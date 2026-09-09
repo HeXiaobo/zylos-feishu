@@ -690,6 +690,85 @@ test('normalizes the completed answer into the delivered answer-card chat-list s
   }
 });
 
+test('strips markdown decoration from the chat-list summary while the body keeps the answer verbatim', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  const output = [
+    '## **发布结论**',
+    '',
+    '- 请先看 `release-notes` 里的 ~~旧版本~~ 说明',
+    '> 补充：截图见 ![发布图](https://example.com/release.png)',
+    '---',
+    '详情见 [发布页](https://example.com/release)。',
+  ].join('\n');
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunCompleted', { output })],
+  });
+
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  const summary = answerCard.config.summary.content;
+  assert.equal(summary, '发布结论 请先看 release-notes 里的 旧版本 说明 补充：截图见 详情见 发布页。');
+  for (const marker of ['**', '`', '~~', '![](', '](', '>', '---']) {
+    assert.equal(summary.includes(marker), false, `summary must not contain ${marker}`);
+  }
+  // The normalization is preview-only: the delivered answer body stays verbatim.
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, output);
+}));
+
+test('falls back to explicit summary copy when the answer has no previewable text', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  const output = '![仅有的图片](https://example.com/chart.png)\n\n---\n\n***';
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunCompleted', { output })],
+  });
+
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(answerCard.config.summary.content, '处理完成。');
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, output);
+}));
+
+test('canonical, ordinary-card, and proactive completions share one chat-list summary', async () => {
+  const output = '# **升级结果**\n\n- 已完成 [详情](https://example.com/done)';
+  const summaries = [];
+  for (const { conversion, proactive } of [
+    { conversion: true, proactive: false },
+    { conversion: false, proactive: false },
+    { conversion: true, proactive: true },
+  ]) {
+    await withState(async stateDirectory => {
+      const { client, calls } = createClient({ conversion });
+      const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+      if (proactive) {
+        await stream.sendCompleted({
+          requestId: 'assistant.feishu.proactive.summary',
+          target: target(),
+          output,
+        });
+      } else {
+        await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+        await stream.apply({
+          requestId: 'assistant.feishu.om_1',
+          events: [event(1, 'RunCompleted', { output })],
+        });
+      }
+      const answerCard = JSON.parse(calls
+        .filter(([name]) => name === 'send' || name === 'reply')
+        .at(-1)[1].data.content);
+      assert.equal(cardElement(answerCard, 'zylos_answer').content, output);
+      summaries.push(answerCard.config.summary.content);
+    });
+  }
+  assert.equal(new Set(summaries).size, 1, 'all completion paths must agree on one summary');
+  assert.equal(summaries[0], '升级结果 已完成 详情');
+});
+
 test('rejects empty completed answers and preserves explicit failure summaries', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
