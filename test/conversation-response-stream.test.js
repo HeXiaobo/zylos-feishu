@@ -2277,6 +2277,29 @@ test('a task stream renders task lifecycle phases in place', () => withState(asy
   assert.equal(cardElement(runningCard, 'zylos_answer'), undefined);
 }));
 
+test('task review progress renders submission and awaiting-review phases', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  const requestId = 'assistant.feishu.om_task_review';
+  await stream.open({ requestId, target: target(), streamKind: 'task' });
+  await stream.apply({ requestId, events: [
+    eventFor(requestId, 1, 'AssistantRequestAccepted'),
+    eventFor(requestId, 2, 'RunStarted'),
+  ] });
+  for (const [sequence, status, expected] of [
+    [3, 'started', '正在提交任务验收'],
+    [4, 'completed', '📋 待验收'],
+  ]) {
+    // Core publicProgressForRuntimeTool(task-review-notify) wire contract.
+    await stream.apply({ requestId, events: [eventFor(requestId, sequence, 'ProgressUpdated', {
+      stage: 'communicating', action: 'task_review', status,
+    })] });
+    const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+    assert.equal(cardElement(card, 'zylos_progress').header.title.content, expected);
+    assert.doesNotMatch(processDetail(card), /正在处理通信/);
+  }
+}));
+
 test('task completion delivers the result as a new card and recalls the temporary status', () => withState(async stateDirectory => {
   const { client, calls } = createClient();
   const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });

@@ -253,6 +253,15 @@ function initializeSchema(database) {
     CREATE INDEX IF NOT EXISTS idx_feishu_task_notifications_claim
       ON feishu_task_notifications(status, available_at, recipient_id, created_at);
   `);
+  // Old rows represent uncertain sends and must never become retryable merely
+  // because the database was upgraded. Serialize the additive migration.
+  database.transaction(() => {
+    const columns = database.pragma('table_info(feishu_task_comment_outbound)');
+    if (!columns.some(column => column.name === 'retry_allowed')) {
+      database.exec(`ALTER TABLE feishu_task_comment_outbound
+        ADD COLUMN retry_allowed INTEGER NOT NULL DEFAULT 0 CHECK (retry_allowed IN (0, 1))`);
+    }
+  }).immediate();
 }
 
 export function openTaskCommentStore({ dbPath, clock = () => new Date().toISOString() }) {
@@ -443,6 +452,17 @@ export function openTaskCommentStore({ dbPath, clock = () => new Date().toISOStr
       if (existing.request_fingerprint !== requestFingerprint) {
         throw domainError('IDEMPOTENCY_CONFLICT', 'outbound comment key belongs to different content');
       }
+      if (existing.status === 'dead_letter' && existing.retry_allowed === 1) {
+        database.prepare(`
+          UPDATE feishu_task_comment_outbound
+          SET status = 'pending', retry_allowed = 0, attempt = attempt + 1, updated_at = ?
+          WHERE app_id = ? AND idempotency_key = ?
+        `).run(currentInstant(clock), normalized.appId, normalized.idempotencyKey);
+        return {
+          created: true,
+          delivery: toOutboundView(selectOutbound.get(normalized.appId, normalized.idempotencyKey)),
+        };
+      }
       return { created: false, delivery: toOutboundView(existing) };
     }
     const now = currentInstant(clock);
@@ -491,7 +511,7 @@ export function openTaskCommentStore({ dbPath, clock = () => new Date().toISOStr
     return toOutboundView(selectOutbound.get(normalizedAppId, normalizedKey));
   }
 
-  function failOutbound({ appId, idempotencyKey, error }) {
+  function failOutbound({ appId, idempotencyKey, error, retryAllowed = false }) {
     const normalizedAppId = requireText(appId, 'outbound failure.appId');
     const normalizedKey = requireText(idempotencyKey, 'outbound failure.idempotencyKey');
     const normalizedError = requireText(error, 'outbound failure.error', MAX_ERROR_LENGTH);
@@ -501,9 +521,9 @@ export function openTaskCommentStore({ dbPath, clock = () => new Date().toISOStr
     const now = currentInstant(clock);
     database.prepare(`
       UPDATE feishu_task_comment_outbound
-      SET status = 'dead_letter', last_error = ?, updated_at = ?
+      SET status = 'dead_letter', last_error = ?, updated_at = ?, retry_allowed = ?
       WHERE app_id = ? AND idempotency_key = ? AND status = 'pending'
-    `).run(normalizedError, now, normalizedAppId, normalizedKey);
+    `).run(normalizedError, now, retryAllowed === true ? 1 : 0, normalizedAppId, normalizedKey);
     return toOutboundView(selectOutbound.get(normalizedAppId, normalizedKey));
   }
 
@@ -529,6 +549,7 @@ export function openTaskCommentStore({ dbPath, clock = () => new Date().toISOStr
       WHERE app_id = ? AND task_guid = ?
         AND reply_to_comment_id IS ? AND content = ?
         AND status IN ('pending', 'dead_letter')
+        AND retry_allowed = 0
       ORDER BY created_at, idempotency_key
       LIMIT 2
     `).all(

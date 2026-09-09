@@ -270,6 +270,7 @@ export function createTaskProgressProjector({
         appId: normalizedAppId,
         idempotencyKey,
         error: errorDetail(error),
+        retryAllowed: error?.deliveryOutcome === 'not_sent' && error?.retryable === true,
       });
       throw error;
     }

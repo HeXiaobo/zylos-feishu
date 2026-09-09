@@ -136,7 +136,13 @@ export function createSdkTaskV2CommentApi({ client }) {
           resource_id: guid,
         },
       });
-      if (response?.code !== 0) throw apiError(response, 'Feishu Task v2 comment create');
+      if (response?.code !== 0) {
+        const error = apiError(response, 'Feishu Task v2 comment create');
+        // A valid rejection confirms no comment was created. Missing or
+        // malformed responses and transport errors remain uncertain.
+        if (Number.isInteger(response?.code)) error.deliveryOutcome = 'not_sent';
+        throw error;
+      }
       return normalizeComment(response.data?.comment);
     },
     async reply({ taskGuid, replyToCommentId, content }) {
