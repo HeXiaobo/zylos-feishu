@@ -12,7 +12,7 @@ describe('release metadata', () => {
     const capabilities = JSON.parse(fs.readFileSync(path.join(ROOT, 'capabilities.json'), 'utf8'));
     const skill = fs.readFileSync(path.join(ROOT, 'SKILL.md'), 'utf8');
 
-    assert.equal(pkg.version, '0.3.7-rc.21');
+    assert.equal(pkg.version, '0.3.7-rc.22');
     assert.equal(lock.version, pkg.version);
     assert.equal(lock.packages[''].version, pkg.version);
     assert.equal(capabilities.release, pkg.version);
