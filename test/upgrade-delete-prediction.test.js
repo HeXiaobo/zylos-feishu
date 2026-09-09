@@ -110,6 +110,34 @@ function buildIncidentFixture({ modifyTracked = false } = {}) {
   return fixture;
 }
 
+test('baseline errors refuse CLI apply before either backup or deletion', () => {
+  const fixture = buildIncidentFixture({ modifyTracked: true });
+  try {
+    const manifestPath = path.join(fixture.liveDir, '.zylos/manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.files['../unsafe.txt'] = sha256('unsafe');
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const plan = planUpgradeDeletions(fixture);
+    assert.equal(plan.plan.certainty, 'unavailable');
+    assert.match(plan.plan.errors.join(';'), /unsafe path/);
+    // Defend even against stale plans that were labeled exact before errors
+    // were discovered, as the previous planner did.
+    plan.plan.certainty = 'exact';
+    assert.throws(() => applyDeletionPlan(plan, fixture), ApplyRefusedError);
+    assert.throws(() => execFileSync(process.execPath, [
+      SCRIPT_PATH, '--live', fixture.liveDir, '--target', fixture.targetDir,
+      '--backup-dir', fixture.backupDir, '--apply',
+    ], { stdio: 'pipe' }), error => error.status === 1 && /unsafe path/.test(String(error.stderr)));
+    assert.equal(fs.readFileSync(path.join(fixture.liveDir, 'src/gone.js'), 'utf8'),
+      'console.log("gone v9");\n');
+    assert.equal(fs.readFileSync(path.join(fixture.liveDir, 'src/modified.js'), 'utf8'),
+      'console.log("locally patched");\n');
+    assert.equal(fs.existsSync(fixture.backupDir), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test('deterministic delete prediction equals the actually deleted set', () => {
   const fixture = buildIncidentFixture();
   try {

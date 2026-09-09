@@ -111,6 +111,10 @@ const SAFE_PROGRESS = Object.freeze({
   recovering: '工具调用未成功，正在安全恢复',
 });
 const PUBLIC_ACTION_PROGRESS = Object.freeze({
+  task_review: Object.freeze({
+    started: '正在提交任务验收',
+    completed: '📋 待验收',
+  }),
   analyze_request: Object.freeze({ started: '正在分析问题' }),
   read_sources: Object.freeze({
     started: '正在读取相关资料',

@@ -239,6 +239,7 @@ export function planUpgradeDeletions({ liveDir, targetDir, backupDir = null } = 
     };
   }
 
+  if (errors.length > 0) plan.plan.certainty = 'unavailable';
   return plan;
 }
 
@@ -249,9 +250,9 @@ export function planUpgradeDeletions({ liveDir, targetDir, backupDir = null } = 
  */
 export function applyDeletionPlan(plan, { backupDir = null } = {}) {
   if (!plan || plan.schema !== SCHEMA) throw new Error('invalid deletion plan');
-  if (plan.plan.certainty !== 'exact') {
+  if (plan.plan.certainty !== 'exact' || plan.plan.errors.length > 0) {
     throw new ApplyRefusedError(
-      `refusing to apply a plan that is not exact: ${plan.plan.certainty}`
+      `refusing to apply a plan that is not exact or has errors: ${plan.plan.certainty}`
         + `${plan.plan.errors.length > 0 ? ` (${plan.plan.errors.join('; ')})` : ''}`,
     );
   }

@@ -10,6 +10,7 @@ import {
   renderTaskProgressComment,
 } from '../src/lib/task-progress-projection.js';
 import { openTaskCommentStore } from '../src/lib/task-comment-store.js';
+import { createSdkTaskV2CommentApi } from '../src/lib/task-v2-comment-api.js';
 
 const APP_ID = 'cli_task_gateway';
 const TASK_ID = 'task-core-1';
@@ -300,6 +301,61 @@ test('comment create failures dead-letter the ledger row and block blind retries
     store.close();
   }
 });
+
+test('a confirmed SDK rejection retries successfully and then deduplicates replay', async () => {
+  let requests = 0;
+  const commentApi = createSdkTaskV2CommentApi({ client: { task: { v2: { comment: {
+    async get() {},
+    async list() {},
+    async create({ data }) {
+      requests += 1;
+      if (requests === 1) return { code: 99991400, msg: 'rate limited' };
+      return { code: 0, data: { comment: {
+        id: 'comment-recovered', content: data.content,
+        creator: { id: APP_ID, type: 'app' }, created_at: '1788915724000',
+      } } };
+    },
+  } } } } });
+  const harness = createProjectorHarness({ commentApi });
+  try {
+    assert.equal((await harness.projector.processOnce()).retryWaiting, 1);
+    harness.outbox.queue = [delivery(progressEvent(), { version: 5 })];
+    assert.equal((await harness.projector.processOnce()).commented, 1);
+    harness.outbox.queue = [delivery(progressEvent(), { version: 7 })];
+    assert.equal((await harness.projector.processOnce()).alreadySent, 1);
+    assert.equal(requests, 2);
+    const row = harness.store.queryOutbound({ appId: APP_ID, idempotencyKey: 'task-progress:evt-progress-1' });
+    assert.equal(row.status, 'sent');
+    assert.equal(row.attempt, 2);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+for (const failure of ['timeout', 'malformed response', 'malformed success']) {
+  test(`${failure} keeps SDK delivery uncertain and blocks automatic resend`, async () => {
+    let requests = 0;
+    const commentApi = createSdkTaskV2CommentApi({ client: { task: { v2: { comment: {
+      async get() {},
+      async list() {},
+      async create() {
+        requests += 1;
+        if (failure === 'timeout') throw new Error('timeout after possible send');
+        return failure === 'malformed response' ? {} : { code: 0, data: {} };
+      },
+    } } } } });
+    const harness = createProjectorHarness({ commentApi });
+    try {
+      await harness.projector.processOnce();
+      harness.outbox.queue = [delivery(progressEvent(), { version: 5 })];
+      await harness.projector.processOnce();
+      assert.equal(requests, 1);
+      assert.match(harness.outbox.calls.fail.at(-1).request.error, /uncertain/);
+    } finally {
+      harness.cleanup();
+    }
+  });
+}
 
 test('the target resolver distinguishes missing links from ambiguous ones', () => {
   const resolver = createTaskProgressTargetResolver({ core: linkedCore() });
