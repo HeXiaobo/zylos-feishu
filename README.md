@@ -1,3 +1,7 @@
+For this fork, use the [verified installation/upgrade entry](UPGRADE.md).
+The default channel selects qualified stable releases; preview versions require
+an explicit request. A Git tag alone is not a published installation target.
+
 <p align="center">
   <img src="./assets/logo.png" alt="Zylos" height="120">
 </p>
@@ -34,12 +38,12 @@
 
 Tell your Zylos agent:
 
-> "Install the feishu component"
+> "Install this Feishu fork: https://github.com/HeXiaobo/zylos-feishu"
 
 Or use the CLI:
 
 ```bash
-zylos add feishu
+zylos add HeXiaobo/zylos-feishu
 ```
 
 Zylos will guide you through the setup, including configuring your Feishu app credentials. Once installed, message your bot on Feishu — the first user to interact becomes the admin.

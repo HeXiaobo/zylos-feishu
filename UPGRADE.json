@@ -1,0 +1,12 @@
+{
+  "schema": "zylos.repository-upgrade-entry/v1",
+  "component": "feishu",
+  "repository": "HeXiaobo/zylos-feishu",
+  "catalogRepository": "HeXiaobo/zylos-core",
+  "catalogAsset": "zylos-release.json",
+  "defaultChannel": "stable",
+  "previewChannel": "preview",
+  "operatorEntrypoint": "tools/upgrade/prepare.mjs",
+  "scope": "feishu",
+  "allComponentsRequireExplicitRequest": true
+}
