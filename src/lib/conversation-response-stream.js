@@ -14,6 +14,12 @@ const MAX_CARD_BYTES = 30_000;
 const DEFAULT_ANSWER_BYTES_PER_CARD = 12_000;
 const DEFAULT_QUEUED_TIMEOUT_MS = 60_000;
 const DEFAULT_MAIN_TIMEOUT_MS = 900_000;
+// Issue #65: task streams live on Core's durable queue for minutes or hours.
+// Their observation windows are separate from chat streams and aligned with
+// the Core-side stale window (C4_RESPONSE_STREAM_STALE_SECONDS raised to 24h
+// for task-driven streams); exceeding a window is observability only.
+const DEFAULT_TASK_QUEUED_TIMEOUT_MS = 24 * 60 * 60_000;
+const DEFAULT_TASK_MAIN_TIMEOUT_MS = 24 * 60 * 60_000;
 const MAX_CHAT_LIST_SUMMARY_BYTES = 120;
 const SUMMARY_ELLIPSIS = '…';
 const DEFAULT_THROTTLE_MS = 250;
@@ -23,6 +29,19 @@ const RETRYABLE_FAILURE_PHASE = '⚠️ 回复暂时中断';
 const NON_RETRYABLE_FAILURE_PHASE = '⚠️ 回复中断';
 const RETRYABLE_FAILURE_ANSWER = '⚠️ 回复暂时中断，消息已记录。';
 const NON_RETRYABLE_FAILURE_ANSWER = '⚠️ 回复中断，消息已记录。';
+// Issue #65: task-driven streams render task lifecycle language instead of
+// the chat phases. The lifecycle is 已登记 → 执行中 → 已完成/失败; the
+// rework/reopen phases wait on the core-side mapping (zylos-core#87).
+const STREAM_KINDS = new Set(['chat', 'task']);
+const TASK_QUEUED_PHASE = '⏳ 任务排队中';
+const TASK_ACCEPTED_PHASE = '📋 任务已登记';
+const TASK_STARTED_PHASE = '🚀 任务执行中';
+const TASK_RETRYABLE_FAILURE_PHASE = '⚠️ 任务暂时中断';
+const TASK_FAILURE_PHASE = '⚠️ 任务执行失败';
+const TASK_CANCELLED_PHASE = '🚫 任务已取消';
+const TASK_RETRYABLE_FAILURE_ANSWER = '⚠️ 任务暂时中断，请留意后续通知。';
+const TASK_FAILURE_ANSWER = '⚠️ 任务执行失败，请留意后续通知。';
+const TASK_CANCELLED_ANSWER = '任务已取消。';
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 120_000;
@@ -168,6 +187,7 @@ function readState(filePath) {
     if (!Array.isArray(state.progress)) state.progress = [];
     if (typeof state.publicReasoning !== 'string') state.publicReasoning = '';
     if (!Array.isArray(state.answerCards)) state.answerCards = [];
+    if (!STREAM_KINDS.has(state.kind)) state.kind = 'chat';
     return state;
   } catch {
     return null;
@@ -223,8 +243,17 @@ function completedChatListSummary(output) {
   return `${truncateUtf8(summary, MAX_CHAT_LIST_SUMMARY_BYTES - Buffer.byteLength(SUMMARY_ELLIPSIS, 'utf8'))}${SUMMARY_ELLIPSIS}`;
 }
 
-function failureAnswer(phase) {
-  return phase === RETRYABLE_FAILURE_PHASE
+// The terminal notice is a new plain message. Chat failures keep the
+// historical phase-based wording; task failures speak task language and
+// distinguish a cancelled task from a failed run (issue #65).
+function failureAnswer(state) {
+  if (state?.kind === 'task') {
+    if (state.failureCode === 'TASK_CANCELLED') return TASK_CANCELLED_ANSWER;
+    return state.failureRetryable === true
+      ? TASK_RETRYABLE_FAILURE_ANSWER
+      : TASK_FAILURE_ANSWER;
+  }
+  return state?.phase === RETRYABLE_FAILURE_PHASE
     ? RETRYABLE_FAILURE_ANSWER
     : NON_RETRYABLE_FAILURE_ANSWER;
 }
@@ -234,7 +263,31 @@ function publicProgressText(payload) {
   return actionText || SAFE_PROGRESS[payload?.stage] || null;
 }
 
-function phaseForEvent(event) {
+function chatFailurePhase(retryable) {
+  return retryable ? RETRYABLE_FAILURE_PHASE : NON_RETRYABLE_FAILURE_PHASE;
+}
+
+function taskFailurePhase({ code, retryable }) {
+  if (code === 'TASK_CANCELLED') return TASK_CANCELLED_PHASE;
+  return retryable ? TASK_RETRYABLE_FAILURE_PHASE : TASK_FAILURE_PHASE;
+}
+
+function phaseForEvent(event, kind = 'chat') {
+  if (kind === 'task') {
+    switch (event.type) {
+      case 'AssistantRequestAccepted': return TASK_ACCEPTED_PHASE;
+      case 'RunQueued': return TASK_QUEUED_PHASE;
+      case 'RunStarted': return TASK_STARTED_PHASE;
+      case 'ProgressUpdated': return publicProgressText(event.payload);
+      case 'OutputDelta': return null;
+      case 'RunCompleted': return null;
+      case 'RunFailed': return taskFailurePhase({
+        code: event.payload?.code,
+        retryable: event.payload?.retryable,
+      });
+      default: return null;
+    }
+  }
   switch (event.type) {
     case 'AssistantRequestAccepted': return '✅ 已接收';
     case 'RunQueued': return '⏳ 排队中';
@@ -242,9 +295,7 @@ function phaseForEvent(event) {
     case 'ProgressUpdated': return publicProgressText(event.payload);
     case 'OutputDelta': return '正在生成回答';
     case 'RunCompleted': return null;
-    case 'RunFailed': return event.payload?.retryable
-      ? RETRYABLE_FAILURE_PHASE
-      : NON_RETRYABLE_FAILURE_PHASE;
+    case 'RunFailed': return chatFailurePhase(event.payload?.retryable);
     default: return null;
   }
 }
@@ -527,6 +578,9 @@ export function createConversationResponseStream({
   answerBytesPerCard = DEFAULT_ANSWER_BYTES_PER_CARD,
   queuedTimeoutMs = DEFAULT_QUEUED_TIMEOUT_MS,
   mainTimeoutMs = DEFAULT_MAIN_TIMEOUT_MS,
+  // Issue #65: task-driven streams observe separate, much longer windows.
+  taskQueuedTimeoutMs = DEFAULT_TASK_QUEUED_TIMEOUT_MS,
+  taskMainTimeoutMs = DEFAULT_TASK_MAIN_TIMEOUT_MS,
   processDisplay = 'collapsible',
   // Issue #57: when true, the intake receipt is a plain text message and the
   // final answer is delivered as a separate new plain message, instead of an
@@ -550,6 +604,12 @@ export function createConversationResponseStream({
   }
   if (!Number.isSafeInteger(mainTimeoutMs) || mainTimeoutMs < 1) {
     throw new TypeError('mainTimeoutMs is invalid');
+  }
+  if (!Number.isSafeInteger(taskQueuedTimeoutMs) || taskQueuedTimeoutMs < 1) {
+    throw new TypeError('taskQueuedTimeoutMs is invalid');
+  }
+  if (!Number.isSafeInteger(taskMainTimeoutMs) || taskMainTimeoutMs < 1) {
+    throw new TypeError('taskMainTimeoutMs is invalid');
   }
   if (!PROCESS_DISPLAYS.has(processDisplay)) throw new TypeError('processDisplay is invalid');
   if (completedDeliveryReconciler !== null && typeof completedDeliveryReconciler !== 'function') {
@@ -739,7 +799,7 @@ export function createConversationResponseStream({
         const messageId = await sendPlain(
           client,
           state.target,
-          failureAnswer(state.phase),
+          failureAnswer(state),
           stableToken(state.requestId, `final-answer-plain:${fingerprint}`),
         );
         // part -1: the failure notice is not an answer segment, so a later
@@ -849,7 +909,7 @@ export function createConversationResponseStream({
       if (terminal && state.plainTerminalFingerprint !== terminalFingerprint) {
         const text = state.status === 'completed'
           ? (state.output || '处理完成。')
-          : failureAnswer(state.phase);
+          : failureAnswer(state);
         await sendPlain(
           client,
           state.target,
@@ -955,10 +1015,11 @@ export function createConversationResponseStream({
       : preferPlainPlaceholder === true;
   }
 
-  function newOpeningState(requestId, target, initialPhase = '正在接收消息…') {
+  function newOpeningState(requestId, target, initialPhase = '正在接收消息…', kind = 'chat') {
     return {
       version: 1,
       requestId,
+      kind,
       target,
       mode: 'delivery_pending',
       delivery: prefersPlainPlaceholder()
@@ -971,6 +1032,9 @@ export function createConversationResponseStream({
           reason: 'configured',
           status: 'pending',
           uuid: stableToken(requestId, 'plain-placeholder'),
+          // Issue #65: task receipts open the plain placeholder with the
+          // original plain receipt text instead of the chat placeholder.
+          text: kind === 'task' ? initialPhase : undefined,
         }
         : {
           kind: 'interactive_placeholder',
@@ -1025,6 +1089,9 @@ export function createConversationResponseStream({
           reason: 'degraded',
           status: 'pending',
           uuid: stableToken(state.requestId, 'plain-placeholder'),
+          // Preserve a task receipt's plain text across the degradation so the
+          // original receipt wording still reaches a plain-mode deployment.
+          ...(state.delivery.text === undefined ? {} : { text: state.delivery.text }),
           lastError: error.message,
         };
         save(state);
@@ -1061,7 +1128,9 @@ export function createConversationResponseStream({
         const plainMessageId = await sendPlain(
           client,
           state.target,
-          '已接收，正在处理…',
+          // Issue #65: task receipts open the plain placeholder with the
+          // original plain receipt text; chat streams keep the historical one.
+          state.delivery.text || '已接收，正在处理…',
           state.delivery.uuid,
         );
         state.delivery.status = 'sent';
@@ -1381,12 +1450,25 @@ export function createConversationResponseStream({
       const initialPhase = input.initialPhase === undefined || input.initialPhase === null
         ? '正在接收消息…'
         : requireText(input.initialPhase, 'initialPhase');
+      const streamKind = input.streamKind === undefined || input.streamKind === null
+        ? 'chat'
+        : requireText(input.streamKind, 'streamKind');
+      if (!STREAM_KINDS.has(streamKind)) throw new TypeError('streamKind is unsupported');
       const release = await acquireRequestLock(requestId);
       try {
         const existing = load(requestId);
         if (existing) {
           if (JSON.stringify(existing.target) !== JSON.stringify(target)) {
             throw new Error('response stream requestId belongs to a different target');
+          }
+          // Issue #65: the task receipt may lose the race against the first
+          // task lifecycle event, which lazily opens a chat-kind stream. The
+          // receipt authoritatively knows this is a task, so upgrade the kind
+          // in place; a replay must never send a second card or message.
+          if (streamKind === 'task' && existing.kind !== 'task'
+            && !['completed', 'failed'].includes(existing.status)) {
+            existing.kind = 'task';
+            save(existing);
           }
           if (existing.mode === 'delivery_pending') {
             await finishOpening(existing);
@@ -1400,7 +1482,7 @@ export function createConversationResponseStream({
           return { handled: true, replayed: true, mode: existing.mode, messageId: existing.cards[0]?.messageId || existing.plainMessageId };
         }
 
-        const state = newOpeningState(requestId, target, initialPhase);
+        const state = newOpeningState(requestId, target, initialPhase, streamKind);
         save(state);
         await finishOpening(state);
         return {
@@ -1494,11 +1576,19 @@ export function createConversationResponseStream({
           // Core sequence spans the whole Run stream while this compatibility
           // projection receives only visible events. Missing sequence numbers
           // therefore mean another consumer owned those events, not data loss.
-          const phase = phaseForEvent(event);
+          const phase = phaseForEvent(event, state.kind);
           appendProgress(state, progressForEvent(event));
           if (event.type === 'PublicReasoningDelta') {
             appendPublicReasoning(state, event.payload.delta);
             containsDelta = true;
+          }
+          if (event.type === 'RunFailed') {
+            // Issue #65: task failure notices distinguish a cancelled task
+            // from a failed run; chat wording is unaffected.
+            state.failureCode = typeof event.payload?.code === 'string'
+              ? event.payload.code
+              : null;
+            state.failureRetryable = event.payload?.retryable === true;
           }
           if (compatibility) {
             if (phase) canonicalPhase = phase;
@@ -1567,14 +1657,16 @@ export function createConversationResponseStream({
         const queuedElapsed = state.status === 'queued'
           ? clock() - state.queuedAt
           : 0;
-        const queuedTimedOut = state.status === 'queued' && queuedElapsed >= queuedTimeoutMs;
+        const queuedWindowMs = state.kind === 'task' ? taskQueuedTimeoutMs : queuedTimeoutMs;
+        const queuedTimedOut = state.status === 'queued' && queuedElapsed >= queuedWindowMs;
         if (queuedTimedOut) {
           if (!Number.isSafeInteger(state.queuedTimeoutObservedAt)) {
             state.queuedTimeoutObservedAt = clock();
             logger.warn?.('Queued response stream exceeded its observation window', {
               requestId,
               queuedElapsed,
-              queuedTimeoutMs,
+              queuedWindowMs,
+              kind: state.kind,
             });
           }
           save(state);
@@ -1589,14 +1681,16 @@ export function createConversationResponseStream({
         const mainElapsed = state.status === 'started'
           ? clock() - state.mainStartedAt
           : 0;
-        const mainTimedOut = state.status === 'started' && mainElapsed >= mainTimeoutMs;
+        const mainWindowMs = state.kind === 'task' ? taskMainTimeoutMs : mainTimeoutMs;
+        const mainTimedOut = state.status === 'started' && mainElapsed >= mainWindowMs;
         if (mainTimedOut) {
           if (!Number.isSafeInteger(state.mainTimeoutObservedAt)) {
             state.mainTimeoutObservedAt = clock();
             logger.warn?.('Main response stream exceeded its observation window', {
               requestId,
               mainElapsed,
-              mainTimeoutMs,
+              mainWindowMs,
+              kind: state.kind,
             });
           }
           save(state);

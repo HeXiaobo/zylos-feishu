@@ -27,6 +27,8 @@ import {
   stopWatching,
   getResponseStreamQueuedTimeoutMs,
   getResponseStreamMainTimeoutMs,
+  getResponseStreamTaskQueuedTimeoutMs,
+  getResponseStreamTaskMainTimeoutMs,
 } from './lib/config.js';
 import {
   downloadImage,
@@ -922,6 +924,8 @@ function getConversationResponseStream() {
       processDisplay: getStreamProcessDisplay(config),
       queuedTimeoutMs: getResponseStreamQueuedTimeoutMs(config),
       mainTimeoutMs: getResponseStreamMainTimeoutMs(config),
+      taskQueuedTimeoutMs: getResponseStreamTaskQueuedTimeoutMs(config),
+      taskMainTimeoutMs: getResponseStreamTaskMainTimeoutMs(config),
       // Issue #57: message.useMarkdownCard=false must steer BOTH delivery paths
       // (runtime streaming and c4-send) to plain text. The getter reads the
       // hot-reloaded config at each open so the admin toggle takes effect
@@ -965,7 +969,7 @@ function buildAssistantRequest(messageId, { requireIdle } = {}) {
   });
 }
 
-async function openConversationResponse({ chatId, chatType, messageId, rootId, parentId, request, initialPhase }) {
+async function openConversationResponse({ chatId, chatType, messageId, rootId, parentId, request, initialPhase, streamKind }) {
   const responseRequest = request || buildAssistantRequest(messageId);
   if (!replyRefactorV1Enabled) {
     // Legacy mode has no card completion path (the projection port is wired only
@@ -987,6 +991,7 @@ async function openConversationResponse({ chatId, chatType, messageId, rootId, p
           : (messageId || null),
       },
       ...(initialPhase ? { initialPhase } : {}),
+      ...(streamKind ? { streamKind } : {}),
     });
     return responseRequest;
   } catch (error) {
@@ -1776,9 +1781,13 @@ async function handleWorkIntakeResult(response, {
         // Open a task status card in the originating conversation. Its phase
         // advances as Core emits task lifecycle events (TaskCreated →
         // TaskStarted → SubmittedForReview → Accepted), and the completion is
-        // delivered as a new message so the chat re-notifies. Falls back to the
-        // legacy plain-text receipt when cards are unavailable.
-        const opened = context.assistantRequest
+        // delivered as a new message so the chat re-notifies. Plain-text mode
+        // keeps the original plain receipt (the stream placeholder carries it,
+        // and the terminal still arrives as a new plain message); every other
+        // unavailable-card condition falls back to the legacy plain receipt.
+        const receiptText = `已登记任务：${title}`;
+        const plainMode = config.message?.useMarkdownCard === false;
+        const opened = replyRefactorV1Enabled && context.assistantRequest
           ? await openConversationResponse({
             chatId: context.chatId,
             chatType: context.chatType,
@@ -1786,13 +1795,16 @@ async function handleWorkIntakeResult(response, {
             rootId: context.rootId,
             parentId: context.parentId,
             request: context.assistantRequest,
-            initialPhase: '📋 马上创建飞书任务…',
+            streamKind: 'task',
+            ...(plainMode
+              ? { initialPhase: receiptText }
+              : { initialPhase: '📋 马上创建飞书任务…' }),
           })
           : null;
         if (opened) return { success: true };
         const delivered = await sendThreadAwareMessage(
           context.chatId,
-          `已登记任务：${title}`,
+          receiptText,
           {
             chatType: context.chatType,
             rootId: context.rootId,
