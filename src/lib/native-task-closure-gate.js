@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
+import os from 'node:os';
 
 import Database from 'better-sqlite3';
 
 import { isLiveNativeTaskGateReader } from './native-task-closure-gate-remote.js';
+import { normalizeNativeTaskCanarySenderReceipt } from './native-task-canary-sender.js';
 import { feishuNotificationDedupeKey } from './task-notification-adapter.js';
 
 const REPORT_SCHEMA = 'zylos.native-task-closure-gate/v2';
@@ -50,13 +52,16 @@ function normalizeCases(value) {
   }
   return value.map((rawCase, index) => {
     const item = requireRecord(rawCase, `native Task closure cases[${index}]`);
-    const unknown = Object.keys(item).find(key => !['taskGuid', 'commentId'].includes(key));
+    const unknown = Object.keys(item).find(key => (
+      !['taskGuid', 'commentId', 'senderReceipt'].includes(key)
+    ));
     if (unknown) {
       throw new TypeError(`native Task closure cases[${index}] contains unsupported field: ${unknown}`);
     }
     return Object.freeze({
       taskGuid: requireText(item.taskGuid, `native Task closure cases[${index}].taskGuid`),
       commentId: requireText(item.commentId, `native Task closure cases[${index}].commentId`),
+      ...(item.senderReceipt === undefined ? {} : { senderReceipt: item.senderReceipt }),
     });
   });
 }
@@ -130,8 +135,8 @@ function openReadonly(dbPath, field) {
   });
 }
 
-function latencyBetween(receivedAt, occurredAt) {
-  return new Date(receivedAt).valueOf() - new Date(occurredAt).valueOf();
+function latencyBetween(endAt, startAt) {
+  return new Date(endAt).valueOf() - new Date(startAt).valueOf();
 }
 
 function failedCase(item, code, message, details = {}) {
@@ -147,7 +152,15 @@ function failedCase(item, code, message, details = {}) {
   });
 }
 
-async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, maxInboundLatencyMs }) {
+async function evaluateCase({
+  coreDb,
+  commentsDb,
+  appId,
+  item,
+  remoteReader,
+  maxInboundLatencyMs,
+  currentHostname,
+}) {
   const links = coreDb.prepare(`
     SELECT links.task_id AS taskId, tasks.title AS title,
            tasks.owner_id AS ownerId, tasks.acceptor_id AS acceptorId,
@@ -240,8 +253,48 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
       { observedStatus: realtimeRows[0]?.status ?? null },
     );
   }
-  const latencyMs = latencyBetween(inbound.receivedAt, inbound.occurredAt);
-  if (!Number.isFinite(latencyMs) || latencyMs < 0) {
+  const eventTimestampLatencyMs = latencyBetween(inbound.receivedAt, inbound.occurredAt);
+  if (!Number.isFinite(eventTimestampLatencyMs)) {
+    return failedCase(
+      item,
+      'INBOUND_LATENCY_INVALID',
+      'Comment intake event timestamps do not form a valid latency',
+      { occurredAt: inbound.occurredAt, receivedAt: inbound.receivedAt },
+    );
+  }
+  let latencyMs = eventTimestampLatencyMs;
+  let latencySource = 'event-timestamp';
+  let senderReceipt = null;
+  if (item.senderReceipt !== undefined) {
+    try {
+      senderReceipt = normalizeNativeTaskCanarySenderReceipt(item.senderReceipt, {
+        appId,
+        taskGuid: item.taskGuid,
+        commentId: item.commentId,
+        currentHostname,
+      });
+    } catch (error) {
+      return failedCase(
+        item,
+        'INBOUND_SENDER_RECEIPT_INVALID',
+        'Canary sender receipt is missing a valid exact App, Task, comment, or timing binding',
+        { error: String(error?.message ?? error ?? 'invalid sender receipt').slice(0, 4_000) },
+      );
+    }
+    latencyMs = latencyBetween(inbound.receivedAt, senderReceipt.requestStartedAt);
+    latencySource = 'sender-request-start';
+    if (!Number.isFinite(latencyMs) || latencyMs < 0) {
+      return failedCase(
+        item,
+        'INBOUND_SENDER_LATENCY_INVALID',
+        'Canary sender request start does not precede durable comment receipt',
+        {
+          requestStartedAt: senderReceipt.requestStartedAt,
+          receivedAt: inbound.receivedAt,
+        },
+      );
+    }
+  } else if (eventTimestampLatencyMs < 0) {
     return failedCase(
       item,
       'INBOUND_LATENCY_INVALID',
@@ -250,11 +303,20 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
     );
   }
   if (latencyMs > maxInboundLatencyMs) {
+    const details = senderReceipt
+      ? {
+          latencyMs,
+          maxInboundLatencyMs,
+          latencySource,
+          eventTimestampLatencyMs,
+          requestStartedAt: senderReceipt.requestStartedAt,
+        }
+      : { latencyMs, maxInboundLatencyMs };
     return failedCase(
       item,
       'INBOUND_LATENCY_EXCEEDED',
       'Realtime comment intake exceeded the configured latency SLO',
-      { latencyMs, maxInboundLatencyMs },
+      details,
     );
   }
 
@@ -855,7 +917,15 @@ async function evaluateCase({ coreDb, commentsDb, appId, item, remoteReader, max
       source: inbound.source,
       status: inbound.status,
       latencyMs,
+      latencySource,
+      eventTimestampLatencyMs,
+      occurredAt: inbound.occurredAt,
       receivedAt: inbound.receivedAt,
+      ...(senderReceipt === null ? {} : {
+        hostname: senderReceipt.hostname,
+        requestStartedAt: senderReceipt.requestStartedAt,
+        requestFinishedAt: senderReceipt.requestFinishedAt,
+      }),
     }),
     outbound: Object.freeze({
       idempotencyKey: outbound.idempotencyKey,
@@ -895,6 +965,7 @@ export async function evaluateNativeTaskClosure({
     requireFunction(remote[operation], `native Task closure remoteReader.${operation}`);
   }
   const checkedAt = canonicalInstant(clock(), 'native Task closure clock result');
+  const currentHostname = os.hostname();
   const latencyLimit = requireLatency(maxInboundLatencyMs);
   const coreDb = openReadonly(coreDbPath, 'native Task closure coreDbPath');
   const commentsDb = openReadonly(
@@ -912,6 +983,7 @@ export async function evaluateNativeTaskClosure({
           item,
           remoteReader: remote,
           maxInboundLatencyMs: latencyLimit,
+          currentHostname,
         }));
       } catch (error) {
         caseReports.push(failedCase(

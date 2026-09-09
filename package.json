@@ -13,6 +13,7 @@
     "governance:deploy": "node scripts/agent-governance-check.js deploy",
     "governance:test": "node --test test/agent-governance-check.test.js",
     "task-comments:once": "node src/lib/task-comment-worker.js run --once",
+    "task-comments:canary": "node scripts/native-task-comment-canary.js",
     "task-comments:gate": "node scripts/native-task-closure-gate.js",
     "task-status:gate": "node scripts/native-task-completion-gate.js",
     "task-conservation:gate": "node scripts/native-task-conservation-gate.js",

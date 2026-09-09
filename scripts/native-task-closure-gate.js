@@ -36,9 +36,29 @@ function readJson(filePath, field) {
   }
 }
 
+function loadSenderReceipts(input) {
+  if (!Array.isArray(input?.cases)) return input;
+  const cases = input.cases.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+    const receiptPath = item.senderReceiptPath;
+    if (receiptPath === undefined) return item;
+    if (Object.prototype.hasOwnProperty.call(item, 'senderReceipt')) {
+      throw new TypeError(
+        `gate input cases[${index}] cannot include both senderReceipt and senderReceiptPath`,
+      );
+    }
+    const { senderReceiptPath: ignored, ...caseWithoutPath } = item;
+    return {
+      ...caseWithoutPath,
+      senderReceipt: readJson(receiptPath, `sender receipt cases[${index}]`),
+    };
+  });
+  return { ...input, cases };
+}
+
 async function main(args = process.argv.slice(2)) {
   const values = parseArgs(args);
-  const input = readJson(values.get('--input'), 'gate input');
+  const input = loadSenderReceipts(readJson(values.get('--input'), 'gate input'));
   dotenv.config({ path: path.join(process.env.HOME || os.homedir(), 'zylos/.env') });
   const remoteReader = createSdkNativeTaskGateReader({ client: getClient() });
   const report = await evaluateNativeTaskClosure({ ...input, remoteReader });
