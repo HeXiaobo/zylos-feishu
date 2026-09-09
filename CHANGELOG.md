@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7-rc.22] - 2026-09-09
+
+### Added
+- Project task progress as native Task v2 comments and render task lifecycle/review phases (#85, #86, #89).
+- Probe collapsible process panels and degrade to an answer-only presentation when needed (#88).
+
+### Fixed
+- Reject deletion plans with errors before applying any backup or deletion; label worst-case predictions separately (#84, #89).
+- Retry explicitly rejected progress comments while preserving duplicate protection for uncertain sends and legacy records (#89).
+- Resolve mentions from live chat membership, record plain-placeholder provenance, and derive chat-list summaries from normalized answers (#82, #83, #87).
+- Recall temporary status cards after successful answer delivery (#74).
+
 ## [0.3.7-rc.21] - 2026-09-06
 
 ### Fixed
