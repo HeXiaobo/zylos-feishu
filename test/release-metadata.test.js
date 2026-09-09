@@ -39,7 +39,7 @@ describe('release metadata', () => {
     assert.equal(capabilities.provides['feishu.native-task-conservation-gate'], 1);
     assert.equal(pkg.repository.url, 'git+https://github.com/HeXiaobo/zylos-feishu.git');
     assert.equal(pkg.engines.node, '>=20.20.0');
-    assert.match(skill, /^version: 0\.3\.7-rc.21$/m);
+    assert.match(skill, /^version: 0\.3\.7-rc.22$/m);
     assert.match(skill, /^  repo: HeXiaobo\/zylos-feishu$/m);
     assert.match(skill, /^  branch: main$/m);
   });
