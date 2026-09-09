@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-09-10
+
+### Added
+- Route Feishu installs and upgrades through qualified releases with immutable source selection and publication verification (#91).
+
+### Fixed
+- Measure native task comment canaries with same-host end-to-end timing so cross-host clock skew cannot produce false latency failures (#92).
+
 ## [0.3.7-rc.22] - 2026-09-09
 
 ### Added
