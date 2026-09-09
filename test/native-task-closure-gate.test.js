@@ -10,8 +10,10 @@ import Database from 'better-sqlite3';
 
 import { evaluateNativeTaskClosure } from '../src/lib/native-task-closure-gate.js';
 import { createSdkNativeTaskGateReader } from '../src/lib/native-task-closure-gate-remote.js';
+import { NATIVE_TASK_CANARY_SENDER_SCHEMA } from '../src/lib/native-task-canary-sender.js';
 
 const APP_ID = 'cli_task_gateway';
+const HOSTNAME = os.hostname();
 
 function logicalCommentId(commentId) {
   const digest = createHash('sha256')
@@ -312,6 +314,40 @@ function evaluateFixture(fixture, overrides = {}) {
     maxInboundLatencyMs: 5_000,
     ...overrides,
   });
+}
+
+function senderReceipt(overrides = {}) {
+  return {
+    schema: NATIVE_TASK_CANARY_SENDER_SCHEMA,
+    hostname: HOSTNAME,
+    appId: APP_ID,
+    taskGuid: 'task-guid-1',
+    commentId: 'comment-human-1',
+    requestStartedAt: '2026-08-26T10:00:00.000Z',
+    requestFinishedAt: '2026-08-26T10:00:00.050Z',
+    dryRun: {
+      ok: true,
+      identity: 'user',
+      context: { appId: APP_ID, userOpenId: 'ou_user-1' },
+      request: {
+        method: 'POST',
+        url: '/open-apis/task/v2/comments',
+        resourceType: 'task',
+        taskGuid: 'task-guid-1',
+      },
+    },
+    response: {
+      ok: true,
+      identity: 'user',
+      data: { id: 'comment-human-1' },
+    },
+    responseBinding: {
+      appId: APP_ID,
+      taskGuid: 'task-guid-1',
+      commentId: 'comment-human-1',
+    },
+    ...overrides,
+  };
 }
 
 function addSecondClosure(fixture) {
@@ -1037,6 +1073,206 @@ test('invalid or negative ledger timestamps cannot pass the intake latency check
   }
 });
 
+test('a trusted sender receipt measures end-to-end latency when the remote event clock is ahead', async () => {
+  const fixture = createFixture();
+  try {
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare(`
+      UPDATE feishu_task_comment_inbox
+      SET occurred_at = ?, received_at = ?
+      WHERE comment_id = ?
+    `).run(
+      '2026-08-26T10:00:00.200Z',
+      '2026-08-26T10:00:00.120Z',
+      'comment-human-1',
+    );
+    comments.close();
+
+    const report = await evaluateFixture(fixture, {
+      remoteReader: createLiveRemoteReader(),
+      cases: [{
+        taskGuid: 'task-guid-1',
+        commentId: 'comment-human-1',
+        senderReceipt: senderReceipt(),
+      }],
+    });
+
+    assert.equal(report.passed, true);
+    assert.equal(report.validationPassed, true);
+    assert.equal(report.cases[0].inbound.latencyMs, 120);
+    assert.equal(report.cases[0].inbound.latencySource, 'sender-request-start');
+    assert.equal(report.cases[0].inbound.eventTimestampLatencyMs, -80);
+    assert.equal(report.cases[0].inbound.occurredAt, '2026-08-26T10:00:00.200Z');
+    assert.equal(report.cases[0].inbound.receivedAt, '2026-08-26T10:00:00.120Z');
+    assert.equal(report.cases[0].inbound.requestStartedAt, '2026-08-26T10:00:00.000Z');
+    assert.equal(report.cases[0].inbound.requestFinishedAt, '2026-08-26T10:00:00.050Z');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('sender-bound latency still fails the same five-second SLO', async () => {
+  const fixture = createFixture();
+  try {
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare(`
+      UPDATE feishu_task_comment_inbox
+      SET occurred_at = ?, received_at = ?
+      WHERE comment_id = ?
+    `).run(
+      '2026-08-26T10:00:10.200Z',
+      '2026-08-26T10:00:10.120Z',
+      'comment-human-1',
+    );
+    comments.close();
+
+    const report = await evaluateFixture(fixture, {
+      cases: [{
+        taskGuid: 'task-guid-1',
+        commentId: 'comment-human-1',
+        senderReceipt: senderReceipt({
+          requestStartedAt: '2026-08-26T10:00:00.000Z',
+          requestFinishedAt: '2026-08-26T10:00:00.050Z',
+        }),
+      }],
+    });
+
+    assert.equal(report.passed, false);
+    assert.deepEqual(report.failureCodes, ['INBOUND_LATENCY_EXCEEDED']);
+    assert.deepEqual(report.cases[0].failures[0].details, {
+      latencyMs: 10_120,
+      maxInboundLatencyMs: 5_000,
+      latencySource: 'sender-request-start',
+      eventTimestampLatencyMs: -80,
+      requestStartedAt: '2026-08-26T10:00:00.000Z',
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a sender receipt bound to another comment cannot rescue a negative event timestamp', async () => {
+  const fixture = createFixture();
+  try {
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare(`
+      UPDATE feishu_task_comment_inbox
+      SET occurred_at = ?, received_at = ?
+      WHERE comment_id = ?
+    `).run(
+      '2026-08-26T10:00:00.200Z',
+      '2026-08-26T10:00:00.120Z',
+      'comment-human-1',
+    );
+    comments.close();
+
+    const report = await evaluateFixture(fixture, {
+      cases: [{
+        taskGuid: 'task-guid-1',
+        commentId: 'comment-human-1',
+        senderReceipt: senderReceipt({
+          commentId: 'comment-other',
+          responseBinding: {
+            appId: APP_ID,
+            taskGuid: 'task-guid-1',
+            commentId: 'comment-other',
+          },
+        }),
+      }],
+    });
+
+    assert.equal(report.passed, false);
+    assert.deepEqual(report.failureCodes, ['INBOUND_SENDER_RECEIPT_INVALID']);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a sender receipt from another host cannot provide a clock-domain binding', async () => {
+  const fixture = createFixture();
+  try {
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare(`
+      UPDATE feishu_task_comment_inbox
+      SET occurred_at = ?, received_at = ?
+      WHERE comment_id = ?
+    `).run(
+      '2026-08-26T10:00:00.200Z',
+      '2026-08-26T10:00:00.120Z',
+      'comment-human-1',
+    );
+    comments.close();
+
+    const report = await evaluateFixture(fixture, {
+      cases: [{
+        taskGuid: 'task-guid-1',
+        commentId: 'comment-human-1',
+        senderReceipt: senderReceipt({ hostname: 'another-host' }),
+      }],
+    });
+
+    assert.equal(report.passed, false);
+    assert.deepEqual(report.failureCodes, ['INBOUND_SENDER_RECEIPT_INVALID']);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a sender receipt with an impossible local start fails closed', async () => {
+  const fixture = createFixture();
+  try {
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare(`
+      UPDATE feishu_task_comment_inbox SET received_at = ? WHERE comment_id = ?
+    `).run('2026-08-26T10:00:00.120Z', 'comment-human-1');
+    comments.close();
+
+    const report = await evaluateFixture(fixture, {
+      cases: [{
+        taskGuid: 'task-guid-1',
+        commentId: 'comment-human-1',
+        senderReceipt: senderReceipt({
+          requestStartedAt: '2026-08-26T10:00:00.200Z',
+          requestFinishedAt: '2026-08-26T10:00:00.250Z',
+        }),
+      }],
+    });
+
+    assert.equal(report.passed, false);
+    assert.deepEqual(report.failureCodes, ['INBOUND_SENDER_LATENCY_INVALID']);
+    assert.deepEqual(report.cases[0].failures[0].details, {
+      requestStartedAt: '2026-08-26T10:00:00.200Z',
+      receivedAt: '2026-08-26T10:00:00.120Z',
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('an invalid remote event timestamp remains fail-closed even with sender evidence', async () => {
+  const fixture = createFixture();
+  try {
+    const comments = new Database(fixture.taskCommentsDbPath);
+    comments.prepare(`
+      UPDATE feishu_task_comment_inbox SET occurred_at = ? WHERE comment_id = ?
+    `).run('not-an-instant', 'comment-human-1');
+    comments.close();
+
+    const report = await evaluateFixture(fixture, {
+      cases: [{
+        taskGuid: 'task-guid-1',
+        commentId: 'comment-human-1',
+        senderReceipt: senderReceipt(),
+      }],
+    });
+
+    assert.equal(report.passed, false);
+    assert.deepEqual(report.failureCodes, ['INBOUND_LATENCY_INVALID']);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test('a processed inbound comment without an exact sent Agent reply fails closed', async () => {
   const fixture = createFixture();
   try {
@@ -1224,6 +1460,24 @@ test('caller-supplied notification assertions are rejected instead of trusted', 
         }],
       }),
       /contains unsupported field: notification/,
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a free request timestamp on a gate case is rejected instead of trusted', async () => {
+  const fixture = createFixture();
+  try {
+    await assert.rejects(
+      evaluateFixture(fixture, {
+        cases: [{
+          taskGuid: 'task-guid-1',
+          commentId: 'comment-human-1',
+          requestStartedAt: '2026-08-26T10:00:00.000Z',
+        }],
+      }),
+      /contains unsupported field: requestStartedAt/,
     );
   } finally {
     fixture.cleanup();

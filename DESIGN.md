@@ -592,8 +592,9 @@ in read-only mode and accepts a remote Reader Adapter. The production CLI uses
 only the SDK Reader and marks reports as live/attestable; injected test Readers
 are machine-distinguishable and cannot attest a pass.
 
-Every case provides only the exact Task GUID and inbound comment ID. The gate
-derives the canonical Core comment event, immutable NotificationPolicy
+Every case provides the exact Task GUID and inbound comment ID. A case may
+also reference one sender receipt produced by the canary command below. The
+gate derives the canonical Core comment event, immutable NotificationPolicy
 decision, full recipient set, and delivery dedupe keys from the read-only Core
 database rather than trusting caller assertions. It proves all of the following
 before it passes:
@@ -601,7 +602,9 @@ before it passes:
 - the GUID and linked Core Task have a one-to-one `feishu-task-v2`
   `ExternalLink`;
 - the exact comment arrived through the realtime event source within the
-  configured latency SLO and reached `processed`;
+  configured latency SLO and reached `processed`; the normal latency value is
+  `received_at - occurred_at` and its raw cross-clock value remains in the
+  report;
 - exactly one sent outbound comment targets that inbound comment;
 - the exact canonical comment has an action-required notification decision;
   its non-empty recipient/dedupe-key set normally matches sent Feishu receipts
@@ -628,6 +631,44 @@ disables the sole-human fallback.
 ```bash
 npm run task-comments:gate -- --input /absolute/path/gate-input.json
 ```
+
+When the Feishu event clock is ahead of the local receipt clock, an operator
+may first create a same-host sender receipt for the exact canary comment:
+
+```bash
+npm run task-comments:canary -- \
+  --task-id <task-guid> \
+  --content "Please close this canary." \
+  --output /absolute/path/sender-receipt.json
+```
+
+The sender runs `lark-cli task +comment --dry-run --as user` first and checks
+the real success envelope (`ok: true`, `identity: "user"`), the Task v2
+comment request body, and `data.context.app_id`. It then reserves the output
+path with exclusive create before issuing the live command, and checks the
+live response's `ok`, `identity`, and returned `data.id`. The receipt contains
+the observed App context, returned comment ID, local request bounds, and the
+generating hostname. A failed live attempt leaves its response/error evidence
+in the reserved output and is not retried by the sender.
+
+Add the receipt path to its exact gate case:
+
+```json
+{
+  "taskGuid": "<task-guid>",
+  "commentId": "<comment-id>",
+  "senderReceiptPath": "/absolute/path/sender-receipt.json"
+}
+```
+
+The gate accepts sender timing only when the receipt's hostname matches the
+current gate host and its App, Task, comment, dry-run request, and live
+response binding all agree. It measures the conservative end-to-end bound as
+`received_at - requestStartedAt`, while retaining the raw event-timestamp
+delta as `eventTimestampLatencyMs`; the five-second SLO stays unchanged.
+Sender receipts are operator evidence with strict shape and identity checks,
+not a cryptographic attestation. Cases without a receipt keep the original
+non-negative event-timestamp check and fail closed on clock skew.
 
 The production CLI deliberately rejects remote fixtures. Deterministic tests
 inject Readers directly into the library Interface; those reports are marked
