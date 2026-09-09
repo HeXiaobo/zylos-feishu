@@ -565,6 +565,25 @@ one durable C4 receipt. The reply endpoint is opaque and platform-owned;
 exact Task v2 `reply_to_comment_id`. Agent notification identities are routed
 to C4 and are never passed to Feishu as fake `open_id` values.
 
+Core progress reports project through the same worker loop.
+`createTaskProgressProjector(...)` claims the registered
+`feishu-task-progress` outbox projection via `core.outbox.claim/ack/fail`,
+ignores every non-progress event, and posts each `TaskProgressReported`
+payload as a top-level App comment on the linked Task v2 task through
+`createSdkTaskV2CommentApi(...).createComment`. The body is the full progress
+message under a `【Zylos 任务进度】` header; when the message already fills the
+comment body limit the header is dropped instead of truncating the report.
+Deduplication reuses the outbound comment ledger keyed by the immutable Core
+event ID, so redeliveries acknowledge as already sent instead of posting a
+second comment. Comment-create ambiguity dead-letters the ledger row exactly
+like Agent replies and never blindly retries; reconciler adoption or operator
+redrive resolves it, and a Core task whose Task v2 link does not exist yet
+fails retryably. The projection is registered out of band with
+`task-comment-worker.js register --bootstrap-policy <from_now|from_beginning>`.
+It issues no Core commands: a progress event is same-state, so projecting it
+never moves task state, and the top-level App-authored comment stays outside
+the Agent wake path.
+
 ### 4.6 Native Task closure acceptance gate
 
 `evaluateNativeTaskClosure(...)` is the read-only acceptance Interface for a

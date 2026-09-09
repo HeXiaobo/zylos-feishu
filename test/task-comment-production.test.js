@@ -470,6 +470,11 @@ test('production assembly opens every required seam and an idle one-shot cycle i
   const core = {
     query({ taskId } = {}) { return taskId === undefined ? [] : null; },
     externalLinks: { query() { return []; } },
+    outbox: {
+      claim() { return []; },
+      ack() { throw new Error('idle cycle must not ack'); },
+      fail() { throw new Error('idle cycle must not fail'); },
+    },
     close() { coreClosed += 1; },
   };
   const queue = {
@@ -511,6 +516,16 @@ test('production assembly opens every required seam and an idle one-shot cycle i
         failures: [],
       },
       notifications: { claimed: 0, messagesSent: 0, deadLettered: 0 },
+      progress: {
+        claimed: 0,
+        commented: 0,
+        alreadySent: 0,
+        notApplicable: 0,
+        retryWaiting: 0,
+        deadLettered: 0,
+        settlementFailed: 0,
+        results: [],
+      },
     });
   } finally {
     runtime.close();

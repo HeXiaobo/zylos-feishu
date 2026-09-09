@@ -125,6 +125,20 @@ export function createSdkTaskV2CommentApi({ client }) {
       } while (pageToken);
       return comments;
     },
+    async createComment({ taskGuid, content }) {
+      const guid = requireText(taskGuid, 'comment create.taskGuid');
+      const body = requireText(content, 'comment create.content', 20_000);
+      const response = await commentApi.create({
+        params: { user_id_type: 'open_id' },
+        data: {
+          content: body,
+          resource_type: 'task',
+          resource_id: guid,
+        },
+      });
+      if (response?.code !== 0) throw apiError(response, 'Feishu Task v2 comment create');
+      return normalizeComment(response.data?.comment);
+    },
     async reply({ taskGuid, replyToCommentId, content }) {
       const guid = requireText(taskGuid, 'comment reply.taskGuid');
       const parentId = requireText(replyToCommentId, 'comment reply.replyToCommentId');
