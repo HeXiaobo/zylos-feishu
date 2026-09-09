@@ -27,7 +27,7 @@ import {
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage } from '../src/lib/message.js';
-import { initMention, buildMentionContent, buildMentionMarkdown } from '../src/lib/mention.js';
+import { initMention, buildMentionContent, buildMentionMarkdown, resolveMentionMapForChat } from '../src/lib/mention.js';
 import { getClient } from '../src/lib/client.js';
 import { createConversationResponseStream } from '../src/lib/conversation-response-stream.js';
 import {
@@ -203,7 +203,7 @@ async function sendText(endpoint, text) {
       console.warn('[feishu] Unified card skipped: Core did not provide a stable C4 delivery identity');
     } else {
       const replyToMessageId = chooseReplyTarget(parsedEndpoint, { isFirstChunk: true, quoteDirectMessage: true }) || null;
-      const cardText = convertAtMentionsForCard(buildMentionMarkdown(text));
+      const cardText = convertAtMentionsForCard(buildMentionMarkdown(text, await buildMentionContext()));
       try {
         const responseStream = createConversationResponseStream({
           client: getClient(),
@@ -252,6 +252,26 @@ async function sendText(endpoint, text) {
 initMention();
 
 /**
+ * Build the mention resolution context for THIS outgoing message (issue #81).
+ *
+ * open_id is context-scoped: for group sends we resolve names against the
+ * target chat's live member list (real-time fetch, short TTL cache) instead
+ * of trusting the global override_map. DMs keep the legacy map — there is no
+ * group member context to resolve against.
+ */
+async function buildMentionContext() {
+  const { chatId, type } = parsedEndpoint;
+  if (type === 'p2p' || !chatId) return {};
+  try {
+    const resolved = await resolveMentionMapForChat(chatId);
+    return { map: resolved.map, liveNames: resolved.liveNames, chatId: resolved.chatId };
+  } catch (err) {
+    console.warn('[feishu] Mention context resolution failed, using fallback map:', err.message);
+    return { chatId };
+  }
+}
+
+/**
  * Send a single chunk as plain text with routing logic.
  */
 async function sendPlainTextChunk(endpoint, chunk, isFirstChunk) {
@@ -261,7 +281,8 @@ async function sendPlainTextChunk(endpoint, chunk, isFirstChunk) {
   const replyTarget = chooseReplyTarget(parsedEndpoint, { isFirstChunk, quoteDirectMessage: true });
   // Resolve configured @names before choosing the transport. Plain text stays
   // `text`; resolved mentions use Feishu's rich-text `post` representation.
-  const { msgType, content } = buildMentionContent(chunk);
+  // Group sends resolve against the target chat's live member list (issue #81).
+  const { msgType, content } = buildMentionContent(chunk, await buildMentionContext());
   let result;
 
   if (replyTarget) {
