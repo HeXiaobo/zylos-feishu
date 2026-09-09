@@ -44,8 +44,11 @@ const CODE_SPAN = /(```[\s\S]*?```|`[^`\n]*`)/g;
  *
  * An unterminated fence matches nothing and is treated as ordinary text, which
  * keeps a stray backtick from disabling conversion for the rest of the message.
+ *
+ * Exported so mention resolution can reuse the same code-span exemption when
+ * scanning for unresolved @candidates (src/lib/mention.js, issue #81).
  */
-function mapOutsideCode(text, fn) {
+export function mapOutsideCode(text, fn) {
   return text
     .split(CODE_SPAN)
     .map((segment, i) => (i % 2 === 1 ? segment : fn(segment)))
