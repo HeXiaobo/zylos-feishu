@@ -643,6 +643,198 @@ test('keeps the collapsed process panel when CardKit falls back to ordinary card
   assert.equal(cardElement(card, 'zylos_answer'), undefined);
 }));
 
+function rejectPanelCardUpdates(client, calls) {
+  const originalUpdate = client.cardkit.v1.card.update;
+  client.cardkit.v1.card.update = async payload => {
+    const card = JSON.parse(payload.data.card.data);
+    if (card.body?.elements?.some(element => element.element_id === 'zylos_progress')) {
+      calls.push(['update', payload]);
+      return { code: 230001, msg: 'collapsible_panel unsupported on this client' };
+    }
+    return originalUpdate(payload);
+  };
+}
+
+test('probes the collapsible panel at runtime and degrades a rejected panel update to answer-only', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  rejectPanelCardUpdates(client, calls);
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunStarted')],
+  });
+
+  const updates = calls.filter(([name]) => name === 'update').map(([, payload]) => payload);
+  assert.equal(updates.length, 2, 'the rejected panel update is retried once without the panel');
+  const rejectedCard = JSON.parse(updates[0].data.card.data);
+  assert.equal(cardElement(rejectedCard, 'zylos_progress')?.tag, 'collapsible_panel');
+  const degradedCard = JSON.parse(updates[1].data.card.data);
+  assert.equal(cardElement(degradedCard, 'zylos_progress'), undefined, 'the degraded card never renders a process list');
+  assert.equal(cardElement(degradedCard, 'zylos_phase').content, '思考中');
+  assert.equal(/^\s*\d+[.、]/m.test(JSON.stringify(degradedCard)), false, 'the fallback must not be a numbered list');
+
+  const persisted = readPersistedState(stateDirectory);
+  assert.equal(persisted.processDisplay, 'answer_only', 'the probe decision is persisted');
+
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(2, 'ProgressUpdated', { stage: 'reading' })],
+  });
+  const laterCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(laterCard, 'zylos_progress'), undefined);
+  assert.equal(cardElement(laterCard, 'zylos_phase').content, '正在读取资料');
+
+  // The recorded decision survives a restart: a new stream instance on the
+  // same state keeps rendering answer-only.
+  const restarted = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await restarted.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(3, 'RunCompleted', { output: '终态答案' })],
+  });
+  const finalCard = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(finalCard, 'zylos_progress'), undefined);
+  assert.equal(cardElement(finalCard, 'zylos_phase').content, '✅ 已完成');
+  const answerCard = JSON.parse(calls.filter(([name]) => name === 'send').at(-1)[1].data.content);
+  assert.equal(cardElement(answerCard, 'zylos_answer').content, '终态答案');
+}));
+
+test('the ordinary-card patch path degrades a rejected panel through the same answer-only fallback', () => withState(async stateDirectory => {
+  const { client, calls } = createClient({ conversion: false });
+  const originalPatch = client.im.v1.message.patch;
+  client.im.v1.message.patch = async payload => {
+    const card = JSON.parse(payload.data.content);
+    if (card.body?.elements?.some(element => element.element_id === 'zylos_progress')) {
+      return { code: 230001, msg: 'collapsible_panel unsupported on this client' };
+    }
+    return originalPatch(payload);
+  };
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0, logger: { warn() {} } });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'RunStarted'),
+      event(2, 'ProgressUpdated', { stage: 'reading' }),
+    ],
+  });
+
+  const card = JSON.parse(calls.filter(([name]) => name === 'patch').at(-1)[1].data.content);
+  assert.equal(cardElement(card, 'zylos_progress'), undefined);
+  assert.equal(cardElement(card, 'zylos_phase').content, '正在读取资料');
+  assert.equal(readPersistedState(stateDirectory).processDisplay, 'answer_only');
+}));
+
+test('task streams never probe or degrade their phase rendering (issue #86 untouched)', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  rejectPanelCardUpdates(client, calls);
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  await stream.open({
+    requestId: 'assistant.feishu.om_task',
+    target: target(),
+    initialPhase: '📋 马上创建飞书任务…',
+    streamKind: 'task',
+  });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_task',
+    events: [eventFor('assistant.feishu.om_task', 1, 'AssistantRequestAccepted')],
+  });
+  await assert.rejects(
+    stream.apply({
+      requestId: 'assistant.feishu.om_task',
+      events: [eventFor('assistant.feishu.om_task', 2, 'RunStarted')],
+    }),
+    error => error?.code === 230001,
+    'a rejected task-panel update keeps the pre-existing error semantics',
+  );
+  assert.equal(readPersistedState(stateDirectory).processDisplay, 'collapsible');
+}));
+
+test('unknown panel-update outcomes keep retrying in collapsible mode instead of degrading', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const originalUpdate = client.cardkit.v1.card.update;
+  let losing = true;
+  client.cardkit.v1.card.update = async payload => {
+    const card = JSON.parse(payload.data.card.data);
+    if (card.body?.elements?.some(element => element.element_id === 'zylos_progress') && losing) {
+      throw new Error('connection reset while updating the card');
+    }
+    return originalUpdate(payload);
+  };
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await assert.rejects(
+    stream.apply({
+      requestId: 'assistant.feishu.om_1',
+      events: [event(1, 'RunStarted')],
+    }),
+    /connection reset/,
+  );
+  assert.equal(readPersistedState(stateDirectory).processDisplay, 'collapsible');
+
+  // The reliable redelivery replays the same event once the transport heals,
+  // and the stream is still allowed to render the panel.
+  losing = false;
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [event(1, 'RunStarted')],
+  });
+  const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(card, 'zylos_progress').header.title.content, '思考中');
+}));
+
+test('repeated identical progress events update nothing until a real semantic transition', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+
+  await stream.apply({ requestId: 'assistant.feishu.om_1', events: [event(1, 'RunStarted')] });
+  assert.equal(calls.filter(([name]) => name === 'update').length, 1);
+  await stream.apply({ requestId: 'assistant.feishu.om_1', events: [event(2, 'ProgressUpdated', { stage: 'reading' })] });
+  assert.equal(calls.filter(([name]) => name === 'update').length, 2);
+
+  await stream.apply({ requestId: 'assistant.feishu.om_1', events: [event(3, 'ProgressUpdated', { stage: 'reading' })] });
+  assert.equal(calls.filter(([name]) => name === 'update').length, 2, 'a duplicate tool event must not re-render the card');
+
+  await stream.apply({ requestId: 'assistant.feishu.om_1', events: [event(4, 'ProgressUpdated', { stage: 'querying' })] });
+  assert.equal(calls.filter(([name]) => name === 'update').length, 3);
+  const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  assert.equal(cardElement(card, 'zylos_progress').header.title.content, '正在查询数据');
+}));
+
+test('tool events carrying commands, credentials, paths, or raw output never reach the card JSON', () => withState(async stateDirectory => {
+  const { client, calls } = createClient();
+  const stream = createConversationResponseStream({ client, stateDirectory, throttleMs: 0 });
+  await stream.open({ requestId: 'assistant.feishu.om_1', target: target() });
+  await stream.apply({
+    requestId: 'assistant.feishu.om_1',
+    events: [
+      event(1, 'RunStarted'),
+      event(2, 'ProgressUpdated', {
+        stage: 'executing',
+        action: 'execute_operation',
+        status: 'started',
+        command: 'rm -rf /tmp/secret',
+        token: 'sk-internal-credential',
+        path: '/home/deploy/.ssh/id_rsa',
+        stdout: 'RAW TOOL OUTPUT LEAK',
+        summary: '隐藏推理不允许进入卡片',
+      }),
+    ],
+  });
+
+  const card = JSON.parse(calls.filter(([name]) => name === 'update').at(-1)[1].data.card.data);
+  const json = JSON.stringify(card);
+  for (const secret of ['rm -rf', 'sk-internal-credential', '.ssh', 'RAW TOOL OUTPUT LEAK', '隐藏推理不允许进入卡片']) {
+    assert.equal(json.includes(secret), false, `the card must not expose ${secret}`);
+  }
+  assert.equal(cardElement(card, 'zylos_progress').header.title.content, '正在执行所需操作');
+}));
+
 test('uses a user-facing chat-list summary in both running card modes', async () => {
   for (const conversion of [true, false]) {
     await withState(async stateDirectory => {
