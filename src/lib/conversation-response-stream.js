@@ -964,6 +964,11 @@ export function createConversationResponseStream({
       delivery: prefersPlainPlaceholder()
         ? {
           kind: 'plain_placeholder',
+          // Issue #62: provenance of a plain opening — 'configured' means the
+          // deployment asked for plain delivery. The degraded fallback in
+          // finishOpening marks 'degraded' instead. The uuid is deliberately
+          // shared by both causes as one idempotency key; do not split it.
+          reason: 'configured',
           status: 'pending',
           uuid: stableToken(requestId, 'plain-placeholder'),
         }
@@ -1013,8 +1018,14 @@ export function createConversationResponseStream({
         });
         state.delivery = {
           kind: 'plain_placeholder',
+          // Issue #62: mark the fallback cause so a plain placeholder can be
+          // told apart from a configured one after the fact. Keep lastError:
+          // the previous code wrote it and then replaced the whole delivery
+          // object, discarding the rejection evidence it had just persisted.
+          reason: 'degraded',
           status: 'pending',
           uuid: stableToken(state.requestId, 'plain-placeholder'),
+          lastError: error.message,
         };
         save(state);
       }
