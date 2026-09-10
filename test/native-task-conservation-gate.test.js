@@ -62,7 +62,7 @@ function stableRemote(tasks) {
   };
 }
 
-async function audit({ tasks, nativeTasks, inventory, deployment } = {}) {
+async function audit({ tasks, nativeTasks, inventory, deployment, projectionPolicy } = {}) {
   return auditNativeTaskConservation({
     coreInventory: inventory ?? coreInventory(tasks),
     remote: stableRemote(nativeTasks),
@@ -71,6 +71,7 @@ async function audit({ tasks, nativeTasks, inventory, deployment } = {}) {
       appId: APP_ID,
       agentAppIds: { [AGENT_ID]: APP_ID },
     },
+    projectionPolicy,
   });
 }
 
@@ -101,10 +102,141 @@ test('conserves every active Agent task with todo for work and done for review',
     coreTasks: 3,
     activeAgentTasks: 3,
     persistentLinks: 3,
+    unprojectedLocalTasks: 0,
     remoteTasks: 3,
     scopedRemoteTasks: 3,
   });
+  assert.deepEqual(report.policy, {
+    schema: 'zylos.native-task-conservation-policy/v1',
+    projectionRequired: true,
+    taskV2Enabled: null,
+    verified: false,
+    source: 'default-strict',
+    reasonCode: 'PROJECTION_POLICY_NOT_SUPPLIED',
+  });
   assert.equal(Object.isFrozen(report), true);
+});
+
+test('allows an unlinked active Agent task only under a verified disabled policy', async () => {
+  const task = coreTask('task-disabled-unlinked', 'review');
+  const inventory = coreInventory([task]);
+  inventory.externalLinks = [];
+
+  const report = await audit({
+    tasks: [task],
+    inventory,
+    nativeTasks: [],
+    projectionPolicy: {
+      projectionRequired: false,
+      taskV2Enabled: false,
+      verified: true,
+      source: 'runtime-dotenv',
+      reasonCode: 'TASK_V2_RUNTIME_DISABLED',
+    },
+  });
+
+  assert.equal(report.passed, true);
+  assert.deepEqual(report.failureCodes, []);
+  assert.equal(report.counts.activeAgentTasks, 1);
+  assert.equal(report.counts.unprojectedLocalTasks, 1);
+  assert.deepEqual(report.unprojectedLocalTasks, [
+    { taskId: task.id, state: 'review', assigneeId: AGENT_ID },
+  ]);
+  assert.equal(report.inventory.core.tasks.length, 1);
+  assert.equal(report.policy.projectionRequired, false);
+});
+
+test('keeps an unlinked active Agent task blocking when projection is enabled', async () => {
+  const task = coreTask('task-enabled-unlinked', 'ready');
+  const inventory = coreInventory([task]);
+  inventory.externalLinks = [];
+
+  const report = await audit({
+    tasks: [task],
+    inventory,
+    nativeTasks: [],
+    projectionPolicy: {
+      projectionRequired: true,
+      taskV2Enabled: true,
+      verified: true,
+      source: 'pm2-environment',
+      reasonCode: 'TASK_V2_RUNTIME_ENABLED',
+    },
+  });
+
+  assert.equal(report.passed, false);
+  assert.deepEqual(report.failureCodes, ['CORE_TASK_LINK_CARDINALITY_MISMATCH']);
+  assert.deepEqual(report.unprojectedLocalTasks, []);
+});
+
+test('retains all protections for existing links and remote App cards when projection is disabled', async () => {
+  const missingCardTask = coreTask('task-disabled-missing-card', 'ready');
+  const missingCardReport = await audit({
+    tasks: [missingCardTask],
+    nativeTasks: [],
+    projectionPolicy: {
+      projectionRequired: false,
+      taskV2Enabled: false,
+      verified: true,
+      source: 'runtime-dotenv',
+    },
+  });
+  assert.deepEqual(missingCardReport.failureCodes, ['PERSISTENT_LINK_CARD_CARDINALITY_MISMATCH']);
+
+  const duplicateLinksTask = coreTask('task-disabled-duplicate-links', 'ready');
+  const duplicateLinksInventory = coreInventory([duplicateLinksTask]);
+  duplicateLinksInventory.externalLinks.push({
+    taskId: duplicateLinksTask.id,
+    backend: 'feishu-task-v2',
+    externalId: 'guid-other',
+  });
+  const duplicateLinksReport = await audit({
+    tasks: [duplicateLinksTask],
+    inventory: duplicateLinksInventory,
+    nativeTasks: [nativeTask(duplicateLinksTask.id, 'todo')],
+    projectionPolicy: {
+      projectionRequired: false,
+      taskV2Enabled: false,
+      verified: true,
+      source: 'runtime-dotenv',
+    },
+  });
+  assert.equal(duplicateLinksReport.failureCodes.includes('CORE_TASK_LINK_CARDINALITY_MISMATCH'), true);
+
+  const orphanTask = coreTask('task-disabled-orphan-card', 'ready');
+  const orphanInventory = coreInventory([orphanTask]);
+  orphanInventory.externalLinks = [];
+  const orphanReport = await audit({
+    tasks: [orphanTask],
+    inventory: orphanInventory,
+    nativeTasks: [nativeTask(orphanTask.id, 'todo')],
+    projectionPolicy: {
+      projectionRequired: false,
+      taskV2Enabled: false,
+      verified: true,
+      source: 'runtime-dotenv',
+    },
+  });
+  assert.deepEqual(orphanReport.failureCodes, ['REMOTE_CARD_LINK_CARDINALITY_MISMATCH']);
+});
+
+test('does not accept an unverified policy that disables projection', async () => {
+  const task = coreTask('task-unverified-disabled', 'ready');
+  const inventory = coreInventory([task]);
+  inventory.externalLinks = [];
+  await assert.rejects(
+    audit({
+      tasks: [task],
+      inventory,
+      nativeTasks: [],
+      projectionPolicy: {
+        projectionRequired: false,
+        taskV2Enabled: false,
+        verified: false,
+      },
+    }),
+    /verified taskV2Enabled=false/,
+  );
 });
 
 test('fails an open App card that has a projection marker but no persistent link', async () => {
