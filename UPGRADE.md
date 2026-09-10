@@ -36,16 +36,42 @@ repository. This fetches operator tools; it does **not** install or upgrade Core
 Record the tool commit and read the nearest AGENTS.md.
 
 Collect the actual host's verified component source baseline into a local
-`installed.json` yourself, then prepare with:
+`installed.json` yourself. The host environment descriptor is a required step,
+not an optional extra: the deployment gate needs the publisher's qualification
+imported, and qualification matches on the host's functional-config
+fingerprint, while platform, architecture, Node major version and runtime only
+decide whether the published matrix covers this host. Run the authoritative
+probe that ships with the Core tools once, and pass its output file straight to
+`--environment`:
 
 ```sh
-node tools/upgrade/prepare.mjs --only feishu --feishu latest --installed /absolute/installed.json --out /absolute/new/control-directory --authorization-ref OWNER_MESSAGE_ID
+# The probe comes from the same Core tools checkout. Use the host's installed
+# component sources and the host's runtime (claude or codex).
+node tools/upgrade/functional-config-probe.mjs \
+  --zylos-dir "$ZYLOS_DIR" --core-source "$CORE_SOURCE" \
+  --feishu-source "$FEISHU_SOURCE" --hxa-source "$HXA_SOURCE" \
+  --runtime claude --out /absolute/probe-result.json
+
+node tools/upgrade/prepare.mjs --only feishu --feishu latest \
+  --installed /absolute/installed.json --environment /absolute/probe-result.json \
+  --out /absolute/new/control-directory --authorization-ref OWNER_MESSAGE_ID
 ```
 
 For a named version, replace latest with that exact version (for example 0.3.7-rc.20).
+Omitting `--environment` on a covered host fails during preparation, and the
+error prints this probe command. A descriptor embedded in older release notes is
+a stale copy; only the repository copy is authoritative.
 The paths and message reference are filled by the Agent, not the owner.
-Continue with the generated WORKFLOW.md. Import its published qualification for the verified host environment; keep local backup, source, compatibility and host smoke checks fresh. Use `command.mjs` to obtain just the
-selected component's native update command after the existing deployment gate.
+Continue with the generated WORKFLOW.md. When the fingerprint is covered, the
+published functional qualification is imported as `REUSED`, and local identity,
+backup, source, compatibility, data and host smoke checks still run fresh. When
+the host or source combination is not covered, do not fabricate a fingerprint,
+do not ask the owner for more authorization and do not fall back to `main`: keep
+the descriptor and add `--environment-policy newest-qualified`, then
+`prepare.mjs` reports `environmentVerified=false` and the full local
+qualification must run before `deploy --stage final` passes. Use `command.mjs` to
+obtain just the selected component's native update command after the existing
+deployment gate.
 Do not run a full Core/Feishu pair installation for this single-component request.
 
 Verify compatibility with the installed companions, identity, backup, source,
