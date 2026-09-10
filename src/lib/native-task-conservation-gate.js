@@ -1,6 +1,7 @@
 const REPORT_SCHEMA = 'zylos.native-task-conservation-gate/v1';
 const CORE_SCHEMA = 'zylos.native-task-core-inventory/v1';
 const PROJECTION_MARKER_SCHEMA = 'zylos.task-v2-projection/v1';
+const PROJECTION_POLICY_SCHEMA = 'zylos.native-task-conservation-policy/v1';
 const LINK_BACKEND = 'feishu-task-v2';
 const ACTIVE_STATES = new Set(['ready', 'in_progress', 'review']);
 const TERMINAL_STATES = new Set(['done', 'cancelled']);
@@ -56,6 +57,55 @@ function normalizeDeployment(input) {
     throw new TypeError('deployment mapping must bind agentId to appId');
   }
   return { agentId, appId, agentAppIds };
+}
+
+function normalizeProjectionPolicy(input) {
+  if (input === undefined || input === null) {
+    return {
+      schema: PROJECTION_POLICY_SCHEMA,
+      projectionRequired: true,
+      taskV2Enabled: null,
+      verified: false,
+      source: 'default-strict',
+      reasonCode: 'PROJECTION_POLICY_NOT_SUPPLIED',
+    };
+  }
+  const policy = requireRecord(input, 'projectionPolicy');
+  const taskV2Enabled = policy.taskV2Enabled === undefined
+    ? null
+    : policy.taskV2Enabled;
+  if (taskV2Enabled !== null && typeof taskV2Enabled !== 'boolean') {
+    throw new TypeError('projectionPolicy.taskV2Enabled must be a boolean or null');
+  }
+  const projectionRequired = policy.projectionRequired === undefined
+    ? taskV2Enabled !== false
+    : policy.projectionRequired;
+  if (typeof projectionRequired !== 'boolean') {
+    throw new TypeError('projectionPolicy.projectionRequired must be a boolean');
+  }
+  if (!projectionRequired && (taskV2Enabled !== false || policy.verified !== true)) {
+    throw new TypeError(
+      'projectionPolicy may disable projection only with verified taskV2Enabled=false',
+    );
+  }
+  const verified = policy.verified === undefined ? false : policy.verified;
+  if (typeof verified !== 'boolean') {
+    throw new TypeError('projectionPolicy.verified must be a boolean');
+  }
+  const source = policy.source === undefined
+    ? 'injected'
+    : requireText(policy.source, 'projectionPolicy.source');
+  const reasonCode = policy.reasonCode === undefined
+    ? null
+    : requireText(policy.reasonCode, 'projectionPolicy.reasonCode');
+  return {
+    schema: PROJECTION_POLICY_SCHEMA,
+    projectionRequired,
+    taskV2Enabled,
+    verified,
+    source,
+    reasonCode,
+  };
 }
 
 function normalizeCoreInventory(input, deployment) {
@@ -244,7 +294,15 @@ function findingSort(left, right) {
     || canonical(left).localeCompare(canonical(right));
 }
 
-function buildReport({ deployment, core, remoteFirst, remote, findings }) {
+function buildReport({
+  deployment,
+  core,
+  remoteFirst,
+  remote,
+  findings,
+  projectionPolicy,
+  unprojectedLocalTasks,
+}) {
   const sortedFindings = [...findings].sort(findingSort);
   const activeAgentTasks = core.tasks.filter(task => (
     ACTIVE_STATES.has(task.state) && task.assigneeId?.startsWith('agent:')
@@ -256,11 +314,16 @@ function buildReport({ deployment, core, remoteFirst, remote, findings }) {
     schema: REPORT_SCHEMA,
     passed: sortedFindings.length === 0,
     deployment,
+    policy: projectionPolicy,
+    unprojectedLocalTasks: [...unprojectedLocalTasks].sort((left, right) => (
+      left.taskId.localeCompare(right.taskId)
+    )),
     failureCodes: [...new Set(sortedFindings.map(item => item.code))].sort(),
     counts: {
       coreTasks: core.tasks.length,
       activeAgentTasks: activeAgentTasks.length,
       persistentLinks: core.externalLinks.length,
+      unprojectedLocalTasks: unprojectedLocalTasks.length,
       remoteTasks: remote.tasks.length,
       scopedRemoteTasks: scopedRemoteTasks.length,
     },
@@ -285,9 +348,11 @@ export async function auditNativeTaskConservation({
   coreInventory,
   remote,
   deployment: deploymentInput,
+  projectionPolicy: projectionPolicyInput,
   signal,
 } = {}) {
   const deployment = normalizeDeployment(deploymentInput);
+  const projectionPolicy = normalizeProjectionPolicy(projectionPolicyInput);
   const core = normalizeCoreInventory(coreInventory, deployment);
   if (!remote || typeof remote.capture !== 'function') {
     throw new TypeError('remote must provide the capture Interface');
@@ -299,6 +364,7 @@ export async function auditNativeTaskConservation({
   throwIfAborted(signal);
 
   const findings = [];
+  const unprojectedLocalTasks = [];
   if (canonical(first) !== canonical(second)) {
     findings.push(finding('SNAPSHOT_UNSTABLE'));
   }
@@ -342,6 +408,14 @@ export async function auditNativeTaskConservation({
       continue;
     }
     const links = linksByTask.get(task.id) ?? [];
+    if (links.length === 0 && !projectionPolicy.projectionRequired) {
+      unprojectedLocalTasks.push({
+        taskId: task.id,
+        state: task.state,
+        assigneeId: task.assigneeId,
+      });
+      continue;
+    }
     if (links.length !== 1) {
       findings.push(finding('CORE_TASK_LINK_CARDINALITY_MISMATCH', {
         taskId: task.id,
@@ -484,7 +558,16 @@ export async function auditNativeTaskConservation({
     }
   }
 
-  return buildReport({ deployment, core, remoteFirst: first, remote: native, findings });
+  return buildReport({
+    deployment,
+    core,
+    remoteFirst: first,
+    remote: native,
+    findings,
+    projectionPolicy,
+    unprojectedLocalTasks,
+  });
 }
 
 export const NATIVE_TASK_CONSERVATION_GATE_SCHEMA = REPORT_SCHEMA;
+export const NATIVE_TASK_CONSERVATION_POLICY_SCHEMA = PROJECTION_POLICY_SCHEMA;
