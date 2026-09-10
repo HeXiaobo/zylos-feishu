@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-09-10
+
+### Fixed
+- Preserve active local tasks during upgrades when the target runtime has Task v2 projection disabled. Verify actual PM2 and dotenv settings; retain strict identity, existing-link, remote-card and status checks (#94).
+
 ## [0.3.7] - 2026-09-10
 
 ### Added
