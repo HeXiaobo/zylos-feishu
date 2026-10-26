@@ -8,6 +8,8 @@
  */
 
 import * as lark from '@larksuiteoapi/node-sdk';
+// zylos-lab-safe-logger: never print request bodies/headers (app_secret).
+import { safeLogger } from './safe-logger.js';
 import { getCredentials } from './config.js';
 
 let clientInstance = null;
@@ -31,6 +33,7 @@ export function getClient() {
     appSecret: creds.app_secret,
     appType: lark.AppType.SelfBuild,
     domain: lark.Domain.Feishu,  // Chinese version (feishu.cn)
+    logger: safeLogger,
   });
 
   return clientInstance;

@@ -14,6 +14,8 @@ import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import * as Lark from '@larksuiteoapi/node-sdk';
+// zylos-lab-safe-logger: never print request bodies/headers (app_secret).
+import { safeLogger } from './lib/safe-logger.js';
 
 // Load .env from ~/zylos/.env (absolute path, not cwd-dependent)
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
@@ -1512,6 +1514,7 @@ function startWebSocket(creds) {
     appSecret: creds.app_secret,
     domain: Lark.Domain.Feishu,
     loggerLevel: Lark.LoggerLevel.info,
+    logger: safeLogger,
     autoReconnect: true
   });
 
@@ -1717,7 +1720,8 @@ if (!creds.app_id || !creds.app_secret) {
       appId: creds.app_id,
       appSecret: creds.app_secret,
       appType: Lark.AppType.SelfBuild,
-      domain: Lark.Domain.Feishu
+      domain: Lark.Domain.Feishu,
+      logger: safeLogger
     });
 
     const res = await client.request({
@@ -1733,7 +1737,8 @@ if (!creds.app_id || !creds.app_secret) {
       console.error(`[feishu] Warning: Could not fetch bot info: ${res.msg}`);
     }
   } catch (err) {
-    console.error(`[feishu] Warning: getBotInfo failed: ${err.message}`);
+    // Never echo an Axios error object: it can contain the auth request body.
+    safeLogger.error('[feishu] getBotInfo failed', err);
   }
 
   // Store app_id for exact bot message matching
