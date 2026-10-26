@@ -19,6 +19,8 @@ import { safeLogger } from './lib/safe-logger.js';
 
 // Load .env from ~/zylos/.env (absolute path, not cwd-dependent)
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
+// zylos-lab-mention-patch: @everyone is not a mention of this bot.
+import { isBotMentioned } from './lib/feishu-group-policy.js';
 
 import { getConfig, watchConfig, saveConfig, DATA_DIR, getCredentials, stopWatching } from './lib/config.js';
 import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages } from './lib/message.js';
@@ -706,16 +708,6 @@ function getGroupName(chatId) {
   const legacySmart = (config.smart_groups || []).find(g => String(g.chat_id) === String(chatId));
   if (legacySmart?.name) return legacySmart.name;
   return String(chatId || 'unknown');
-}
-
-// Check if bot is mentioned
-function isBotMentioned(mentions, botId) {
-  if (!mentions || !Array.isArray(mentions)) return false;
-  const normalizedBotId = botId === undefined || botId === null ? '' : String(botId);
-  return mentions.some(m => {
-    const mentionId = m.id?.open_id || m.id?.user_id || m.id?.app_id || '';
-    return (normalizedBotId && String(mentionId) === normalizedBotId) || m.key === '@_all';
-  });
 }
 
 /**
