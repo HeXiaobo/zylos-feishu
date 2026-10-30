@@ -83,7 +83,7 @@ test('loadClaimStore: a module without createClaimStore is rejected', async () =
 // reports and index.js stays on the in-process Map.
 test('index.js loads the claim store and consults it before handling a message', () => {
   const source = fs.readFileSync(path.join(REPO_ROOT, 'src', 'index.js'), 'utf8');
-  assert.match(source, /loadClaimStore\(\{ via: 'ws' \}\)/);
+  assert.match(source, /loadClaimStore\(\{ via: 'ws', log:/);
   assert.match(source, /claimStore\.claim\(messageId\)/);
   assert.match(source, /claimStore\.sweep\(\)/);
   // The claim check must come before the message is recorded as seen.

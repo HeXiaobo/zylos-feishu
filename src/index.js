@@ -80,7 +80,7 @@ const processedMessages = new Map();
 // paths create a claim file for a message id before handling it; the first
 // creator wins and the other one skips. Without the module (plain `zylos add`,
 // no 3ai image) this stays memory-only, which is what it was before.
-const claimLoad = await loadClaimStore({ via: 'ws' });
+const claimLoad = await loadClaimStore({ via: 'ws', log: (message) => console.warn(`[feishu] ${message}`) });
 const claimStore = claimLoad.store;
 if (claimStore) {
   console.log(`[feishu] Dedupe claims shared with feishu-recovery at ${claimStore.dir}`);
