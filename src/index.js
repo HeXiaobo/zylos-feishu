@@ -31,6 +31,10 @@ import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 // 3ai-dedupe: one claim per message id, shared with the feishu-recovery poller.
 import { loadClaimStore } from './lib/dedupe-claim-loader.js';
+// 3ai-recovery: body parsing and DM rules live in lib/ so the recovery poller
+// applies the same ones instead of keeping its own copies.
+import { extractPostText, resolveMentions } from './lib/message-text.js';
+import { isDmAllowed as isDmAllowedByConfig, isOwner as isOwnerByConfig } from './lib/dm-policy.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -735,27 +739,6 @@ function getGroupName(chatId) {
 }
 
 /**
- * Resolve @_user_N placeholders in message text to real names.
- * Feishu replaces @mentions with @_user_1, @_user_2, etc. in the raw text.
- * The mentions array contains the mapping: { key: "@_user_1", name: "Name", id: { ... } }
- */
-function resolveMentions(text, mentions, { stripBot = false, botOpenId: botId } = {}) {
-  if (!text || !mentions || !Array.isArray(mentions) || mentions.length === 0) return text;
-
-  let resolved = text;
-  for (const m of mentions) {
-    if (!m.key) continue;
-    const isBotMention = botId && (m.id?.open_id === botId || m.id?.app_id === botId);
-    if (stripBot && isBotMention) {
-      resolved = resolved.replace(new RegExp(m.key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*', 'g'), '');
-    } else if (m.name) {
-      resolved = resolved.replace(m.key, `@${m.name}`);
-    }
-  }
-  return resolved.trim();
-}
-
-/**
  * Parse c4-receive JSON response from stdout.
  */
 function parseC4Response(stdout) {
@@ -1062,62 +1045,6 @@ function buildSafeDownloadPath(downloadDir, prefix, fileName) {
   return filePath;
 }
 
-/**
- * Extract text from a Feishu post (rich text) message.
- * Post messages have nested arrays: paragraphs > elements.
- * Each element has a tag (text, at, a, img, media, emotion).
- *
- * @param {Array} paragraphs - content.content array from post message
- * @param {string} messageId - message ID for lazy media references
- * @returns {{ text: string, imageKeys: string[] }} Extracted text and image keys
- */
-function extractPostText(paragraphs, messageId) {
-  const imageKeys = [];
-  const lines = [];
-
-  for (const paragraph of paragraphs) {
-    if (!Array.isArray(paragraph)) continue;
-    const parts = [];
-
-    for (const el of paragraph) {
-      switch (el.tag) {
-        case 'text':
-          parts.push(el.text || '');
-          break;
-        case 'at':
-          parts.push(`@${el.user_name || el.user_id || 'unknown'}`);
-          break;
-        case 'a':
-          if (el.href) {
-            parts.push(`${el.text || ''}(${el.href})`);
-          } else {
-            parts.push(el.text || '');
-          }
-          break;
-        case 'img':
-          if (el.image_key) {
-            imageKeys.push(el.image_key);
-            parts.push(`[image, image_key: ${el.image_key}, msg_id: ${messageId}]`);
-          }
-          break;
-        case 'media':
-          parts.push(`[media, file_key: ${el.file_key || 'unknown'}, msg_id: ${messageId}]`);
-          break;
-        case 'emotion':
-          parts.push(el.emoji_type ? `[${el.emoji_type}]` : '');
-          break;
-        default:
-          if (el.text) parts.push(el.text);
-          break;
-      }
-    }
-
-    lines.push(parts.join(''));
-  }
-
-  return { text: lines.join('\n'), imageKeys };
-}
-
 // Extract content from Feishu message
 // Returns imageKeys as array (all images from post messages, or single image)
 function extractMessageContent(message) {
@@ -1185,27 +1112,14 @@ async function bindOwner(userId, openId) {
   return userName;
 }
 
-// Check if user is owner
+// Check if user is owner — rule lives in lib/dm-policy.js (shared with recovery).
 function isOwner(userId, openId) {
-  if (!config.owner?.bound) return false;
-  const ownerUserId = config.owner.user_id;
-  const ownerOpenId = config.owner.open_id;
-  return (ownerUserId !== undefined && ownerUserId !== null && userId !== undefined && userId !== null && String(ownerUserId) === String(userId))
-    || (ownerOpenId !== undefined && ownerOpenId !== null && openId !== undefined && openId !== null && String(ownerOpenId) === String(openId));
+  return isOwnerByConfig(config, { userId, openId });
 }
 
-// Check DM access — uses dmPolicy + dmAllowFrom
+// Check DM access — dmPolicy + dmAllowFrom, same shared rule.
 function isDmAllowed(userId, openId) {
-  if (isOwner(userId, openId)) return true;
-  const policy = config.dmPolicy || 'owner';
-  if (policy === 'open') return true;
-  if (policy === 'owner') return false;
-  // policy === 'allowlist'
-  const allowFrom = (Array.isArray(config.dmAllowFrom) ? config.dmAllowFrom : []).map(String);
-  const normalizedUserId = userId === undefined || userId === null ? '' : String(userId);
-  const normalizedOpenId = openId === undefined || openId === null ? '' : String(openId);
-  return (normalizedUserId && allowFrom.includes(normalizedUserId)) ||
-    (normalizedOpenId && allowFrom.includes(normalizedOpenId));
+  return isDmAllowedByConfig(config, { userId, openId });
 }
 
 // Reply-to (threaded/quoted) sends only make sense in group chats. In a p2p DM

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { claimLibPath, loadClaimStore } from '../src/lib/dedupe-claim-loader.js';
+import { claimDirPath, claimLibPath, loadClaimStore, sharedClaimEnabled } from '../src/lib/dedupe-claim-loader.js';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
@@ -44,11 +44,25 @@ test('claimLibPath: defaults to the image copy under zylos/lib/3ai', () => {
   );
 });
 
+test('shared claim is off unless the entrypoint marked the data volume', async () => {
+  const home = tmpdir();
+  const env = { HOME: home };
+  const loaded = await loadClaimStore({ via: 'ws', env });
+  assert.equal(loaded.store, null);
+  assert.match(loaded.error, /shared claim is off/);
+  // Off must not touch the data volume: no claim dir, no claim files.
+  assert.equal(fs.existsSync(claimDirPath(env)), false);
+  assert.equal(sharedClaimEnabled(env), false);
+});
+
 test('loadClaimStore: imports the shared module and tags the claims', async () => {
   const dir = tmpdir();
   const file = path.join(dir, 'feishu-claim.mjs');
+  const dedup = path.join(dir, 'dedup');
   fs.writeFileSync(file, STUB_MODULE);
-  const loaded = await loadClaimStore({ via: 'ws', env: { ZYLOS_FEISHU_CLAIM_LIB: file } });
+  fs.mkdirSync(dedup, { recursive: true });
+  fs.writeFileSync(path.join(dedup, '.enabled'), '{}\n');
+  const loaded = await loadClaimStore({ via: 'ws', env: { ZYLOS_FEISHU_CLAIM_LIB: file, ZYLOS_FEISHU_DEDUP_DIR: dedup } });
   try {
     assert.equal(loaded.error, undefined);
     assert.equal(typeof loaded.store.claim, 'function');
@@ -61,7 +75,11 @@ test('loadClaimStore: imports the shared module and tags the claims', async () =
 });
 
 test('loadClaimStore: a missing module is reported, not thrown', async () => {
-  const loaded = await loadClaimStore({ env: { ZYLOS_FEISHU_CLAIM_LIB: '/nonexistent/claim.mjs' } });
+  const dedup = tmpdir();
+  fs.writeFileSync(path.join(dedup, '.enabled'), '{}\n');
+  const loaded = await loadClaimStore({
+    env: { ZYLOS_FEISHU_CLAIM_LIB: '/nonexistent/claim.mjs', ZYLOS_FEISHU_DEDUP_DIR: dedup },
+  });
   assert.equal(loaded.store, null);
   assert.match(loaded.error, /not found/);
 });
@@ -69,9 +87,12 @@ test('loadClaimStore: a missing module is reported, not thrown', async () => {
 test('loadClaimStore: a module without createClaimStore is rejected', async () => {
   const dir = tmpdir();
   const file = path.join(dir, 'empty.mjs');
+  const dedup = path.join(dir, 'dedup');
+  fs.mkdirSync(dedup, { recursive: true });
+  fs.writeFileSync(path.join(dedup, '.enabled'), '{}\n');
   fs.writeFileSync(file, 'export const nothing = 1;\n');
   try {
-    const loaded = await loadClaimStore({ env: { ZYLOS_FEISHU_CLAIM_LIB: file } });
+    const loaded = await loadClaimStore({ env: { ZYLOS_FEISHU_CLAIM_LIB: file, ZYLOS_FEISHU_DEDUP_DIR: dedup } });
     assert.equal(loaded.store, null);
     assert.match(loaded.error, /createClaimStore is not exported/);
   } finally {
