@@ -29,6 +29,8 @@ import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
+// 3ai-dedupe: one claim per message id, shared with the feishu-recovery poller.
+import { loadClaimStore } from './lib/dedupe-claim-loader.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -74,10 +76,27 @@ const USER_CACHE_PATH = path.join(DATA_DIR, 'user-cache.json');
 const DEDUP_TTL = 5 * 60 * 1000; // 5 minutes
 const processedMessages = new Map();
 
+// The recovery poller is a separate process and cannot see this Map. Both
+// paths create a claim file for a message id before handling it; the first
+// creator wins and the other one skips. Without the module (plain `zylos add`,
+// no 3ai image) this stays memory-only, which is what it was before.
+const claimLoad = await loadClaimStore({ via: 'ws' });
+const claimStore = claimLoad.store;
+if (claimStore) {
+  console.log(`[feishu] Dedupe claims shared with feishu-recovery at ${claimStore.dir}`);
+} else {
+  console.warn(`[feishu] Dedupe claims unavailable (${claimLoad.error}); memory-only dedupe, the recovery poller will not run`);
+}
+
 function isDuplicate(messageId) {
   if (!messageId) return false;
   if (processedMessages.has(messageId)) {
     console.log(`[feishu] Duplicate message_id ${messageId}, skipping`);
+    return true;
+  }
+  if (claimStore && !claimStore.claim(messageId)) {
+    const owner = claimStore.ownerOf(messageId);
+    console.log(`[feishu] Duplicate message_id ${messageId}, skipping (already claimed by ${owner?.via || 'another path'})`);
     return true;
   }
   processedMessages.set(messageId, Date.now());
@@ -98,6 +117,11 @@ const dedupCleanupInterval = setInterval(() => {
     if (now - ts > DEDUP_TTL) processedMessages.delete(id);
   }
 }, DEDUP_TTL);
+
+// Claim files live 24 h on the data volume; sweep them once an hour.
+const claimSweepInterval = setInterval(() => {
+  if (claimStore) claimStore.sweep();
+}, 60 * 60 * 1000);
 
 console.log(`[feishu] Config loaded, enabled: ${config.enabled}`);
 

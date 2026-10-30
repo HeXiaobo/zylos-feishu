@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Message dedupe is now shared across processes.** `isDuplicate()` also asks a
+  claim store loaded from `~/zylos/lib/3ai/feishu-claim.mjs` (the 3ai image's
+  `docker/3ai/lib/feishu-claim.mjs`). The WebSocket path and the
+  `feishu-recovery` poller each create `<message_id>.claim` with
+  `O_CREAT|O_EXCL` under `~/zylos/components/feishu/dedup` before handling a
+  message; the first creator wins and the other skips it. Claims are kept for
+  24 h and swept hourly.
+  Without the module the component keeps the in-memory Map and logs why, so a
+  plain `zylos add` install behaves exactly as before.
+
 ## [0.3.6] - 2026-08-10
 
 ### Fixed
