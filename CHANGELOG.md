@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Success prints `[feishu] card sent message_id=<om_…> via=<reply|reply-root|send>`
     and records `[sent card] <summary>` (summary from `config.summary.content`,
     else the header title, else `card`).
+  - The `[MEDIA:card]` prefix is recognized before the generic media regex and
+    before the text branch, so a missing or empty path fails with
+    `ERR_CARD_PATH` and a path containing a newline is read as a path; neither
+    can fall back to sending the directive as literal text.
+  - Send wrappers keep Feishu's `code`/`msg` from an HTTP error response, so a
+    rejected card reports `ERR_CARD_SEND: 230099 <msg>` instead of only
+    `Request failed with status code 400`.
 
 ### Changed
 - **Message dedupe is now shared across processes.** `isDuplicate()` also asks a

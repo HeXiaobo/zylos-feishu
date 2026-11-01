@@ -187,7 +187,7 @@ EOF
 
 > ⚠️ `[MEDIA:...]` must be the only content in the message. Send text and media as separate calls.
 
-A card file must be a complete Feishu card 2.0 document (`"schema": "2.0"` with a `body` object). The whole request body may not exceed 30 KB (UTF-8 bytes; CJK text counts 3 bytes per character). The card is sent as-is: if the file cannot be read, fails validation or cannot be delivered, `send.js` exits non-zero and sends nothing further. It never falls back to a text message and never truncates the card. On success it prints `[feishu] card sent message_id=<om_…> via=<reply|reply-root|send>`.
+A card file must be a complete Feishu card 2.0 document (`"schema": "2.0"` with a `body` object). The whole request body may not exceed 30 KB (UTF-8 bytes; CJK text counts 3 bytes per character). The card is sent as-is: if the file cannot be read, fails validation or cannot be delivered, `send.js` exits non-zero and sends nothing further. It never falls back to a text message and never truncates the card; a missing or empty path fails with `ERR_CARD_PATH`. On success it prints `[feishu] card sent message_id=<om_…> via=<reply|reply-root|send>`.
 
 Direct send (bypasses C4 logging, for testing only):
 ```bash

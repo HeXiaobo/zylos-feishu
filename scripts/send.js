@@ -78,8 +78,15 @@ if (!config.enabled) {
   process.exit(1);
 }
 
-// Parse media prefix
-const mediaMatch = message.match(/^\[MEDIA:(\w+)\](.+)$/);
+// Card directives are recognized on the full prefix BEFORE the generic media
+// regex. The regex needs a non-empty `.+` and cannot match an embedded newline,
+// so `[MEDIA:card]` with a missing path (or a path containing a newline) used to
+// fall through to sendText() and go out as literal text. Every `[MEDIA:card]`
+// input must reach card validation instead, including the empty path.
+const CARD_MEDIA_PREFIX = '[MEDIA:card]';
+const isCardMessage = message.startsWith(CARD_MEDIA_PREFIX);
+const cardPath = isCardMessage ? message.slice(CARD_MEDIA_PREFIX.length) : '';
+const mediaMatch = isCardMessage ? null : message.match(/^\[MEDIA:(\w+)\](.+)$/);
 
 /**
  * Split long message into chunks (markdown-aware).
@@ -429,21 +436,20 @@ async function recordOutgoing(text) {
 
 async function send() {
   try {
-    if (mediaMatch) {
+    if (isCardMessage) {
+      // A card file is sent as-is: interactive, never degraded to text and
+      // never truncated. Validation failures (including an empty path) throw
+      // before anything is sent.
+      const result = await sendCard(
+        { ...parsedEndpoint, cardPath },
+        { replyToMessage, sendMessage },
+      );
+      console.log(`[feishu] card sent message_id=${result.messageId} via=${result.via}`);
+      await recordOutgoing(`[sent card] ${result.summary}`);
+    } else if (mediaMatch) {
       const [, mediaType, mediaPath] = mediaMatch;
-      if (mediaType === 'card') {
-        // A card file is sent as-is: interactive, never degraded to text and
-        // never truncated. Validation failures throw before anything is sent.
-        const result = await sendCard(
-          { ...parsedEndpoint, cardPath: mediaPath },
-          { replyToMessage, sendMessage },
-        );
-        console.log(`[feishu] card sent message_id=${result.messageId} via=${result.via}`);
-        await recordOutgoing(`[sent card] ${result.summary}`);
-      } else {
-        await sendMedia(mediaType, mediaPath);
-        await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');
-      }
+      await sendMedia(mediaType, mediaPath);
+      await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');
     } else {
       await sendText(endpointId, message);
       await recordOutgoing(message);
