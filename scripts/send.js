@@ -6,6 +6,7 @@
  *   ./send.js <endpoint_id> "message text"
  *   ./send.js <endpoint_id> "[MEDIA:image]/path/to/image.png"
  *   ./send.js <endpoint_id> "[MEDIA:file]/path/to/document.pdf"
+ *   ./send.js <endpoint_id> "[MEDIA:card]/path/to/card.json"
  *
  * Exit codes:
  *   0 - Success
@@ -19,6 +20,7 @@ dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
 import { getConfig, DATA_DIR } from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
+import { sendCard } from '../src/lib/card-send.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
 
@@ -32,6 +34,7 @@ if (args.length < 2) {
   console.error('Usage: send.js <endpoint_id> <message>');
   console.error('       send.js <endpoint_id> "[MEDIA:image]/path/to/image.png"');
   console.error('       send.js <endpoint_id> "[MEDIA:file]/path/to/file.pdf"');
+  console.error('       send.js <endpoint_id> "[MEDIA:card]/path/to/card.json"');
   process.exit(1);
 }
 
@@ -428,8 +431,19 @@ async function send() {
   try {
     if (mediaMatch) {
       const [, mediaType, mediaPath] = mediaMatch;
-      await sendMedia(mediaType, mediaPath);
-      await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');
+      if (mediaType === 'card') {
+        // A card file is sent as-is: interactive, never degraded to text and
+        // never truncated. Validation failures throw before anything is sent.
+        const result = await sendCard(
+          { ...parsedEndpoint, cardPath: mediaPath },
+          { replyToMessage, sendMessage },
+        );
+        console.log(`[feishu] card sent message_id=${result.messageId} via=${result.via}`);
+        await recordOutgoing(`[sent card] ${result.summary}`);
+      } else {
+        await sendMedia(mediaType, mediaPath);
+        await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');
+      }
     } else {
       await sendText(endpointId, message);
       await recordOutgoing(message);
