@@ -6,6 +6,7 @@
  *   ./send.js <endpoint_id> "message text"
  *   ./send.js <endpoint_id> "[MEDIA:image]/path/to/image.png"
  *   ./send.js <endpoint_id> "[MEDIA:file]/path/to/document.pdf"
+ *   ./send.js <endpoint_id> "[MEDIA:card]/path/to/card.json"
  *
  * Exit codes:
  *   0 - Success
@@ -19,6 +20,7 @@ dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 
 import { getConfig, DATA_DIR } from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
+import { sendCard } from '../src/lib/card-send.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
 
@@ -32,6 +34,7 @@ if (args.length < 2) {
   console.error('Usage: send.js <endpoint_id> <message>');
   console.error('       send.js <endpoint_id> "[MEDIA:image]/path/to/image.png"');
   console.error('       send.js <endpoint_id> "[MEDIA:file]/path/to/file.pdf"');
+  console.error('       send.js <endpoint_id> "[MEDIA:card]/path/to/card.json"');
   process.exit(1);
 }
 
@@ -75,8 +78,15 @@ if (!config.enabled) {
   process.exit(1);
 }
 
-// Parse media prefix
-const mediaMatch = message.match(/^\[MEDIA:(\w+)\](.+)$/);
+// Card directives are recognized on the full prefix BEFORE the generic media
+// regex. The regex needs a non-empty `.+` and cannot match an embedded newline,
+// so `[MEDIA:card]` with a missing path (or a path containing a newline) used to
+// fall through to sendText() and go out as literal text. Every `[MEDIA:card]`
+// input must reach card validation instead, including the empty path.
+const CARD_MEDIA_PREFIX = '[MEDIA:card]';
+const isCardMessage = message.startsWith(CARD_MEDIA_PREFIX);
+const cardPath = isCardMessage ? message.slice(CARD_MEDIA_PREFIX.length) : '';
+const mediaMatch = isCardMessage ? null : message.match(/^\[MEDIA:(\w+)\](.+)$/);
 
 /**
  * Split long message into chunks (markdown-aware).
@@ -426,7 +436,17 @@ async function recordOutgoing(text) {
 
 async function send() {
   try {
-    if (mediaMatch) {
+    if (isCardMessage) {
+      // A card file is sent as-is: interactive, never degraded to text and
+      // never truncated. Validation failures (including an empty path) throw
+      // before anything is sent.
+      const result = await sendCard(
+        { ...parsedEndpoint, cardPath },
+        { replyToMessage, sendMessage },
+      );
+      console.log(`[feishu] card sent message_id=${result.messageId} via=${result.via}`);
+      await recordOutgoing(`[sent card] ${result.summary}`);
+    } else if (mediaMatch) {
       const [, mediaType, mediaPath] = mediaMatch;
       await sendMedia(mediaType, mediaPath);
       await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');

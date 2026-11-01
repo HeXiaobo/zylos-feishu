@@ -210,7 +210,16 @@ node send.js "oc_xxx" "[MEDIA:image]/path/to/photo.jpg"
 
 # Send file
 node send.js "oc_xxx" "[MEDIA:file]/path/to/document.pdf"
+
+# Send a prepared card 2.0 (absolute path, ≤ 30 KB request body)
+node send.js "oc_xxx" "[MEDIA:card]/path/to/card.json"
 ```
+
+`[MEDIA:card]` reads a card 2.0 JSON document (`"schema": "2.0"` and a `body`
+object), sends it as an `interactive` message, and uses the same routing as
+images/files (p2p always sends to the chat; groups reply to the thread/message,
+then fall back to the root, then to the chat). Validation or delivery failures
+exit non-zero instead of degrading to text.
 
 ### 4.4 Message Format Specification
 

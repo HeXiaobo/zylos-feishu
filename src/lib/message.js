@@ -29,6 +29,25 @@ async function getAccessToken() {
 }
 
 /**
+ * Normalize a thrown send error into the result shape callers use.
+ *
+ * Feishu can answer with an HTTP 4xx/5xx whose JSON body still carries the
+ * actionable `{ code, msg }`. The SDK surfaces that as an AxiosError whose own
+ * message is only "Request failed with status code 400", so keep the Feishu
+ * code/msg when present. Errors without a response body keep their original
+ * message.
+ */
+export function sendFailureResult(err) {
+  const data = err?.response?.data;
+  if (data && typeof data === 'object' && (data.code !== undefined || data.msg)) {
+    const result = { success: false, message: data.msg || err.message };
+    if (data.code !== undefined) result.code = data.code;
+    return result;
+  }
+  return { success: false, message: err?.message };
+}
+
+/**
  * Send message to a chat (group or individual)
  */
 export async function sendMessage(receiveId, content, receiveIdType = 'chat_id', msgType = 'text') {
@@ -75,7 +94,7 @@ export async function sendMessage(receiveId, content, receiveIdType = 'chat_id',
       };
     }
   } catch (err) {
-    return { success: false, message: err.message };
+    return sendFailureResult(err);
   }
 }
 
@@ -116,7 +135,7 @@ export async function replyToMessage(messageId, content, msgType = 'text') {
       };
     }
   } catch (err) {
-    return { success: false, message: err.message };
+    return sendFailureResult(err);
   }
 }
 

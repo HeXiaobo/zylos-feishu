@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`[MEDIA:card]` sends a prepared Feishu card 2.0 file through C4.**
+  `scripts/send.js` now accepts `[MEDIA:card]<absolute path>`, the third media
+  type beside image and file, so an agent that generated a card JSON document
+  can send it without turning it into a file attachment. The reader
+  (`src/lib/card-send.js`) requires an absolute path to a regular file, valid
+  JSON whose top level is an object, `"schema": "2.0"`, and a `body` object;
+  templates and old 1.0 cards are rejected.
+  - The 30 KB Feishu request-body limit is enforced on the exact payload being
+    sent (`{receive_id, msg_type, content}` for a new message,
+    `{msg_type, content}` for a reply), counted in UTF-8 bytes, so CJK text is
+    measured at 3 bytes per character. Oversize is
+    `ERR_CARD_TOO_LARGE: <bytes>/<limit>`.
+  - Routing reuses `chooseReplyTarget` and the image/file fallback chain
+    (reply target → thread root when parent ≠ root → direct chat send). Every
+    attempt is still an `interactive` card; failures report
+    `ERR_CARD_SEND: <code> <msg>` and exit 1. The card path never degrades to
+    text, never truncates, and is not affected by `useMarkdownCard`.
+  - Success prints `[feishu] card sent message_id=<om_…> via=<reply|reply-root|send>`
+    and records `[sent card] <summary>` (summary from `config.summary.content`,
+    else the header title, else `card`).
+  - The `[MEDIA:card]` prefix is recognized before the generic media regex and
+    before the text branch, so a missing or empty path fails with
+    `ERR_CARD_PATH` and a path containing a newline is read as a path; neither
+    can fall back to sending the directive as literal text.
+  - Send wrappers keep Feishu's `code`/`msg` from an HTTP error response, so a
+    rejected card reports `ERR_CARD_SEND: 230099 <msg>` instead of only
+    `Request failed with status code 400`.
+
 ### Changed
 - **Message dedupe is now shared across processes.** `isDuplicate()` also asks a
   claim store loaded from `~/zylos/lib/3ai/feishu-claim.mjs` (the 3ai image's
