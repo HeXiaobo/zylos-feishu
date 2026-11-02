@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Without the module the component keeps the in-memory Map and logs why, so a
   plain `zylos add` install behaves exactly as before.
 
+### Fixed
+- **Image / file / audio / media markers inside a 合并转发 now cite the outer
+  forward message id, so an agent can actually download them.** Markers for a
+  forward's children used each child's own `message_id`; with that id Feishu
+  rejects the download (HTTP 400「图片与消息不匹配」), while the same
+  `image_key` downloads successfully with the id of the forward message the bot
+  received (~42 KB, verified on a live tenant). The same rule is applied to
+  file / audio / media markers — 〔未验证〕 for those three, only an image was
+  measured. `parseMessageItemText` now lives
+  in `src/lib/message-item-text.js` and takes the id that resource markers must
+  cite; `renderMergeForward` threads the OUTERMOST id down through every
+  nesting level (nested levels extrapolated from the measured single-level
+  case). Images embedded in a forwarded `post` carry it too. Standalone
+  messages and quoted messages are unchanged — they still cite their own id.
+  This supersedes the 0.3.5 note that forward resources were not downloadable
+  at all: that conclusion came from a measurement that used the wrong id.
+
 ## [0.3.6] - 2026-08-10
 
 ### Fixed

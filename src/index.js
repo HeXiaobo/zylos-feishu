@@ -34,6 +34,9 @@ import { loadClaimStore } from './lib/dedupe-claim-loader.js';
 // 3ai-recovery: body parsing and DM rules live in lib/ so the recovery poller
 // applies the same ones instead of keeping its own copies.
 import { extractPostText, resolveMentions } from './lib/message-text.js';
+// 3ai-forward-media: display text for im.message.get items lives in lib/ so the
+// merge-forward resource-id rule is unit-testable (see the module's docblock).
+import { parseMessageItemText } from './lib/message-item-text.js';
 import { isDmAllowed as isDmAllowedByConfig, isOwner as isOwnerByConfig } from './lib/dm-policy.js';
 
 // C4 receive interface path
@@ -838,56 +841,6 @@ function buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId
 const MESSAGE_GET_PARAMS = { user_id_type: 'open_id', card_msg_content_type: 'user_card_content' };
 
 /**
- * Parse the msg_type/body.content of a single Feishu message item (as returned
- * by `im.message.get`) into display text, resolving mentions if present.
- *
- * NOTE on resource keys: image/file/audio keys are rendered as inert text
- * markers only. For merge-forward children they are NOT downloadable at all —
- * Feishu returns error 234043 for the wrapper's id, a child's id, or a card
- * message id (「获取消息中的资源文件」§使用限制) — so they must never be fed
- * into the normal download path.
- */
-function parseMessageItemText(msg, fallbackMessageId) {
-  const messageId = msg.message_id || fallbackMessageId;
-  // body.content is not guaranteed to be JSON for every msg_type — a nested
-  // forward-of-a-forward can come back as a bare "Merged and Forwarded
-  // Message" string rather than a JSON payload.
-  let content;
-  try {
-    content = JSON.parse(msg.body?.content || '{}');
-  } catch {
-    content = {};
-  }
-  let text;
-  if (msg.msg_type === 'text') {
-    text = content.text || '';
-  } else if (msg.msg_type === 'post') {
-    ({ text } = extractPostText(content.content || [], messageId));
-    if (content.title) text = `[${content.title}] ${text}`;
-  } else if (msg.msg_type === 'interactive') {
-    text = extractInteractiveText(content);
-  } else if (msg.msg_type === 'file') {
-    text = `[file: ${content.file_name || 'unknown'}, file_key: ${content.file_key}, msg_id: ${messageId}]`;
-  } else if (msg.msg_type === 'image') {
-    text = `[image, image_key: ${content.image_key}, msg_id: ${messageId}]`;
-  } else if (msg.msg_type === 'audio') {
-    text = `[audio, file_key: ${content.file_key}, msg_id: ${messageId}]`;
-  } else if (msg.msg_type === 'media') {
-    text = `[media: ${content.file_name || 'video'}, file_key: ${content.file_key}, msg_id: ${messageId}]`;
-  } else if (msg.msg_type === 'sticker') {
-    text = `[sticker, file_key: ${content.file_key || 'unknown'}]`;
-  } else if (msg.msg_type === 'merge_forward') {
-    text = '[nested merge_forward message]';
-  } else {
-    text = `[${msg.msg_type} message]`;
-  }
-  if (msg.mentions && msg.mentions.length > 0) {
-    text = resolveMentions(text, msg.mentions);
-  }
-  return text;
-}
-
-/**
  * Fetch content of a quoted/replied message (best-effort).
  * Returns { sender, text } with resolved sender name.
  */
@@ -939,7 +892,13 @@ async function fetchMergeForwardContent(messageId) {
     return await renderMergeForward({
       items: await fetchMessageItems(messageId),
       rootId: messageId,
-      parseItemText: (item) => parseMessageItemText(item, item.message_id),
+      // Resource markers inside a forward must cite the id of the forward
+      // message the bot received, not the child's own id — with the child id
+      // Feishu rejects the download (400「图片与消息不匹配」); the outer id
+      // downloads the same key. renderMergeForward threads that id down through
+      // every nesting level.
+      parseItemText: (item, outerId) =>
+        parseMessageItemText(item, item.message_id, { resourceMessageId: outerId }),
       resolveSenderName: (item) => resolveUserName(null, item.sender?.id),
       fetchItems: fetchMessageItems,
       log: (msg) => console.log(`[feishu] ${msg}`),

@@ -7,6 +7,7 @@ import {
   itemsFromResponse,
   MAX_MERGE_FORWARD_FETCHES,
 } from '../src/lib/merge-forward.js';
+import { parseMessageItemText } from '../src/lib/message-item-text.js';
 
 const ROOT = 'om_root';
 
@@ -243,4 +244,132 @@ test('groupByUpperMessageId excludes the wrapper and keeps child order', () => {
   assert.deepEqual(byUpper.get(ROOT).map((i) => i.message_id), ['om_1', 'om_3']);
   assert.deepEqual(byUpper.get('om_inner').map((i) => i.message_id), ['om_2']);
   assert.equal(byUpper.has(ROOT) && byUpper.get(ROOT).some((i) => i.message_id === ROOT), false);
+});
+
+// --- Resource markers inside forwards -------------------------------------
+//
+// Measured on a live tenant: an image inside a 合并转发 downloads with the id
+// of the OUTER forward message the bot received, and fails (400「图片与消息不匹配」)
+// with the child message id. The tests below use the real parser so they assert
+// the rendered marker text, not just that an id was passed through.
+
+const imageItem = (id, upper, key) => ({
+  message_id: id,
+  upper_message_id: upper,
+  msg_type: 'image',
+  sender: { id: 'ou_img' },
+  body: { content: JSON.stringify({ image_key: key }) },
+});
+const fileItem = (id, upper, key, name) => ({
+  message_id: id,
+  upper_message_id: upper,
+  msg_type: 'file',
+  sender: { id: 'ou_file' },
+  body: { content: JSON.stringify({ file_key: key, file_name: name }) },
+});
+const audioItem = (id, upper, key) => ({
+  message_id: id,
+  upper_message_id: upper,
+  msg_type: 'audio',
+  sender: { id: 'ou_audio' },
+  body: { content: JSON.stringify({ file_key: key }) },
+});
+const mediaItem = (id, upper, key, name) => ({
+  message_id: id,
+  upper_message_id: upper,
+  msg_type: 'media',
+  sender: { id: 'ou_media' },
+  body: { content: JSON.stringify({ file_key: key, file_name: name }) },
+});
+const postItem = (id, upper, key) => ({
+  message_id: id,
+  upper_message_id: upper,
+  msg_type: 'post',
+  sender: { id: 'ou_post' },
+  body: { content: JSON.stringify({ content: [[{ tag: 'img', image_key: key }]] }) },
+});
+// Mirrors index.js's fetchMergeForwardContent wiring.
+const realParseItemText = (item, outerId) =>
+  parseMessageItemText(item, item.message_id, { resourceMessageId: outerId });
+
+test('flat forward: resource markers cite the outer forward id, never the child id', async () => {
+  const items = [
+    forwardItem(ROOT, undefined, 'ou_s'),
+    imageItem('om_child_img', ROOT, 'img_fake_a'),
+    fileItem('om_child_file', ROOT, 'file_fake_a', 'notes.txt'),
+    audioItem('om_child_audio', ROOT, 'file_fake_b'),
+    mediaItem('om_child_media', ROOT, 'file_fake_c', 'clip.mp4'),
+    postItem('om_child_post', ROOT, 'img_fake_b'),
+  ];
+  const out = await renderMergeForward({
+    items, rootId: ROOT, parseItemText: realParseItemText, resolveSenderName, fetchItems: noFetch,
+  });
+  for (const marker of [
+    `[image, image_key: img_fake_a, msg_id: ${ROOT}]`,
+    `[file: notes.txt, file_key: file_fake_a, msg_id: ${ROOT}]`,
+    `[audio, file_key: file_fake_b, msg_id: ${ROOT}]`,
+    `[media: clip.mp4, file_key: file_fake_c, msg_id: ${ROOT}]`,
+    `[image, image_key: img_fake_b, msg_id: ${ROOT}]`, // image inside a forwarded post
+  ]) {
+    assert.ok(out.includes(marker), `expected marker ${marker} in:\n${out}`);
+  }
+  for (const childId of ['om_child_img', 'om_child_file', 'om_child_audio', 'om_child_media', 'om_child_post']) {
+    assert.ok(!out.includes(`msg_id: ${childId}`), `child id ${childId} must not be cited`);
+  }
+});
+
+test('nested forward (flattened): resource markers still cite the outermost id', async () => {
+  const items = [
+    forwardItem(ROOT, undefined, 'ou_s'),
+    forwardItem('om_inner_fake', ROOT, 'ou_b'),
+    imageItem('om_deep_img', 'om_inner_fake', 'img_fake_c'),
+    fileItem('om_deep_file', 'om_inner_fake', 'file_fake_d', 'inner.pdf'),
+  ];
+  const out = await renderMergeForward({
+    items, rootId: ROOT, parseItemText: realParseItemText, resolveSenderName, fetchItems: noFetch,
+  });
+  assert.match(out, new RegExp(`\\[image, image_key: img_fake_c, msg_id: ${ROOT}\\]`));
+  assert.match(out, new RegExp(`\\[file: inner\\.pdf, file_key: file_fake_d, msg_id: ${ROOT}\\]`));
+  assert.ok(!out.includes('msg_id: om_inner_fake'), 'inner forward id must not be cited');
+  assert.ok(!out.includes('msg_id: om_deep_img'), 'nested child id must not be cited');
+});
+
+test('nested forward (separately fetched): resource markers still cite the outermost id', async () => {
+  const items = [
+    forwardItem(ROOT, undefined, 'ou_s'),
+    forwardItem('om_inner_fake', ROOT, 'ou_b'),
+  ];
+  const fetchItems = async (id) => {
+    assert.equal(id, 'om_inner_fake');
+    return [
+      forwardItem('om_inner_fake', undefined, 'ou_b'),
+      imageItem('om_deep_img', 'om_inner_fake', 'img_fake_e'),
+    ];
+  };
+  const out = await renderMergeForward({
+    items, rootId: ROOT, parseItemText: realParseItemText, resolveSenderName, fetchItems,
+  });
+  assert.match(out, new RegExp(`\\[image, image_key: img_fake_e, msg_id: ${ROOT}\\]`));
+  assert.ok(!out.includes('msg_id: om_deep_img'));
+  assert.ok(!out.includes('msg_id: om_inner_fake'));
+});
+
+test('standalone and quoted messages keep citing their own id', () => {
+  // Standalone: no resourceMessageId is passed anywhere on that path.
+  const standalone = imageItem('om_solo_fake', undefined, 'img_fake_f');
+  assert.equal(
+    parseMessageItemText(standalone, 'om_solo_fake'),
+    '[image, image_key: img_fake_f, msg_id: om_solo_fake]',
+  );
+  // Quoted: index.js's fetchQuotedMessage passes the quoted message's own id.
+  const quotedFile = fileItem('om_quoted_fake', undefined, 'file_fake_g', 'q.txt');
+  assert.equal(
+    parseMessageItemText(quotedFile, 'om_quoted_fake'),
+    '[file: q.txt, file_key: file_fake_g, msg_id: om_quoted_fake]',
+  );
+  // A post image outside a forward likewise keeps its own id.
+  assert.equal(
+    parseMessageItemText(postItem('om_solo_post', undefined, 'img_fake_g'), 'om_solo_post'),
+    '[image, image_key: img_fake_g, msg_id: om_solo_post]',
+  );
 });

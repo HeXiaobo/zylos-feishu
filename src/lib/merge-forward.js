@@ -77,18 +77,24 @@ export function groupByUpperMessageId(items, rootId) {
  *
  * @param {object} opts
  * @param {string} opts.parentId forward whose children are being rendered
+ * @param {string} opts.outerId message_id of the forward the bot received
+ *   (the top-level root), cited by resource markers at EVERY depth: Feishu
+ *   accepts that id for a child's image/file key and rejects the child's own id
+ *   (400「图片与消息不匹配」). Nested levels reuse it — measured on one level,
+ *   extrapolated to deeper ones (see lib/message-item-text.js).
  * @param {Map<string, Array<object>>} opts.byUpper grouping for this payload
  * @param {string[]} opts.lines output accumulator
  * @param {number} opts.depth current nesting depth (1 = top level)
  * @param {string} opts.indent prefix for this level
  * @param {{fetches: number}} opts.budget shared nested-fetch counter
- * @param {(msg: object) => string} opts.parseItemText renders one item's text
+ * @param {(msg: object, outerId: string) => string} opts.parseItemText renders
+ *   one item's text; `outerId` is the id resource markers must cite
  * @param {(msg: object) => Promise<string>} opts.resolveSenderName sender name
  * @param {(messageId: string) => Promise<Array<object>>} opts.fetchItems nested fetch
  * @param {(message: string) => void} [opts.log] diagnostic sink
  */
 export async function renderForwardLevel({
-  parentId, byUpper, lines, depth, indent, budget,
+  parentId, outerId = parentId, byUpper, lines, depth, indent, budget,
   parseItemText, resolveSenderName, fetchItems, log = () => {},
 }) {
   const children = byUpper.get(parentId) || [];
@@ -97,7 +103,7 @@ export async function renderForwardLevel({
     // A child's text can be multi-line (a forwarded card commonly is). Indent
     // the continuation lines to this child's level too, otherwise they land at
     // column 0 and read as separate top-level entries in a nested forward.
-    const body = String(parseItemText(item) ?? '').replace(/\n/g, `\n${indent}  `);
+    const body = String(parseItemText(item, outerId) ?? '').replace(/\n/g, `\n${indent}  `);
     lines.push(`${indent}${senderName}: ${body}`);
 
     if (item.msg_type !== 'merge_forward') continue;
@@ -108,7 +114,7 @@ export async function renderForwardLevel({
     if (byUpper.has(item.message_id)) {
       // Flattened: this inner forward's children are already in the payload.
       await renderForwardLevel({
-        parentId: item.message_id, byUpper, lines, depth: depth + 1,
+        parentId: item.message_id, outerId, byUpper, lines, depth: depth + 1,
         indent: `${indent}  `, budget, parseItemText, resolveSenderName, fetchItems, log,
       });
       continue;
@@ -122,7 +128,7 @@ export async function renderForwardLevel({
     try {
       const nested = await fetchItems(item.message_id);
       await renderForwardLevel({
-        parentId: item.message_id,
+        parentId: item.message_id, outerId,
         byUpper: groupByUpperMessageId(nested, item.message_id),
         lines, depth: depth + 1, indent: `${indent}  `, budget,
         parseItemText, resolveSenderName, fetchItems, log,
@@ -148,7 +154,10 @@ export async function renderMergeForward({
 
   const lines = [];
   await renderForwardLevel({
-    parentId: rootId, byUpper, lines, depth: 1, indent: '', budget: { fetches: 0 },
+    parentId: rootId,
+    // The bot received rootId; child resource keys download only with it.
+    outerId: rootId,
+    byUpper, lines, depth: 1, indent: '', budget: { fetches: 0 },
     parseItemText, resolveSenderName, fetchItems, log,
   });
   if (lines.length === 0) return '[merge_forward message, no child messages]';
