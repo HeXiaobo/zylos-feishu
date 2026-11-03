@@ -6,6 +6,7 @@
  *   ./send.js <endpoint_id> "message text"
  *   ./send.js <endpoint_id> "[MEDIA:image]/path/to/image.png"
  *   ./send.js <endpoint_id> "[MEDIA:file]/path/to/document.pdf"
+ *   ./send.js <endpoint_id> "[MEDIA:card]/path/to/card.json"
  *
  * Exit codes:
  *   0 - Success
@@ -56,6 +57,7 @@ if (args.length < 2) {
   console.error('Usage: send.js <endpoint_id> <message>');
   console.error('       send.js <endpoint_id> "[MEDIA:image]/path/to/image.png"');
   console.error('       send.js <endpoint_id> "[MEDIA:file]/path/to/file.pdf"');
+  console.error('       send.js <endpoint_id> "[MEDIA:card]/path/to/card.json"');
   process.exit(1);
 }
 
@@ -308,7 +310,7 @@ async function sendPlainTextChunk(endpoint, chunk, isFirstChunk) {
 }
 
 /**
- * Send media (image or file).
+ * Send media (image, file, or a Card 2.0 JSON file).
  * Thread-aware: in topic threads, reply to parent||root to stay in topic.
  */
 async function sendMedia(type, filePath) {
@@ -317,7 +319,37 @@ async function sendMedia(type, filePath) {
   // p2p DMs never reply-to (invisible in the 1:1 view); only groups reply.
   const replyTarget = chooseReplyTarget(parsedEndpoint);
 
-  if (type === 'image') {
+  if (type === 'card') {
+    const cardJson = fs.readFileSync(trimmedPath, 'utf8');
+    let card;
+    try {
+      card = JSON.parse(cardJson);
+    } catch {
+      throw new Error('Invalid card JSON file');
+    }
+    if (!card || typeof card !== 'object' || Array.isArray(card) ||
+        card.schema !== '2.0' || !Array.isArray(card.body?.elements)) {
+      throw new Error('Expected a Feishu Card 2.0 JSON file');
+    }
+    const content = JSON.stringify(card);
+    if (replyTarget) {
+      const targets = [replyTarget];
+      if (parent && root && parent !== root) targets.push(root);
+      for (const target of targets) {
+        try {
+          const result = await replyToMessage(target, content, 'interactive');
+          if (result.success) return;
+          console.log('[feishu] Card reply failed, falling back:', result.message);
+        } catch (err) {
+          console.log('[feishu] Card reply threw, falling back:', err.message);
+        }
+      }
+    }
+    const sendResult = await sendMessage(chatId, content, 'chat_id', 'interactive');
+    if (!sendResult.success) {
+      throw new Error(`Failed to send card: ${sendResult.message}`);
+    }
+  } else if (type === 'image') {
     const uploadResult = await uploadImage(trimmedPath);
     if (!uploadResult.success) {
       throw new Error(`Failed to upload image: ${uploadResult.message}`);
@@ -514,7 +546,7 @@ async function send() {
       } else if (mediaMatch) {
         const [, mediaType, mediaPath] = mediaMatch;
         await sendMedia(mediaType, mediaPath);
-        await recordOutgoing(mediaType === 'image' ? '[sent image]' : '[sent file]');
+        await recordOutgoing(mediaType === 'card' ? '[sent card]' : mediaType === 'image' ? '[sent image]' : '[sent file]');
       } else {
         await sendText(endpointId, message);
         await recordOutgoing(message);
