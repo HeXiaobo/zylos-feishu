@@ -16,9 +16,9 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { requireMinCoreVersion } from './post-install-shared.js';
-import { installLarkCliTools, toolsEnabled } from './post-install-tools.js';
+import { installLarkCliTools } from './post-install-tools.js';
 
-if (toolsEnabled()) requireMinCoreVersion();
+requireMinCoreVersion();
 
 const __filename_hook = fileURLToPath(import.meta.url);
 const __dirname_hook = path.dirname(__filename_hook);
