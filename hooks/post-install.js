@@ -17,12 +17,8 @@ import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 import { fileURLToPath } from 'url';
-import {
-  requireMinCoreVersion,
-  installLarkCliBinary,
-  installLarkCliSkills,
-  syncCredentialsToLarkCli,
-} from './post-install-shared.js';
+import { requireMinCoreVersion } from './post-install-shared.js';
+import { installLarkCliTools, toolsEnabled } from './post-install-tools.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -125,13 +121,13 @@ if (isInteractive) {
   console.log(`\n  Connection mode set to: ${mode}`);
 }
 
-// 5. lark-cli integration (idempotent — safe to re-run on reinstall)
-requireMinCoreVersion();
+// 5. lark-cli integration (business tools; idempotent — safe to re-run).
+//    A messaging-only deployment sets ZYLOS_FEISHU_TOOLS=off and this whole
+//    block becomes a no-op (issue #132). Unset keeps the old behaviour.
 console.log('\nIntegrating lark-cli...');
 try {
-  installLarkCliBinary();
-  installLarkCliSkills(SKILL_DIR);
-  syncCredentialsToLarkCli();
+  if (toolsEnabled()) requireMinCoreVersion();
+  installLarkCliTools({ skillDir: SKILL_DIR });
 } catch (err) {
   console.error('lark-cli integration failed:', err.message);
   process.exit(1);
