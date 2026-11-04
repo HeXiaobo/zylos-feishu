@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `Request failed with status code 400`.
 
 ### Changed
+- **Feishu business tools install independently of the messaging component.**
+  `hooks/post-install-tools.js` now owns `installLarkCliBinary()`,
+  `installLarkCliSkills()` and `syncCredentialsToLarkCli()`, and adds
+  `installLarkCliTools()` plus `toolsEnabled()`.
+  `post-install.js` and `post-upgrade.js` call `installLarkCliTools()`, which
+  runs nothing when `ZYLOS_FEISHU_TOOLS` is `off` / `0` / `false` / `no` /
+  `none` / `disabled`. Unset keeps the previous behaviour, so an old entry
+  point (direct `zylos add`, `zylos upgrade feishu`, an older deployment)
+  installs exactly what it installed before. `post-install-shared.js`
+  re-exports the five functions, so old imports keep working.
+  A messaging-only deployment no longer installs `@larksuite/cli` or the
+  `lark-*` skills; the channel component itself is unchanged.
+  (zylos-core issue #132)
 - **Message dedupe is now shared across processes.** `isDuplicate()` also asks a
   claim store loaded from `~/zylos/lib/3ai/feishu-claim.mjs` (the 3ai image's
   `docker/3ai/lib/feishu-claim.mjs`). The WebSocket path and the

@@ -15,12 +15,8 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import {
-  requireMinCoreVersion,
-  installLarkCliBinary,
-  installLarkCliSkills,
-  syncCredentialsToLarkCli,
-} from './post-install-shared.js';
+import { requireMinCoreVersion } from './post-install-shared.js';
+import { installLarkCliTools } from './post-install-tools.js';
 
 requireMinCoreVersion();
 
@@ -326,17 +322,17 @@ if (fs.existsSync(configPath)) {
 // lark-cli integration migration
 //
 // Legacy zylos-feishu installs (pre-bundle) have only .env credentials and
-// no lark-cli on PATH / no references/. This block brings them in line
-// with the current install layout. All three steps are idempotent:
+// no lark-cli on PATH / no references/. This block brings them in line with
+// the current install layout. It is one call now: installLarkCliTools() runs
+// the three idempotent steps below, or nothing when the deployment did not
+// select the business tools (ZYLOS_FEISHU_TOOLS=off, issue #132).
 //   - installLarkCliBinary:    no-op when `lark-cli` is already at target version
 //   - installLarkCliSkills:    no-op when all sub-skills present at target version
 //   - syncCredentialsToLarkCli: overwrites keychain every run, so secret
 //                                rotations propagate after `zylos upgrade feishu`
 console.log('\nEnsuring lark-cli integration is in place...');
 try {
-  installLarkCliBinary();
-  installLarkCliSkills(SKILL_DIR);
-  syncCredentialsToLarkCli();
+  installLarkCliTools({ skillDir: SKILL_DIR });
 } catch (err) {
   console.error('lark-cli integration migration failed:', err.message);
   process.exit(1);
