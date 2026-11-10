@@ -1312,7 +1312,7 @@ async function sendToC4(
   endpoint,
   content,
   onReject,
-  { taskEnvelope, workIntakeEnvelope, assistantRequest, priority, onSuccess } = {},
+  { taskEnvelope, workIntakeEnvelope, assistantRequest, priority, onSuccess, silentStatus = false } = {},
 ) {
   if (!content) {
     throw new TypeError('sendToC4 content must be non-empty');
@@ -1324,10 +1324,15 @@ async function sendToC4(
     endpoint,
     content,
     priority,
+    silentStatus,
     taskEnvelope,
     assistantRequest,
     workIntakeEnvelope,
   });
+
+  const notifyRejected = async () => {
+    if (!silentStatus && onReject) await onReject('暂时无法处理消息，请稍后重试。');
+  };
 
   const runOnce = () => new Promise((resolve, reject) => {
     execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
@@ -1349,7 +1354,7 @@ async function sendToC4(
   } catch (firstError) {
     if (!firstError.retryable) {
       console.warn(`[feishu] C4 rejected (${firstError.code}): ${firstError.message}`);
-      if (onReject) await onReject(firstError.message);
+      await notifyRejected();
       throw firstError;
     }
     console.warn(`[feishu] C4 send failed, retrying in 2s: ${firstError.message}`);
@@ -1358,7 +1363,7 @@ async function sendToC4(
       delivered = await runOnce();
     } catch (retryError) {
       console.error(`[feishu] C4 send failed after retry (${retryError.code}): ${retryError.message}`);
-      if (onReject) await onReject(retryError.message);
+      await notifyRejected();
       throw retryError;
     }
   }
@@ -1371,7 +1376,7 @@ async function sendToC4(
     const failure = new Error('assistant response stream was not accepted');
     failure.code = 'ASSISTANT_RESPONSE_NOT_ACCEPTED';
     failure.retryable = true;
-    if (onReject) await onReject(failure.message);
+    await notifyRejected();
     throw failure;
   }
   if (onSuccess) await onSuccess(response);
@@ -2667,7 +2672,7 @@ async function handleMessage(data, metadata = {}) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('group', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, contextMessages, mediaPaths[0], { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        await sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined, silentStatus: !groupActivation.showImmediateResponse });
       } else {
         await groupRejectReply();
       }
@@ -2688,7 +2693,7 @@ async function handleMessage(data, metadata = {}) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('group', senderName, `[file: ${fileName}]${cleanText ? ' ' + cleanText : ''}`, contextMessages, localPath, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        await sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined });
+        await sendToC4('feishu', endpoint, msg, groupRejectReply, { assistantRequest: assistantRequest || undefined, silentStatus: !groupActivation.showImmediateResponse });
       } else {
         await groupRejectReply();
       }
@@ -2717,6 +2722,7 @@ async function handleMessage(data, metadata = {}) {
       assistantRequest = await openConversationResponse({ chatId, chatType, messageId, rootId, parentId });
     }
     await sendToC4('feishu', endpoint, msg, groupRejectReply, {
+      silentStatus: !groupActivation.showImmediateResponse,
       taskEnvelope: taskRoute?.kind === 'task-intent'
         ? taskRoute.taskEnvelope
         : undefined,

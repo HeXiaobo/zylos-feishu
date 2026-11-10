@@ -25,7 +25,7 @@ test('every p2p sendToC4 call site passes the admission priority; group call sit
     'the work-intake p2p call site must pass priority',
   );
 
-  const groupSites = indexSource.match(/groupRejectReply, \{ assistantRequest: assistantRequest \|\| undefined \}\);/g) ?? [];
+  const groupSites = indexSource.match(/groupRejectReply, \{[^}\n]+\}\);/g) ?? [];
   assert.ok(groupSites.length >= 2, 'group call sites must stay on the default priority');
   for (const site of groupSites) {
     assert.equal(site.includes('priority'), false, 'group call sites must not pass priority');
@@ -36,6 +36,6 @@ test('sendToC4 forwards priority to buildC4ReceiveArgs', () => {
   const signatureStart = indexSource.indexOf('async function sendToC4(');
   assert.notEqual(signatureStart, -1);
   const body = indexSource.slice(signatureStart, indexSource.indexOf('\nfunction ', signatureStart));
-  assert.match(body, /\{ taskEnvelope, workIntakeEnvelope, assistantRequest, priority, onSuccess \} = \{\}/);
+  assert.match(body, /\{ taskEnvelope, workIntakeEnvelope, assistantRequest, priority, onSuccess, silentStatus = false \} = \{\}/);
   assert.match(body, /buildC4ReceiveArgs\(\{[\s\S]*?priority,[\s\S]*?\}\);/);
 });

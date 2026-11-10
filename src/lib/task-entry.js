@@ -124,6 +124,7 @@ export function buildC4ReceiveArgs({
   endpoint,
   content,
   priority,
+  silentStatus = false,
   taskEnvelope,
   assistantRequest,
   workIntakeEnvelope,
@@ -139,6 +140,7 @@ export function buildC4ReceiveArgs({
     '--endpoint', endpoint,
     '--json',
   ];
+  if (silentStatus) args.push('--silent-status');
   if (priority !== undefined) {
     if (!Number.isInteger(priority) || priority < 1 || priority > 3) {
       throw new TypeError('priority must be an integer 1, 2, or 3');
