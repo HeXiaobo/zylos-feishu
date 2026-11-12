@@ -72,7 +72,16 @@ zylos uninstall feishu
 | Smart group message | Receives all messages |
 | @mention in allowed group | Responds with recent context |
 | Owner @mention in any group | Always responds |
-| Unknown user | Ignored |
+| Allowed tenant / cross-tenant teammate | Responds like a group member |
+| Unknown user | Ignored silently (`groupRejectMode: "silent"`) |
+
+Group sender policy can admit a whole Feishu tenant (`groupAllowTenants`, with a
+per-group `allowTenants` override) and individual cross-tenant teammates
+(`internalCrossTenantUsers`). A denied sender is ignored silently by default;
+`groupRejectMode: "reply"` answers once with `groupRejectText` and only on an
+explicit bot @mention. With none of these fields set, the previous `allowFrom`
+behavior is unchanged. All names live in `config.json`; no tenant or user is
+hardcoded.
 
 ## Documentation
 

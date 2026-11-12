@@ -70,7 +70,15 @@ zylos uninstall feishu
 | 智能群组消息 | 接收所有消息 |
 | 在允许的群里 @机器人 | 带上下文回复 |
 | 管理员在任意群 @机器人 | 始终回复 |
-| 未知用户 | 忽略 |
+| 放行租户 / 跨租户同事 | 按群成员处理 |
+| 未知用户 | 默认静默忽略（`groupRejectMode: "silent"`） |
+
+群发送者策略支持按租户放行：`groupAllowTenants` 放行整个飞书租户，群的
+`allowTenants` 覆盖全局名单，`internalCrossTenantUsers` 单独放行跨租户同事
+（open_id/user_id）。被拒绝的发送者默认静默忽略；设为
+`groupRejectMode: "reply"` 时，只在被精确 @机器人 时用 `groupRejectText`
+回复一次。以上字段都不配置时，群聊行为与旧版本一致。所有名单只写在
+`config.json`，代码里不写死任何租户或人员。
 
 ## 文档
 

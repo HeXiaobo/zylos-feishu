@@ -6,7 +6,7 @@ description: >-
   Use when: (1) replying to Feishu messages (DM or group @mentions),
   (2) sending proactive messages or media (images, files) to Feishu users or groups,
   (3) managing DM access control (dmPolicy: open/allowlist/owner, dmAllowFrom list),
-  (4) managing group access control (groupPolicy, per-group allowFrom, smart/mention modes),
+  (4) managing group access control (groupPolicy, per-group allowFrom, tenant allowlist, smart/mention modes),
   (5) operating Feishu productivity surfaces via the bundled lark-cli — documents, sheets, slides,
   multidim Base, calendar, tasks, mail, drive, wiki, OKR, approval, attendance,
   video conferencing, minutes, Miaoda/Spark apps, native OpenAPI explorer
@@ -238,6 +238,11 @@ $ADM add-group <chat_id> <name> [mode]        # Add group (mode: mention|smart)
 $ADM remove-group <chat_id>                   # Remove a group
 $ADM set-group-policy <disabled|allowlist|open>  # Set group policy
 $ADM set-group-allowfrom <chat_id> <id1,id2>  # Set per-group allowed senders
+$ADM set-group-tenants <tenant_key1,tenant_key2>  # Set global sender tenant allowlist ("none" clears)
+$ADM set-group-allow-tenants <chat_id> <keys>  # Set per-group tenant allowlist (overrides global)
+$ADM add-cross-tenant-user <id1,id2>          # Add teammates allowed in every group
+$ADM remove-cross-tenant-user <id1,id2>       # Remove teammates from that list
+$ADM set-group-reject-mode <silent|reply> [text]  # How denied group senders are handled
 $ADM set-group-history-limit <chat_id> <n>    # Set per-group context message limit
 $ADM migrate-groups                           # Migrate legacy group config to new format
 
@@ -376,6 +381,10 @@ DM and group access are controlled by **independent** top-level policies:
   "dmPolicy": "owner",        // "open" | "allowlist" | "owner"
   "dmAllowFrom": ["ou_xxx"],  // used when dmPolicy = "allowlist"
   "groupPolicy": "allowlist", // "open" | "allowlist" | "disabled"
+  "groupAllowTenants": ["<tenant_key_a>", "<tenant_key_b>"],
+  "internalCrossTenantUsers": ["ou_teammate"],
+  "groupRejectMode": "silent",   // "silent" (default) | "reply"
+  "groupRejectText": "",        // used when groupRejectMode = "reply"
   "groups": { ... }           // per-group config (used when groupPolicy = "allowlist")
 }
 ```
@@ -391,14 +400,25 @@ DM and group access are controlled by **independent** top-level policies:
 2. `groupPolicy` = `open`? → respond to @mentions from any group
 3. `groupPolicy` = `allowlist`? → only configured groups; unlisted groups → only owner passes, others dropped silently
 4. Per-group `allowFrom` set? → only listed senders pass (owner always bypasses)
-5. Smart group (mode: `smart`)? → receive all messages, no @mention needed
-6. Not smart? → only @mentions are processed, other messages are logged only
+5. Sender in global or group `internalCrossTenantUsers`? → pass
+6. Sender `tenant_key` in group `allowTenants` (or, when the group sets none, in global `groupAllowTenants`)? → pass
+7. None of `allowFrom`, `internalCrossTenantUsers`, and the applicable tenant list configured? → every member passes (legacy behavior)
+8. Otherwise denied: `groupRejectMode: "silent"` (default) logs only; `"reply"` answers once with `groupRejectText` and only when the bot was explicitly @mentioned
+9. Smart group (mode: `smart`)? → receive all messages, no @mention needed
+10. Not smart? → only @mentions are processed, other messages are logged only
+
+A per-group `allowTenants` **replaces** the global `groupAllowTenants` for that chat.
+`internalCrossTenantUsers` is additive: the global list plus the group list. An
+explicit group `allowFrom` stays authoritative; when it denies a sender, a tenant
+or cross-tenant grant does not apply. An empty `tenantKey` never satisfies the
+tenant allowlist.
 
 **Key points:**
 - Owner always bypasses all access checks
 - `dmPolicy` and `groupPolicy` are fully independent — changing one never affects the other
-- Group access is controlled by `groupPolicy` + `groups` config + per-group `allowFrom`
-- No user-level whitelist for groups; use per-group `allowFrom` if you need to restrict specific senders
+- Group access is controlled by `groupPolicy` + `groups` config + per-group `allowFrom` + the optional sender tenant/cross-tenant lists
+- No per-user group whitelist outside config; use per-group `allowFrom` (specific senders), `internalCrossTenantUsers` (teammates from other tenants), or `groupAllowTenants` (whole tenants)
+- Every sender-policy name lives in `config.json` only; the code hardcodes no tenant key or open_id
 
 ### Groups Config Format
 
@@ -407,12 +427,17 @@ Groups are stored in a map keyed by `chat_id`:
 ```json
 {
   "groupPolicy": "allowlist",
+  "groupAllowTenants": ["<tenant_key_a>"],
+  "internalCrossTenantUsers": ["ou_xxx"],
+  "groupRejectMode": "silent",
   "groups": {
     "oc_xxx": {
       "name": "研发群",
       "mode": "mention",
       "requireMention": true,
       "allowFrom": [],
+      "allowTenants": ["<tenant_key_b>"],
+      "internalCrossTenantUsers": [],
       "historyLimit": 10,
       "added_at": "2026-01-01T00:00:00Z"
     },
@@ -427,6 +452,8 @@ Groups are stored in a map keyed by `chat_id`:
 
 - `mode`: `"mention"` (respond to @mentions only) or `"smart"` (receive all messages)
 - `allowFrom`: Optional list of user_id/open_id. Empty = all group members allowed. `"*"` = wildcard.
+- `allowTenants`: Optional per-group tenant_key list; when present it replaces the global `groupAllowTenants` for that chat.
+- `internalCrossTenantUsers`: Optional per-group additions to the global cross-tenant teammate list.
 - `historyLimit`: Optional per-group context message limit (overrides `message.context_messages`)
 
 ### Markdown Card

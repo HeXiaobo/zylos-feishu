@@ -36,8 +36,18 @@ export const DEFAULT_CONFIG = {
   dmAllowFrom: [],
   // Group policy: 'open' (all groups), 'allowlist' (only configured groups), 'disabled' (no groups)
   groupPolicy: 'allowlist',
+  // Sender tenant keys admitted to every group. A group may override the list
+  // with groups.<chat_id>.allowTenants. Empty keeps the legacy behavior.
+  groupAllowTenants: [],
+  // Cross-tenant teammates (open_id/user_id) admitted to every group.
+  internalCrossTenantUsers: [],
+  // How a denied group sender is handled: 'silent' (log only) or 'reply'.
+  groupRejectMode: 'silent',
+  // Text sent when groupRejectMode is 'reply'; empty uses the built-in text.
+  groupRejectText: '',
   // Per-group configuration map
-  // Format: { "oc_xxx": { name, mode, requireMention, allowFrom, historyLimit } }
+  // Format: { "oc_xxx": { name, mode, requireMention, allowFrom, historyLimit,
+  //                       allowTenants, internalCrossTenantUsers } }
   // mode: "mention" (respond to @mentions) or "smart" (receive all messages)
   groups: {},
   // Legacy fields (kept for backward compatibility, migrated to groups on upgrade)
@@ -70,6 +80,13 @@ export function loadConfig() {
       const content = fs.readFileSync(CONFIG_PATH, 'utf8');
       const parsed = JSON.parse(content);
       config = { ...DEFAULT_CONFIG, ...parsed };
+      // Runtime backward-compat: a config written before the sender-policy
+      // fields existed keeps the default list/mode instead of becoming
+      // undefined. An explicitly configured null still means "not configured".
+      if (config.groupAllowTenants === undefined) config.groupAllowTenants = [];
+      if (config.internalCrossTenantUsers === undefined) config.internalCrossTenantUsers = [];
+      if (config.groupRejectMode === undefined) config.groupRejectMode = 'silent';
+      if (config.groupRejectText === undefined) config.groupRejectText = '';
       // Runtime backward-compat: derive groupPolicy from legacy group_whitelist,
       // but only if the file doesn't already have an explicit groupPolicy
       if (config.group_whitelist !== undefined && !('groupPolicy' in parsed)) {
