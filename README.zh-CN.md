@@ -69,7 +69,22 @@ zylos uninstall feishu
 | 在允许的群里 @机器人 | 带上下文回复 |
 | 显式配置为 smart 的群消息 | 免 @ 评估；无关或未授权的被动消息保持静默，且不触发结构化任务摄取 |
 | 管理员在任意群 @机器人 | 除非群聊被全局禁用，否则回复 |
-| 未知用户 | 忽略 |
+| 放行租户 / 跨租户同事 | 按群成员处理 |
+| 未知用户 | 默认静默忽略（`groupRejectMode: "silent"`） |
+
+群发送者策略支持按租户放行：`groupAllowTenants` 放行整个飞书租户，群的
+`allowTenants` 覆盖全局名单，`internalCrossTenantUsers` 单独放行跨租户同事
+（open_id/user_id）。三种授权是并集：群的 `allowFrom`、跨租户名单、租户名单
+任一条命中即放行，所以保留旧 `allowFrom` 名单的群在打开租户放行后不会失效。
+这套限制同样作用于 `groupPolicy: "open"` 放行的未登记群。被拒绝的发送者默认
+静默忽略；设为 `groupRejectMode: "reply"` 时，只在被精确 @机器人 时用
+`groupRejectText` 回复一次。群聊里的所有拒绝（禁用群、未登记群、发送者不允许）
+都按这个设置处理；owner 不会收到拒绝消息，私聊拒绝不受影响。以上字段都不配置
+时，群聊行为与旧版本一致。所有名单只写在 `config.json`，代码里不写死任何租户
+或人员。
+
+已知限制：历史消息回填不按发言人过滤（飞书历史接口不返回可信的
+`tenant_key`），实时入口已拒绝的消息仍可能作为上下文出现在后续允许的消息里。
 
 ## 自然语言 WorkIntake
 
@@ -100,6 +115,13 @@ WorkIntake 默认关闭。请在 `~/zylos/components/feishu/config.json` 中开�
 显式配置的群以自身 `allowFrom` 作为发送者策略（包括外部成员）；全局成员
 策略继续保护私聊，以及由 `groupPolicy: "open"` 放行但未显式配置的群。
 WorkIntake 仍要求精确 @机器人，并且必须配置专用 capability。
+
+群发送者策略同时支持按租户放行：`groupAllowTenants` 放行整个飞书租户，
+群的 `allowTenants` 覆盖全局名单，`internalCrossTenantUsers` 单独放行跨租户
+同事（open_id/user_id）。被拒绝的发送者默认静默忽略
+（`groupRejectMode: "silent"`）；设为 `"reply"` 时，只在被精确 @机器人时
+用 `groupRejectText` 回复一次。以上字段都不配置时，群聊行为与旧版本一致。
+所有名单只写在 `config.json`，代码里不写死任何租户或人员。
 稳定的确认数据会先写入本地 `0600` outbox；每次投递都重新签发确认卡，
 临时故障或进程重启后会用同一个 Feishu UUID 自动重试。
 

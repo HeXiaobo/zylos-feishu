@@ -347,6 +347,11 @@ $ADM add-group <chat_id> <name> [mode]        # Add group (mode: mention|smart)
 $ADM remove-group <chat_id>                   # Remove a group
 $ADM set-group-policy <disabled|allowlist|open>  # Set group policy
 $ADM set-group-allowfrom <chat_id> <id1,id2>  # Set per-group allowed senders
+$ADM set-group-tenants <tenant_key1,tenant_key2>  # Set global sender tenant allowlist ("none" clears)
+$ADM set-group-allow-tenants <chat_id> <keys>  # Set per-group tenant allowlist (overrides global)
+$ADM add-cross-tenant-user <id1,id2>          # Add teammates allowed in every group
+$ADM remove-cross-tenant-user <id1,id2>       # Remove teammates from that list
+$ADM set-group-reject-mode <silent|reply> [text]  # How denied group senders are handled
 $ADM set-group-history-limit <chat_id> <n>    # Set per-group context message limit
 $ADM migrate-groups                           # Migrate legacy group config to new format
 
@@ -486,6 +491,10 @@ DM and group access are controlled by **independent** top-level policies:
   "dmPolicy": "owner",        // "open" | "allowlist" | "owner"
   "dmAllowFrom": ["ou_xxx"],  // used when dmPolicy = "allowlist"
   "groupPolicy": "allowlist", // "open" | "allowlist" | "disabled"
+  "groupAllowTenants": ["tenant_key_a", "tenant_key_b"],
+  "internalCrossTenantUsers": ["ou_teammate"],
+  "groupRejectMode": "silent",   // "silent" (default) | "reply"
+  "groupRejectText": "",        // used when groupRejectMode = "reply"
   "groups": { ... }           // per-group config (used when groupPolicy = "allowlist")
 }
 ```
@@ -500,17 +509,38 @@ DM and group access are controlled by **independent** top-level policies:
 1. `groupPolicy` = `disabled`? → all group messages dropped
 2. `groupPolicy` = `open`? → respond to @mentions from any group
 3. `groupPolicy` = `allowlist`? → only configured groups; unlisted groups → only owner passes, others dropped silently
-4. Per-group `allowFrom` set? → only listed senders pass (owner always bypasses)
-5. Smart group (mode: `smart`)? → receive ordinary chat without @mention; task protocols remain mention-gated
-6. Not smart? → only exact bot @mentions are processed; other messages are ignored before content parsing
+4. Per-group `allowFrom` contains `*` or the sender? → pass
+5. Sender in global or group `internalCrossTenantUsers`? → pass
+6. Sender `tenant_key` in group `allowTenants` (or, when the group sets none, in global `groupAllowTenants`)? → pass
+7. None of `allowFrom`, `internalCrossTenantUsers`, and the applicable tenant list configured? → every member passes (legacy behavior)
+8. Otherwise denied
+9. Smart group (mode: `smart`)? → receive ordinary chat without @mention; task protocols remain mention-gated
+10. Not smart? → only exact bot @mentions are processed; other messages are ignored before content parsing
+
+Steps 4–6 are a **union**: any one of the three grants admits the sender. A
+per-group `allowFrom` that misses a sender does not veto a cross-tenant or
+tenant grant, so an old per-group list keeps working while the tenant lists are
+switched on for the same group.
+
+Every group denial in steps 1–3 and 8 follows `groupRejectMode: "silent"`
+(default, logs only) or `"reply"` (answers once with `groupRejectText`, and only
+when the bot was explicitly @mentioned). The denial result itself never changes,
+the owner is never sent a rejection, and DM rejections are unaffected.
+
+A per-group `allowTenants` **replaces** the global `groupAllowTenants` for that chat.
+`internalCrossTenantUsers` is additive: the global list plus the group list. An
+empty `tenantKey` never satisfies the tenant allowlist.
 
 **Key points:**
 - Owner bypasses group allowlists and sender filters, but not `groupPolicy: "disabled"`
 - `dmPolicy` and `groupPolicy` are fully independent — changing one never affects the other
-- Group access is controlled by `groupPolicy` + `groups` config + per-group `allowFrom`
-- No user-level whitelist for groups; use per-group `allowFrom` if you need to restrict specific senders
+- Group access is controlled by `groupPolicy` + `groups` config + per-group `allowFrom` + the optional sender tenant/cross-tenant lists
+- No per-user group whitelist outside config; use per-group `allowFrom` (specific senders), `internalCrossTenantUsers` (teammates from other tenants), or `groupAllowTenants` (whole tenants)
+- Every sender-policy name lives in `config.json` only; the code hardcodes no tenant key or open_id
+- The new tenant/cross-tenant sender policy applies to every group the group policy admits, including an unregistered group admitted by `groupPolicy: "open"`. With none of the new fields configured, an open group keeps its legacy allow-all result.
 - Smart mode is opt-in compatibility behavior. A no-mention smart message is not mapped into the structured Commitment Core task protocol.
 - An explicitly configured group owns its `allowFrom` sender policy, including for external members. The global `memberAccessPolicy` still protects direct messages and unconfigured groups admitted by `groupPolicy: "open"`; WorkIntake remains exact-mention gated and requires its dedicated capability configuration.
+- Known limitation, by design: the historical-message backfill (`getContextWithFallback`) inserts recent group messages as context without re-running the sender policy. Feishu's history API returns sender ids without a trustworthy `tenant_key`, so a message the live ingress rejected can still appear as context for the next allowed message in that group. Closing it needs an identity lookup per history entry; this version does not include it.
 - Passive Smart-group authorization failures and terminal runtime `[SKIP]` decisions produce no typing indicator, card, or permission reply. A visible denial is reserved for an explicit bot @mention.
 
 ### Groups Config Format
@@ -520,12 +550,17 @@ Groups are stored in a map keyed by `chat_id`:
 ```json
 {
   "groupPolicy": "allowlist",
+  "groupAllowTenants": ["1237f138330f9740"],
+  "internalCrossTenantUsers": ["ou_xxx"],
+  "groupRejectMode": "silent",
   "groups": {
     "oc_xxx": {
       "name": "研发群",
       "mode": "mention",
       "requireMention": true,
       "allowFrom": [],
+      "allowTenants": ["12429a7f20cf1758"],
+      "internalCrossTenantUsers": [],
       "historyLimit": 10,
       "added_at": "2026-01-01T00:00:00Z"
     },
@@ -540,6 +575,8 @@ Groups are stored in a map keyed by `chat_id`:
 
 - `mode`: `"mention"` (respond to @mentions only) or `"smart"` (receive all messages)
 - `allowFrom`: Optional list of user_id/open_id. Empty = all group members allowed. `"*"` = wildcard.
+- `allowTenants`: Optional per-group tenant_key list; when present it replaces the global `groupAllowTenants` for that chat.
+- `internalCrossTenantUsers`: Optional per-group additions to the global cross-tenant teammate list.
 - `historyLimit`: Optional per-group context message limit (overrides `message.context_messages`)
 
 ### Markdown Card

@@ -311,8 +311,17 @@ export function createFeishuConversationGateway({
   return Object.freeze({
     accept(rawEvent, options = {}) {
       return runOperation('accept', async () => {
-        if (await authorize(rawEvent, options) !== true) {
-          return Object.freeze({ status: 'ignored', reason: 'unauthorized' });
+        const authorization = await authorize(rawEvent, options);
+        if (authorization !== true) {
+          // A denial may carry a configured outbound rejection. It is returned
+          // instead of thrown so the caller decides whether to send it; the
+          // denial result itself never changes.
+          const rejection = authorization && typeof authorization === 'object'
+            ? authorization.rejection
+            : undefined;
+          return Object.freeze(rejection === undefined
+            ? { status: 'ignored', reason: 'unauthorized' }
+            : { status: 'ignored', reason: 'unauthorized', rejection });
         }
         const normalized = normalizeFeishuInboundMessage(rawEvent, {
           accountRef: normalizedAccountRef,

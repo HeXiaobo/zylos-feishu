@@ -24,6 +24,34 @@ function saveConfigOrExit(config) {
   process.exit(1);
 }
 
+const VALID_REJECT_MODES = new Set(['silent', 'reply']);
+
+function printGroupSenderPolicy(config) {
+  const tenants = config.groupAllowTenants || [];
+  const crossTenant = config.internalCrossTenantUsers || [];
+  console.log(`Group allow tenants (${tenants.length}):`, tenants.length ? tenants.join(', ') : 'none');
+  console.log(`Cross-tenant users (${crossTenant.length}):`, crossTenant.length ? crossTenant.join(', ') : 'none');
+  const mode = config.groupRejectMode === 'reply' ? 'reply' : 'silent';
+  const text = config.groupRejectText?.trim();
+  console.log(`Reject mode: ${mode}${mode === 'reply' ? ` (text: ${text || 'default'})` : ''}`);
+}
+
+function normalizedIdList(values) {
+  const list = Array.isArray(values) ? values : [values];
+  return [...new Set(list
+    .flatMap(value => String(value ?? '').split(','))
+    .map(value => value.trim())
+    .filter(Boolean))];
+}
+
+function assertNoWhitespace(ids) {
+  const invalid = ids.filter(id => /\s/.test(id));
+  if (invalid.length > 0) {
+    console.error(`Invalid IDs (no whitespace allowed): ${invalid.join(', ')}`);
+    process.exit(1);
+  }
+}
+
 // Commands
 const commands = {
   'show': () => {
@@ -60,12 +88,17 @@ const commands = {
     }
 
     console.log(`Group Policy: ${config.groupPolicy || 'allowlist'}`);
+    printGroupSenderPolicy(config);
     console.log(`\nConfigured Groups (${entries.length}):`);
     for (const [chatId, cfg] of entries) {
       const mode = cfg.mode || (cfg.requireMention === false ? 'smart' : 'mention');
       const allowFrom = cfg.allowFrom?.length ? ` allowFrom: [${cfg.allowFrom.join(', ')}]` : '';
+      const allowTenants = cfg.allowTenants?.length ? ` allowTenants: [${cfg.allowTenants.join(', ')}]` : '';
+      const crossTenant = cfg.internalCrossTenantUsers?.length
+        ? ` crossTenantUsers: [${cfg.internalCrossTenantUsers.join(', ')}]`
+        : '';
       const historyLimit = cfg.historyLimit ? ` history: ${cfg.historyLimit}` : '';
-      console.log(`  ${chatId} - ${cfg.name || 'unnamed'} [${mode}]${allowFrom}${historyLimit}`);
+      console.log(`  ${chatId} - ${cfg.name || 'unnamed'} [${mode}]${allowFrom}${allowTenants}${crossTenant}${historyLimit}`);
     }
   },
 
@@ -182,14 +215,103 @@ const commands = {
       console.error('Invalid allowFrom value. Provide at least one non-empty user ID or "*".');
       process.exit(1);
     }
-    const invalidIds = normalizedUserIds.filter(id => /\s/.test(id));
-    if (invalidIds.length > 0) {
-      console.error(`Invalid user IDs (no whitespace allowed): ${invalidIds.join(', ')}`);
-      process.exit(1);
-    }
+    assertNoWhitespace(normalizedUserIds);
     config.groups[normalizedChatId].allowFrom = normalizedUserIds;
     saveConfigOrExit(config);
     console.log(`Set allowFrom for ${normalizedChatId}: [${normalizedUserIds.join(', ')}]`);
+    console.log('Run: pm2 restart zylos-feishu');
+  },
+
+  'set-group-tenants': (...tenantKeys) => {
+    const tenants = normalizedIdList(tenantKeys);
+    const clear = tenants.length === 1 && tenants[0].toLowerCase() === 'none';
+    if (tenants.length === 0) {
+      console.error('Usage: admin.js set-group-tenants <tenant_key1,tenant_key2,...|none>');
+      process.exit(1);
+    }
+    assertNoWhitespace(tenants);
+    const config = loadConfig();
+    config.groupAllowTenants = clear ? [] : tenants;
+    saveConfigOrExit(config);
+    console.log(`Set global groupAllowTenants: [${config.groupAllowTenants.join(', ')}]`);
+    console.log('Run: pm2 restart zylos-feishu');
+  },
+
+  'set-group-allow-tenants': (chatId, ...tenantKeys) => {
+    const normalizedChatId = String(chatId || '').trim();
+    const tenants = normalizedIdList(tenantKeys);
+    const clear = tenants.length === 1 && tenants[0].toLowerCase() === 'none';
+    if (!normalizedChatId || tenants.length === 0) {
+      console.error('Usage: admin.js set-group-allow-tenants <chat_id> <tenant_key1,tenant_key2,...|none>');
+      process.exit(1);
+    }
+    assertNoWhitespace(tenants);
+    const config = loadConfig();
+    if (!config.groups?.[normalizedChatId]) {
+      console.error(`Group ${normalizedChatId} not configured. Add it first with add-group.`);
+      process.exit(1);
+    }
+    config.groups[normalizedChatId].allowTenants = clear ? [] : tenants;
+    saveConfigOrExit(config);
+    console.log(`Set allowTenants for ${normalizedChatId}: [${config.groups[normalizedChatId].allowTenants.join(', ')}]`);
+    console.log('Run: pm2 restart zylos-feishu');
+  },
+
+  'add-cross-tenant-user': (...ids) => {
+    const users = normalizedIdList(ids);
+    if (users.length === 0) {
+      console.error('Usage: admin.js add-cross-tenant-user <open_id_or_user_id> [...]');
+      process.exit(1);
+    }
+    assertNoWhitespace(users);
+    const config = loadConfig();
+    const current = Array.isArray(config.internalCrossTenantUsers)
+      ? config.internalCrossTenantUsers
+      : [];
+    config.internalCrossTenantUsers = [...new Set([...current, ...users])];
+    saveConfigOrExit(config);
+    console.log(`internalCrossTenantUsers (${config.internalCrossTenantUsers.length}): ${config.internalCrossTenantUsers.join(', ')}`);
+    console.log('Run: pm2 restart zylos-feishu');
+  },
+
+  'remove-cross-tenant-user': (...ids) => {
+    const users = normalizedIdList(ids);
+    if (users.length === 0) {
+      console.error('Usage: admin.js remove-cross-tenant-user <open_id_or_user_id> [...]');
+      process.exit(1);
+    }
+    const config = loadConfig();
+    const removed = users.map(user => user.toLowerCase());
+    const current = Array.isArray(config.internalCrossTenantUsers)
+      ? config.internalCrossTenantUsers
+      : [];
+    config.internalCrossTenantUsers = current.filter(user => !removed.includes(String(user).toLowerCase()));
+    saveConfigOrExit(config);
+    console.log(`internalCrossTenantUsers (${config.internalCrossTenantUsers.length}): ${config.internalCrossTenantUsers.join(', ') || 'none'}`);
+    console.log('Run: pm2 restart zylos-feishu');
+  },
+
+  'set-group-reject-mode': (mode, ...textParts) => {
+    const normalizedMode = String(mode || '').trim().toLowerCase();
+    if (!VALID_REJECT_MODES.has(normalizedMode)) {
+      console.error(`Invalid reject mode "${mode || ''}". Valid values: silent, reply.`);
+      console.error('Usage: admin.js set-group-reject-mode silent');
+      console.error('       admin.js set-group-reject-mode reply [text]');
+      process.exit(1);
+    }
+    const config = loadConfig();
+    config.groupRejectMode = normalizedMode;
+    if (normalizedMode === 'reply') {
+      const text = textParts.join(' ').trim();
+      if (text) config.groupRejectText = text;
+    } else {
+      config.groupRejectText = '';
+    }
+    saveConfigOrExit(config);
+    console.log(`Reject mode set to: ${normalizedMode}`);
+    if (normalizedMode === 'reply') {
+      console.log(`Reject text: ${config.groupRejectText || '(default)'}`);
+    }
     console.log('Run: pm2 restart zylos-feishu');
   },
 
@@ -239,6 +361,7 @@ const commands = {
     const config = loadConfig();
     console.log(`DM policy: ${config.dmPolicy || 'owner'}`);
     console.log(`Group policy: ${config.groupPolicy || 'allowlist'}`);
+    printGroupSenderPolicy(config);
     const allowFrom = config.dmAllowFrom || [];
     console.log(`DM allowFrom (${allowFrom.length}):`, allowFrom.length ? allowFrom.join(', ') : 'none');
   },
@@ -346,6 +469,11 @@ Commands:
   remove-group <chat_id>              Remove a group
   set-group-policy <policy>           Set group policy (disabled|allowlist|open)
   set-group-allowfrom <chat_id> <ids> Set per-group allowed senders
+  set-group-tenants <keys>            Set global sender tenant allowlist (comma separated, "none" clears)
+  set-group-allow-tenants <id> <keys> Set per-group sender tenant allowlist (overrides global)
+  add-cross-tenant-user <ids>         Add teammates (open_id/user_id) allowed in every group
+  remove-cross-tenant-user <ids>      Remove teammates from the cross-tenant list
+  set-group-reject-mode <mode> [text] Reject denied senders: silent (default) or reply [text]
   set-group-history-limit <id> <n>    Set per-group history message limit
   migrate-groups                      Migrate legacy group config to new format
 
@@ -378,7 +506,12 @@ Commands:
 
 Permission flow:
   Private DM:  dmPolicy (open|allowlist|owner) + dmAllowFrom
-  Group chat:  groupPolicy → groups config → per-group allowFrom
+  Group chat:  groupPolicy → groups config → per-group allowFrom →
+               internalCrossTenantUsers → groupAllowTenants/allowTenants
+  Denied group messages (disabled group, unregistered group, denied sender):
+               groupRejectMode=reply sends groupRejectText on an explicit
+               @mention; silent (default) only logs. The owner is never sent a
+               rejection; DM rejections keep their own text.
   Owner always bypasses all checks.
 
 After changes, restart bot: pm2 restart zylos-feishu

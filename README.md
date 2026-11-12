@@ -75,7 +75,26 @@ zylos uninstall feishu
 | @mention in allowed group | Responds with recent context |
 | Message in an explicitly configured smart group | Evaluated without @mention; irrelevant or unauthorized passive traffic stays silent, and structured task intake remains disabled |
 | Owner @mention in any group | Responds unless group chat is globally disabled |
-| Unknown user | Ignored |
+| Allowed tenant / cross-tenant teammate | Responds like a group member |
+| Unknown user | Ignored silently (`groupRejectMode: "silent"`) |
+
+Group sender policy can admit a whole Feishu tenant (`groupAllowTenants`, with a
+per-group `allowTenants` override) and individual cross-tenant teammates
+(`internalCrossTenantUsers`). The three grants — per-group `allowFrom`, the
+cross-tenant list, and the tenant list — are a union: any one of them admits the
+sender, so a group that still has an old `allowFrom` list keeps working while
+tenant admission is switched on. The policy also covers unconfigured groups
+admitted by `groupPolicy: "open"`. A denied sender is ignored silently by
+default; `groupRejectMode: "reply"` answers once with `groupRejectText` and only
+on an explicit bot @mention. All group denials (disabled group, unregistered
+group, denied sender) follow that setting; the owner is never sent a rejection
+and DM rejections are unchanged. With none of these fields set, the previous
+`allowFrom` behavior is unchanged. All names live in `config.json`; no tenant or
+user is hardcoded.
+
+Known limitation: the historical-message backfill is not filtered by sender
+(Feishu's history API carries no trustworthy `tenant_key`), so a message the
+live ingress rejected can still appear as context for a later allowed message.
 
 ## Natural-language WorkIntake
 
@@ -108,6 +127,15 @@ explicitly configured group uses its own `allowFrom` sender policy, including
 for external members; the global member policy still protects direct messages
 and unconfigured groups admitted by `groupPolicy: "open"`. WorkIntake remains
 exact-mention gated and requires its dedicated capability configuration.
+
+Group sender policy also understands tenants. `groupAllowTenants` admits whole
+Feishu tenants, a per-group `allowTenants` overrides that global list for one
+chat, and `internalCrossTenantUsers` adds individual open_id/user_id teammates
+from any tenant. A denied sender is ignored silently by default
+(`groupRejectMode: "silent"`); `"reply"` answers once with `groupRejectText`
+and only when the bot was explicitly @mentioned. When none of these fields is
+set, group behavior is unchanged. All names live in `config.json`; no tenant or
+user is hardcoded.
 Stable confirmation data is persisted to a local `0600` outbox before delivery.
 Each attempt signs a fresh card, and transient failures or process restarts retry
 with the same Feishu UUID.
