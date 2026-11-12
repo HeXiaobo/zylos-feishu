@@ -100,6 +100,13 @@ WorkIntake 默认关闭。请在 `~/zylos/components/feishu/config.json` 中开�
 显式配置的群以自身 `allowFrom` 作为发送者策略（包括外部成员）；全局成员
 策略继续保护私聊，以及由 `groupPolicy: "open"` 放行但未显式配置的群。
 WorkIntake 仍要求精确 @机器人，并且必须配置专用 capability。
+
+群发送者策略同时支持按租户放行：`groupAllowTenants` 放行整个飞书租户，
+群的 `allowTenants` 覆盖全局名单，`internalCrossTenantUsers` 单独放行跨租户
+同事（open_id/user_id）。被拒绝的发送者默认静默忽略
+（`groupRejectMode: "silent"`）；设为 `"reply"` 时，只在被精确 @机器人时
+用 `groupRejectText` 回复一次。以上字段都不配置时，群聊行为与旧版本一致。
+所有名单只写在 `config.json`，代码里不写死任何租户或人员。
 稳定的确认数据会先写入本地 `0600` outbox；每次投递都重新签发确认卡，
 临时故障或进程重启后会用同一个 Feishu UUID 自动重试。
 

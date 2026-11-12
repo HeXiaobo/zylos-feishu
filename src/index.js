@@ -118,7 +118,10 @@ import {
 } from './lib/inbound-event-inbox.js';
 import { normalizeInboundMessageEvent } from './lib/inbound-message-event.js';
 import { decideGroupActivation } from './lib/group-activation-policy.js';
-import { decideGroupAccess } from './lib/group-access-policy.js';
+import {
+  decideGroupSenderAccess,
+  groupRejectAction,
+} from './lib/feishu-group-policy.js';
 import { buildSmartModePrompt } from './lib/smart-mode-prompt.js';
 
 // C4 receive interface path
@@ -828,21 +831,22 @@ function isGroupAllowed(chatId) {
 }
 
 /**
- * Check if a sender is allowed in a specific group.
- * If the group has an allowFrom list, check it; otherwise allow all.
+ * Apply the configured reaction to a denied group sender. `silent` only logs;
+ * `reply` sends exactly one configured message.
  */
-function isSenderAllowedInGroup(chatId, senderUserId, senderOpenId) {
-  const groupConfig = resolveGroupConfig(chatId);
-  if (!groupConfig?.allowFrom || groupConfig.allowFrom.length === 0) {
-    return true; // No per-group sender restriction
+function rejectGroupSender({ chatId, messageId, reasonCode, mentioned }) {
+  const action = groupRejectAction(config);
+  if (action === 'silent') {
+    console.log(`[feishu] Group sender rejection stays silent chat=${chatId} reason=${reasonCode}`);
+    return Promise.resolve(false);
   }
-  const allowed = groupConfig.allowFrom.map(s => String(s).toLowerCase());
-  const normalizedSenderUserId = senderUserId === undefined || senderUserId === null ? '' : String(senderUserId).toLowerCase();
-  const normalizedSenderOpenId = senderOpenId === undefined || senderOpenId === null ? '' : String(senderOpenId).toLowerCase();
-  if (allowed.includes('*')) return true;
-  if (normalizedSenderUserId && allowed.includes(normalizedSenderUserId)) return true;
-  if (normalizedSenderOpenId && allowed.includes(normalizedSenderOpenId)) return true;
-  return false;
+  if (!mentioned) {
+    // Passive Smart-group traffic must stay zero-outbound even when a visible
+    // rejection is configured.
+    console.log(`[feishu] Group sender rejection stays silent (no mention) chat=${chatId} reason=${reasonCode}`);
+    return Promise.resolve(false);
+  }
+  return replyToMessage(messageId, action.reply).then(() => true).catch(() => false);
 }
 
 /**
@@ -1169,6 +1173,7 @@ async function authorizeReplyRefactorMessage(rawEvent) {
     .some(value => String(value) === String(senderId))) return false;
   const senderUserId = sender.sender_id?.user_id;
   const senderOpenId = sender.sender_id?.open_id;
+  const senderTenantKey = sender.tenant_key || '';
   const chatType = message.chat_type;
   if (chatType === 'p2p') {
     return isDmAllowed(senderUserId, senderOpenId, sender);
@@ -1185,23 +1190,22 @@ async function authorizeReplyRefactorMessage(rawEvent) {
   const groupPolicy = config.groupPolicy || 'allowlist';
   const groupConfigured = hasExplicitGroupConfig(message.chat_id);
   const groupAllowed = isGroupAllowed(message.chat_id);
-  const senderAllowedByGroup = isSenderAllowedInGroup(
-    message.chat_id,
-    senderUserId,
-    senderOpenId,
-  );
   const memberAccess = groupPolicy !== 'disabled'
     && groupAllowed
     && !groupConfigured
     && !senderIsOwner
     ? await authorizeConfiguredMemberAccess(senderUserId, senderOpenId, sender)
     : null;
-  return decideGroupAccess({
-    groupPolicy,
-    groupAllowed,
-    groupConfigured,
+  return decideGroupSenderAccess({
+    config,
+    chatId: message.chat_id,
+    userId: senderUserId,
+    openId: senderOpenId,
+    tenantKey: senderTenantKey,
+    chatType,
     senderIsOwner,
-    senderAllowedByGroup,
+    groupConfigured,
+    groupAllowed,
     memberAccessAllowed: memberAccess,
     explicitActivation: mentioned,
   }).allowed;
@@ -2284,6 +2288,7 @@ async function handleMessage(data, metadata = {}) {
 
   const senderUserId = sender.sender_id?.user_id;
   const senderOpenId = sender.sender_id?.open_id;
+  const senderTenantKey = sender.tenant_key || '';
   const chatId = message.chat_id;
   const messageId = message.message_id;
   const chatType = message.chat_type;
@@ -2325,31 +2330,42 @@ async function handleMessage(data, metadata = {}) {
     const groupPolicy = config.groupPolicy || 'allowlist';
     const groupConfigured = hasExplicitGroupConfig(chatId);
     const groupAllowed = isGroupAllowed(chatId);
-    const senderAllowedByGroup = isSenderAllowedInGroup(chatId, senderUserId, senderOpenId);
     const memberAccess = groupPolicy !== 'disabled'
       && groupAllowed
       && !groupConfigured
       && !senderIsOwnerAtIngress
       ? await authorizeConfiguredMemberAccess(senderUserId, senderOpenId, sender)
       : null;
-    const access = decideGroupAccess({
-      groupPolicy,
-      groupAllowed,
-      groupConfigured,
+    const access = decideGroupSenderAccess({
+      config,
+      chatId,
+      userId: senderUserId,
+      openId: senderOpenId,
+      tenantKey: senderTenantKey,
+      chatType,
       senderIsOwner: senderIsOwnerAtIngress,
-      senderAllowedByGroup,
+      groupConfigured,
+      groupAllowed,
       memberAccessAllowed: memberAccess,
       explicitActivation: mentionedAtIngress,
     });
     if (!access.allowed) {
       console.log(`[feishu] Group access denied reason=${access.reasonCode} sender=${senderUserId} chat=${chatId}`);
       if (access.notifySender) {
-        const rejection = access.reasonCode === 'ACCESS_GROUP_DISABLED'
-          ? 'Sorry, group chat is currently disabled.'
-          : access.reasonCode === 'ACCESS_GROUP_NOT_ALLOWED'
-            ? "Sorry, I'm not available in this group."
-            : "Sorry, you don't have permission to interact with me in this group.";
-        replyToMessage(messageId, rejection).catch(() => {});
+        if (access.reasonCode === 'ACCESS_GROUP_SENDER_POLICY') {
+          // Sender-level denial honors groupRejectMode: silent by default.
+          rejectGroupSender({
+            chatId,
+            messageId,
+            reasonCode: access.reasonCode,
+            mentioned: mentionedAtIngress,
+          }).catch(() => {});
+        } else {
+          const rejection = access.reasonCode === 'ACCESS_GROUP_DISABLED'
+            ? 'Sorry, group chat is currently disabled.'
+            : "Sorry, I'm not available in this group.";
+          replyToMessage(messageId, rejection).catch(() => {});
+        }
       }
       return;
     }

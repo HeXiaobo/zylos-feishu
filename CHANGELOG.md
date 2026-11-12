@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Group sender policy can admit a whole Feishu tenant (`groupAllowTenants`,
+  overridable per group with `groups.<chat_id>.allowTenants`) and individual
+  cross-tenant teammates (`internalCrossTenantUsers`, additive per group).
+- `groupRejectMode: "silent" | "reply"` controls what a denied group sender
+  sees. It defaults to `silent`; `reply` sends `groupRejectText` once and only
+  on an explicit bot @mention. Passive Smart-group traffic stays zero-outbound.
+- Admin CLI: `set-group-tenants`, `set-group-allow-tenants`,
+  `add-cross-tenant-user`, `remove-cross-tenant-user`, `set-group-reject-mode`.
+  `list-groups` and `list-dm-allow` print the new fields.
+
+### Changed
+- The local `isSenderAllowedInGroup` in `src/index.js` moved to
+  `src/lib/feishu-group-policy.js` and now receives `config` and the inbound
+  `sender.tenant_key`. The group ingress and the `C4_REPLY_REFACTOR_V1`
+  authorizer share one decision through `decideGroupSenderAccess`.
+- Sender-level group denials no longer always answer with the English
+  permission text; they follow `groupRejectMode`.
+
+### Compatibility
+- Existing `config.json` files need no change. Missing `groupAllowTenants`,
+  `internalCrossTenantUsers`, `groupRejectMode`, and `groupRejectText` load as
+  `[]`, `[]`, `'silent'`, and `''`. With none of them configured, sender
+  decisions match the previous `allowFrom` behavior.
+- No tenant key or open_id is hardcoded; names come only from config.
+
 ## [0.3.8] - 2026-09-10
 
 ### Fixed

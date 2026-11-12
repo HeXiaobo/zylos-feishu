@@ -108,6 +108,15 @@ explicitly configured group uses its own `allowFrom` sender policy, including
 for external members; the global member policy still protects direct messages
 and unconfigured groups admitted by `groupPolicy: "open"`. WorkIntake remains
 exact-mention gated and requires its dedicated capability configuration.
+
+Group sender policy also understands tenants. `groupAllowTenants` admits whole
+Feishu tenants, a per-group `allowTenants` overrides that global list for one
+chat, and `internalCrossTenantUsers` adds individual open_id/user_id teammates
+from any tenant. A denied sender is ignored silently by default
+(`groupRejectMode: "silent"`); `"reply"` answers once with `groupRejectText`
+and only when the bot was explicitly @mentioned. When none of these fields is
+set, group behavior is unchanged. All names live in `config.json`; no tenant or
+user is hardcoded.
 Stable confirmation data is persisted to a local `0600` outbox before delivery.
 Each attempt signs a fresh card, and transient failures or process restarts retry
 with the same Feishu UUID.
