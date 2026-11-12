@@ -83,13 +83,28 @@ test('allowFrom keeps its legacy meaning: wildcard admits all, one name admits o
   assert.equal(allowed(single, { openId: 'ou_other' }), false);
 });
 
-test('an explicit allowFrom list stays authoritative over tenant grants', () => {
+test('allowFrom, cross-tenant, and tenant grants are a union, not a veto', () => {
   const value = config({
     groupAllowTenants: [TENANT_A],
+    internalCrossTenantUsers: ['ou_cross'],
+    groups: { 'oc-configured': { mode: 'mention', allowFrom: ['ou_old'] } },
+  });
+
+  // Review B1: an allowFrom miss must not skip the two supplementary grants.
+  assert.equal(allowed(value, { openId: 'ou_new', tenantKey: TENANT_A }), true);
+  assert.equal(allowed(value, { openId: 'ou_cross', tenantKey: TENANT_C }), true);
+  // allowFrom itself still admits, and a sender with no grant is still denied.
+  assert.equal(allowed(value, { openId: 'ou_old', tenantKey: TENANT_C }), true);
+  assert.equal(allowed(value, { openId: 'ou_stranger', tenantKey: TENANT_C }), false);
+});
+
+test('allowFrom is the only restriction, a stranger is still denied', () => {
+  const value = config({
     groups: { 'oc-configured': { mode: 'mention', allowFrom: ['ou_allowed'] } },
   });
 
-  assert.equal(allowed(value, { openId: 'ou_other', tenantKey: TENANT_A }), false);
+  assert.equal(allowed(value, { openId: 'ou_allowed' }), true);
+  assert.equal(allowed(value, { openId: 'ou_stranger' }), false);
 });
 
 test('no sender policy configured keeps the legacy allow-all behavior', () => {

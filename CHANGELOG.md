@@ -23,8 +23,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/lib/feishu-group-policy.js` and now receives `config` and the inbound
   `sender.tenant_key`. The group ingress and the `C4_REPLY_REFACTOR_V1`
   authorizer share one decision through `decideGroupSenderAccess`.
-- Sender-level group denials no longer always answer with the English
-  permission text; they follow `groupRejectMode`.
+- The three group grants (`allowFrom`, `internalCrossTenantUsers`, the applicable
+  `allowTenants`) are a union. An `allowFrom` miss no longer short-circuits the
+  cross-tenant and tenant checks, so an existing per-group sender list keeps
+  working after tenant admission is enabled for the same group.
+- The new sender policy also covers unconfigured groups admitted by
+  `groupPolicy: "open"`; previously the composed decision returned them as
+  allowed without consulting the tenant list. With none of the new fields set,
+  the open-group result is unchanged.
+- Every group denial — disabled group, unregistered group, denied sender — now
+  follows `groupRejectMode`; previously only the sender-level denial did. The
+  denial result is unchanged, the owner is never sent a rejection, and DM
+  rejections keep their own text.
+- `C4_REPLY_REFACTOR_V1=1` now delivers the configured visible rejection through
+  the gateway result instead of dropping it: the message is still `ignored` and
+  never reaches Core, and a redelivered event does not answer twice.
+
+### Known limitation
+- The historical-message backfill is not filtered by sender. Feishu's history
+  API returns sender ids without a trustworthy `tenant_key`, so a message the
+  live ingress rejected can still be injected as group/topic context for a
+  later allowed message. Closing it needs a per-entry identity lookup; not in
+  this change.
 
 ### Compatibility
 - Existing `config.json` files need no change. Missing `groupAllowTenants`,

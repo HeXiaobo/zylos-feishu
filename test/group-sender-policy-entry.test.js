@@ -235,21 +235,28 @@ test('src/index.js passes the Feishu tenant_key into the shared sender policy', 
   );
 });
 
-test('src/index.js routes sender-policy denials through groupRejectMode', () => {
+test('src/index.js routes every group denial through groupRejectMode', () => {
+  // Review B2: the denial reason no longer selects the reaction; all group
+  // denials call rejectGroupSender and the composition result stays denied.
   assert.match(
     indexSource,
-    /if \(access\.reasonCode === 'ACCESS_GROUP_SENDER_POLICY'\) \{\n\s+\/\/ Sender-level denial honors groupRejectMode: silent by default\.\n\s+rejectGroupSender\(\{/,
-    'sender-level denials must not use the unconditional rejection texts',
+    /if \(access\.notifySender\) \{\n\s+\/\/ Every group denial honors groupRejectMode: the result stays denied,\n\s+\/\/ only the outbound reaction changes\./,
+    'all group denials must share one rejection path',
   );
   assert.doesNotMatch(
     indexSource,
     /"Sorry, you don't have permission to interact with me in this group\."/,
     'the always-on denial text is replaced by groupRejectAction',
   );
+  assert.doesNotMatch(
+    indexSource,
+    /'Sorry, group chat is currently disabled\.'/,
+    'the disabled-group text is replaced by groupRejectAction',
+  );
   assert.match(
     indexSource,
-    /function rejectGroupSender\(\{ chatId, messageId, reasonCode, mentioned \}\) \{\n\s+const action = groupRejectAction\(config\);\n\s+if \(action === 'silent'\) \{/,
-    'rejectGroupSender must default to the silent action',
+    /function rejectGroupSender\(\{ chatId, messageId, reasonCode, mentioned, senderIsOwner = false \}\) \{\n\s+const action = groupRejectAction\(config\);\n\s+if \(action === 'silent' \|\| senderIsOwner\) \{/,
+    'rejectGroupSender must default to the silent action and never answer the owner',
   );
 });
 

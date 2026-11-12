@@ -13,7 +13,19 @@ import crypto from 'crypto';
 import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { pathToFileURL } from 'node:url';
 import * as Lark from '@larksuiteoapi/node-sdk';
+
+// Reject library imports before loading credentials or initializing runtime state.
+// Tests and scripts must import pure modules from src/lib/ instead.
+//
+// Scoped to node:test on purpose. pm2, `npm start`, a symlinked install dir and
+// a `bin` wrapper all reach this file in ways where argv[1] and import.meta.url
+// legitimately differ; none of those may be blocked.
+if (process.env.NODE_TEST_CONTEXT
+  && (!process.argv[1] || import.meta.url !== pathToFileURL(path.resolve(process.argv[1])).href)) {
+  throw new Error('src/index.js is a service entry point; execute it directly and import src/lib/* for library use.');
+}
 
 // Load .env from ~/zylos/.env (absolute path, not cwd-dependent)
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
@@ -122,6 +134,7 @@ import {
   decideGroupSenderAccess,
   groupRejectAction,
 } from './lib/feishu-group-policy.js';
+import { createReplyRefactorAuthorizer } from './lib/group-reject-authorizer.js';
 import { buildSmartModePrompt } from './lib/smart-mode-prompt.js';
 
 // C4 receive interface path
@@ -831,19 +844,23 @@ function isGroupAllowed(chatId) {
 }
 
 /**
- * Apply the configured reaction to a denied group sender. `silent` only logs;
- * `reply` sends exactly one configured message.
+ * Apply the configured reaction to a group denial. `silent` only logs; `reply`
+ * sends exactly one configured message, and only on an explicit bot mention so
+ * passive Smart-group traffic stays zero-outbound.
+ *
+ * Every group-level denial (group disabled, group not registered, sender not
+ * allowed) goes through here, so `groupRejectMode` covers all of them. The
+ * denial result itself is unchanged, and the owner is never sent a rejection:
+ * a visible rejection would be triggered by the very account that owns the bot.
  */
-function rejectGroupSender({ chatId, messageId, reasonCode, mentioned }) {
+function rejectGroupSender({ chatId, messageId, reasonCode, mentioned, senderIsOwner = false }) {
   const action = groupRejectAction(config);
-  if (action === 'silent') {
-    console.log(`[feishu] Group sender rejection stays silent chat=${chatId} reason=${reasonCode}`);
+  if (action === 'silent' || senderIsOwner) {
+    console.log(`[feishu] Group rejection stays silent chat=${chatId} reason=${reasonCode}`);
     return Promise.resolve(false);
   }
   if (!mentioned) {
-    // Passive Smart-group traffic must stay zero-outbound even when a visible
-    // rejection is configured.
-    console.log(`[feishu] Group sender rejection stays silent (no mention) chat=${chatId} reason=${reasonCode}`);
+    console.log(`[feishu] Group rejection stays silent (no mention) chat=${chatId} reason=${reasonCode}`);
     return Promise.resolve(false);
   }
   return replyToMessage(messageId, action.reply).then(() => true).catch(() => false);
@@ -1212,6 +1229,79 @@ async function authorizeReplyRefactorMessage(rawEvent) {
 }
 
 /**
+ * The refactor gateway needs more than a boolean: a denial that the operator
+ * configured as visible must produce exactly one reply. The gateway already
+ * dedupes by eventId/messageId before any of this, so a redelivered webhook or
+ * WebSocket event cannot answer twice. DM and unknown chat types keep the
+ * boolean contract.
+ */
+async function authorizeReplyRefactorMessageWithRejection(rawEvent) {
+  const data = rawEvent?.event ?? rawEvent;
+  const chatType = data?.message?.chat_type;
+  if (chatType !== 'group' && chatType !== 'topic_group') {
+    return authorizeReplyRefactorMessage(rawEvent);
+  }
+  const message = data?.message;
+  const sender = data?.sender;
+  if (!message || !sender) return false;
+  const senderId = sender.sender_id?.open_id
+    || sender.sender_id?.app_id
+    || sender.sender_id?.user_id
+    || '';
+  if (senderId && [botAppId, botOpenId, config.app_id, config.bot_open_id]
+    .filter(Boolean)
+    .some(value => String(value) === String(senderId))) return false;
+  const senderUserId = sender.sender_id?.user_id;
+  const senderOpenId = sender.sender_id?.open_id;
+  const senderTenantKey = sender.tenant_key || '';
+  const mentioned = hasExactBotMention(message.mentions, { botOpenId, botAppId });
+  const activation = decideGroupActivation({
+    chatType: 'group',
+    mentionedBot: mentioned,
+    smartMode: isSmartGroup(message.chat_id),
+  });
+  if (!activation.process) return false;
+  const senderIsOwner = isOwner(senderUserId, senderOpenId);
+  const groupPolicy = config.groupPolicy || 'allowlist';
+  const groupConfigured = hasExplicitGroupConfig(message.chat_id);
+  const groupAllowed = isGroupAllowed(message.chat_id);
+  const memberAccess = groupPolicy !== 'disabled'
+    && groupAllowed
+    && !groupConfigured
+    && !senderIsOwner
+    ? await authorizeConfiguredMemberAccess(senderUserId, senderOpenId, sender)
+    : null;
+  const access = decideGroupSenderAccess({
+    config,
+    chatId: message.chat_id,
+    userId: senderUserId,
+    openId: senderOpenId,
+    tenantKey: senderTenantKey,
+    chatType,
+    senderIsOwner,
+    groupConfigured,
+    groupAllowed,
+    memberAccessAllowed: memberAccess,
+    explicitActivation: mentioned,
+  });
+  if (access.allowed) return true;
+  if (!access.notifySender) {
+    console.log(`[feishu] Group access denied reason=${access.reasonCode} sender=${senderUserId} chat=${message.chat_id}`);
+    return false;
+  }
+  const action = groupRejectAction(config);
+  if (action === 'silent' || !mentioned) return false;
+  return Object.freeze({
+    rejection: Object.freeze({
+      messageId: message.message_id,
+      chatId: message.chat_id,
+      reasonCode: access.reasonCode,
+      text: action.reply,
+    }),
+  });
+}
+
+/**
  * A Smart-group message accepted without an explicit mention is evaluated but
  * must stay invisible until a substantive answer exists: it carries the shared
  * Smart policy prompt and registers a silent-disposition marker so the C4
@@ -1287,12 +1377,22 @@ function initializeReplyRefactorComposition(creds) {
     console.warn(`[feishu] Smart silent marker prune failed: ${error.message}`);
   }
   const coreIntake = createCoreMessageIntakeAdapter({ accept: acceptReplyRefactorMessage });
+  const authorize = createReplyRefactorAuthorizer({
+    authorizeGroup: authorizeReplyRefactorMessageWithRejection,
+    reply: (rejection) => replyToMessage(
+      rejection.messageId,
+      rejection.text,
+      'text',
+      // Feishu dedupes on uuid: a redelivered event reuses the same one.
+      { uuid: `feishu-group-reject-${rejection.messageId}` },
+    ),
+  });
   return openFeishuReplyComposition({
     inboundDbPath: path.join(DATA_DIR, 'inbound-events.db'),
     presentationDbPath: path.join(DATA_DIR, 'reply-presentation.db'),
     accountRef: creds.app_id,
     coreIntake,
-    authorize: authorizeReplyRefactorMessage,
+    authorize,
     present: shouldPresentReplyRefactorMessage,
     reactionPort: createReplyReactionPort(),
     cardPort: createConversationResponseProjectionPort(),
@@ -2352,20 +2452,16 @@ async function handleMessage(data, metadata = {}) {
     if (!access.allowed) {
       console.log(`[feishu] Group access denied reason=${access.reasonCode} sender=${senderUserId} chat=${chatId}`);
       if (access.notifySender) {
-        if (access.reasonCode === 'ACCESS_GROUP_SENDER_POLICY') {
-          // Sender-level denial honors groupRejectMode: silent by default.
-          rejectGroupSender({
-            chatId,
-            messageId,
-            reasonCode: access.reasonCode,
-            mentioned: mentionedAtIngress,
-          }).catch(() => {});
-        } else {
-          const rejection = access.reasonCode === 'ACCESS_GROUP_DISABLED'
-            ? 'Sorry, group chat is currently disabled.'
-            : "Sorry, I'm not available in this group.";
-          replyToMessage(messageId, rejection).catch(() => {});
-        }
+        // Every group denial honors groupRejectMode: the result stays denied,
+        // only the outbound reaction changes. groupRejectAction carries the
+        // default silent mode and the configured reply text.
+        rejectGroupSender({
+          chatId,
+          messageId,
+          reasonCode: access.reasonCode,
+          mentioned: mentionedAtIngress,
+          senderIsOwner: senderIsOwnerAtIngress,
+        }).catch(() => {});
       }
       return;
     }

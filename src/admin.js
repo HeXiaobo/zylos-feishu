@@ -508,8 +508,10 @@ Permission flow:
   Private DM:  dmPolicy (open|allowlist|owner) + dmAllowFrom
   Group chat:  groupPolicy → groups config → per-group allowFrom →
                internalCrossTenantUsers → groupAllowTenants/allowTenants
-  Denied group senders: groupRejectMode=reply sends groupRejectText on an
-               explicit @mention; silent (default) only logs.
+  Denied group messages (disabled group, unregistered group, denied sender):
+               groupRejectMode=reply sends groupRejectText on an explicit
+               @mention; silent (default) only logs. The owner is never sent a
+               rejection; DM rejections keep their own text.
   Owner always bypasses all checks.
 
 After changes, restart bot: pm2 restart zylos-feishu

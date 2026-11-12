@@ -82,7 +82,7 @@ function crossTenantAllowList(config, groupConfig) {
 /**
  * Whether the sender may speak in this group.
  *
- * Decision order:
+ * Decision order (union of grants, per the requirement):
  *   1. The group `allowFrom` list contains `*` or the sender → allowed.
  *   2. The sender is in the global or group `internalCrossTenantUsers` → allowed.
  *   3. The sender tenant is in the group (or, when the group does not set one,
@@ -91,8 +91,8 @@ function crossTenantAllowList(config, groupConfig) {
  *      tenant list configured → legacy behavior, every group member allowed.
  *   5. Otherwise denied. An empty `tenantKey` can never satisfy step 3.
  *
- * An explicit sender list is authoritative for the group: when it denies a
- * sender, a tenant or cross-tenant grant for that same sender does not apply.
+ * The three grants are alternatives: an explicit `allowFrom` list that misses a
+ * sender does not veto a cross-tenant or tenant grant.
  */
 export function isSenderAllowedInGroup(config, chatId, {
   userId,
@@ -105,7 +105,6 @@ export function isSenderAllowedInGroup(config, chatId, {
   const allowFrom = normalizeList(groupConfig?.allowFrom);
   if (allowFrom.includes('*')) return true;
   if (senderIds.some((id) => allowFrom.includes(id))) return true;
-  if (allowFrom.length > 0) return false;
 
   const crossTenantUsers = crossTenantAllowList(config, groupConfig);
   if (senderIds.some((id) => crossTenantUsers.includes(id))) return true;
@@ -116,7 +115,7 @@ export function isSenderAllowedInGroup(config, chatId, {
     return true;
   }
 
-  if (crossTenantUsers.length > 0 || tenants.length > 0) return false;
+  if (allowFrom.length > 0 || crossTenantUsers.length > 0 || tenants.length > 0) return false;
   return true;
 }
 
@@ -155,6 +154,12 @@ export function groupRejectAction(config) {
  * Owner and member-access resolution stay in the service (they need live config
  * and, for department policies, network lookups); everything deterministic
  * happens here so the inbound path and the tests share one implementation.
+ *
+ * The sender policy is applied to every group the policy admits, including
+ * unconfigured groups admitted by `groupPolicy: "open"`. The composed
+ * `decideGroupAccess` only consults it for explicitly configured groups, so an
+ * unconfigured-open denial is applied here without pretending the group is
+ * configured (that would skip the global member policy).
  */
 export function decideGroupSenderAccess({
   config,
@@ -184,9 +189,21 @@ export function decideGroupSenderAccess({
     memberAccessAllowed,
     explicitActivation: explicitActivation === true,
   });
+  let allowed = access.allowed;
+  let reasonCode = access.reasonCode;
+  if (allowed && groupConfigured !== true && senderAllowedByGroup !== true) {
+    allowed = false;
+    reasonCode = 'ACCESS_GROUP_SENDER_POLICY';
+  }
   return Object.freeze({
-    ...access,
+    allowed,
+    reasonCode,
+    // A denial that only appears after the composed decision keeps the
+    // explicit-activation visibility rule of the composed decision.
+    notifySender: access.allowed === allowed
+      ? access.notifySender
+      : explicitActivation === true,
     senderAllowedByGroup,
-    rejectAction: access.allowed ? null : groupRejectAction(config),
+    rejectAction: allowed ? null : groupRejectAction(config),
   });
 }
