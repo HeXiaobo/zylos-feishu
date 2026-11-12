@@ -399,19 +399,27 @@ DM and group access are controlled by **independent** top-level policies:
 1. `groupPolicy` = `disabled`? → all group messages dropped
 2. `groupPolicy` = `open`? → respond to @mentions from any group
 3. `groupPolicy` = `allowlist`? → only configured groups; unlisted groups → only owner passes, others dropped silently
-4. Per-group `allowFrom` set? → only listed senders pass (owner always bypasses)
+4. Per-group `allowFrom` contains `*` or the sender? → pass
 5. Sender in global or group `internalCrossTenantUsers`? → pass
 6. Sender `tenant_key` in group `allowTenants` (or, when the group sets none, in global `groupAllowTenants`)? → pass
 7. None of `allowFrom`, `internalCrossTenantUsers`, and the applicable tenant list configured? → every member passes (legacy behavior)
-8. Otherwise denied: `groupRejectMode: "silent"` (default) logs only; `"reply"` answers once with `groupRejectText` and only when the bot was explicitly @mentioned
+8. Otherwise denied
 9. Smart group (mode: `smart`)? → receive all messages, no @mention needed
 10. Not smart? → only @mentions are processed, other messages are logged only
 
+Steps 4–6 are a **union**: any one of the three grants admits the sender. A
+per-group `allowFrom` that misses a sender does not veto a cross-tenant or
+tenant grant, so the old per-group list keeps working while the tenant lists are
+switched on for the same group.
+
+Every group denial in steps 1–3 and 8 follows `groupRejectMode: "silent"`
+(default, logs only) or `"reply"` (answers once with `groupRejectText`, and only
+when the bot was explicitly @mentioned). The denial result itself never changes.
+DM rejections are not affected.
+
 A per-group `allowTenants` **replaces** the global `groupAllowTenants` for that chat.
 `internalCrossTenantUsers` is additive: the global list plus the group list. An
-explicit group `allowFrom` stays authoritative; when it denies a sender, a tenant
-or cross-tenant grant does not apply. An empty `tenantKey` never satisfies the
-tenant allowlist.
+empty `tenantKey` never satisfies the tenant allowlist.
 
 **Key points:**
 - Owner always bypasses all access checks
@@ -419,6 +427,13 @@ tenant allowlist.
 - Group access is controlled by `groupPolicy` + `groups` config + per-group `allowFrom` + the optional sender tenant/cross-tenant lists
 - No per-user group whitelist outside config; use per-group `allowFrom` (specific senders), `internalCrossTenantUsers` (teammates from other tenants), or `groupAllowTenants` (whole tenants)
 - Every sender-policy name lives in `config.json` only; the code hardcodes no tenant key or open_id
+
+Known limitation, by design: the historical-message backfill (`getContextWithFallback`)
+inserts recent group messages as context without re-running the sender policy.
+Feishu's history API returns sender ids without a trustworthy `tenant_key`, so a
+message the live ingress rejected can still appear as context for the next
+allowed message in that group. Fixing it needs an identity lookup per history
+entry; this version does not include it.
 
 ### Groups Config Format
 

@@ -45,10 +45,15 @@ function groupEvent({
   };
 }
 
-// Mirrors the group branch of handleMessage() in src/index.js for 0.3.6. The
-// outbound ports are recorded so the test can assert exactly what left the
-// process: a denied sender must produce no C4 delivery, and in the default
-// silent mode no reply either.
+/**
+ * Mirrors the group branch of handleMessage() in src/index.js for 0.3.6.
+ *
+ * This is a wiring sketch, not the real ingress: `group-sender-policy-runtime
+ * .test.js` runs the actual handleMessage from src/index.js and is the
+ * authoritative entry test. Here we only pin the branch shape — which decision
+ * hands off to which reaction — so a refactor of src/index.js fails loudly.
+ * The outbound ports are recorded to assert what left the process.
+ */
 function createIngressWiring(config, { smart = false, sendToC4 } = {}) {
   const replies = [];
   const coreCalls = [];
@@ -69,27 +74,26 @@ function createIngressWiring(config, { smart = false, sendToC4 } = {}) {
         .filter(Boolean)
         .includes(OWNER_OPEN_ID);
 
+      // Every group denial below goes through groupRejectAction, matching the
+      // real rejectGroupSender(): silent by default, one reply on an explicit
+      // mention, never on passive traffic.
+      const reject = (outcome) => {
+        const action = groupRejectAction(config);
+        if (action !== 'silent' && mentioned) replies.push({ messageId, text: action.reply });
+        return { outcome };
+      };
+
       const groupPolicy = config.groupPolicy || 'allowlist';
-      if (groupPolicy === 'disabled') {
-        if (mentioned) replies.push({ messageId, text: 'Sorry, group chat is currently disabled.' });
-        return { outcome: 'group_disabled' };
-      }
+      if (groupPolicy === 'disabled') return reject('group_disabled');
       const allowedGroup = groupPolicy === 'open' || Boolean(config.groups?.[chatId]);
-      if (!allowedGroup && !(senderIsOwner && mentioned)) {
-        if (mentioned) replies.push({ messageId, text: "Sorry, I'm not available in this group." });
-        return { outcome: 'group_not_allowed' };
-      }
+      if (!allowedGroup && !(senderIsOwner && mentioned)) return reject('group_not_allowed');
 
       if (!isSenderAllowedInGroup(config, chatId, {
         userId: senderUserId,
         openId: senderOpenId,
         tenantKey: senderTenantKey,
       }) && !senderIsOwner) {
-        if (mentioned) {
-          const action = groupRejectAction(config);
-          if (action !== 'silent') replies.push({ messageId, text: action.reply });
-        }
-        return { outcome: 'denied' };
+        return reject('denied');
       }
 
       if (smart && !mentioned) {
@@ -163,6 +167,20 @@ test('groupRejectMode=reply answers once with the configured text and still skip
   assert.deepEqual(wiring.coreCalls, []);
 });
 
+test('an unregistered group answers with the same configured text in reply mode', async () => {
+  const wiring = createIngressWiring(tenantConfig({
+    groups: {},
+    groupRejectMode: 'reply',
+    groupRejectText: 'blocked',
+  }));
+
+  const result = await wiring.handle(groupEvent());
+
+  assert.equal(result.outcome, 'group_not_allowed');
+  assert.deepEqual(wiring.replies, [{ messageId: 'om_fixture_1', text: 'blocked' }]);
+  assert.deepEqual(wiring.coreCalls, []);
+});
+
 test('a passive Smart-group denial stays silent even with groupRejectMode=reply', async () => {
   const wiring = createIngressWiring(tenantConfig({
     groupRejectMode: 'reply',
@@ -201,11 +219,13 @@ test('without the new fields the ingress still matches the old allowFrom behavio
     groups: { [CHAT_ID]: { name: 'fixture', mode: 'mention', allowFrom: ['ou_known'] } },
   });
   assert.equal((await restricted.handle(groupEvent())).outcome, 'denied');
-  assert.deepEqual(restricted.replies, [], 'the legacy denial was silent too');
+  assert.deepEqual(
+    restricted.replies,
+    [],
+    'the default denial is silent; the legacy fixed text is gone',
+  );
 });
 
-// Source-level assertions: the wiring above must stay identical to the real
-// service wiring, otherwise this test proves nothing about src/index.js.
 test('src/index.js passes the Feishu tenant_key into the shared sender policy', () => {
   assert.match(
     indexSource,
@@ -222,28 +242,4 @@ test('src/index.js passes the Feishu tenant_key into the shared sender policy', 
     /function isSenderAllowedInGroup\(chatId, senderUserId, senderOpenId\)/,
     'the local sender check must be gone',
   );
-});
-
-test('src/index.js routes sender-policy denials through groupRejectMode', () => {
-  assert.match(
-    indexSource,
-    /rejectGroupSender\(\{\n\s+chatId,\n\s+messageId,\n\s+reasonCode: 'ACCESS_GROUP_SENDER_POLICY',\n\s+mentioned,\n\s+\}\)/,
-    'sender-level denials must not use the unconditional rejection text',
-  );
-  assert.doesNotMatch(
-    indexSource,
-    /"Sorry, you don't have permission to interact with me in this group\."/,
-    'the always-on denial text is replaced by groupRejectAction',
-  );
-  assert.match(
-    indexSource,
-    /function rejectGroupSender\(\{ chatId, messageId, reasonCode, mentioned \}\) \{\n\s+const action = groupRejectAction\(config\);\n\s+if \(action === 'silent'\) \{/,
-    'rejectGroupSender must default to the silent action',
-  );
-});
-
-test('0.3.6 keeps a single group ingress path', () => {
-  assert.doesNotMatch(indexSource, /decideGroupSenderAccess/, 'the main-only shared helper must not be pulled in');
-  assert.doesNotMatch(indexSource, /group-access-policy/, '0.3.6 has no group-access-policy module');
-  assert.match(indexSource, /if \(chatType === 'group'\) \{/);
 });

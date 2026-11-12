@@ -707,18 +707,22 @@ function isSmartGroup(chatId) {
 }
 
 /**
- * Apply the configured reaction to a denied group sender. `silent` only logs;
+ * Apply the configured reaction to a denied group message. `silent` only logs;
  * `reply` sends exactly one configured message, and only when the bot was
  * explicitly mentioned so passive Smart traffic stays zero-outbound.
+ *
+ * Every group-level denial (group disabled, group not registered, sender not
+ * allowed) goes through here, so `groupRejectMode` covers all of them. The
+ * denial result itself is unchanged; the owner never reaches this function.
  */
 function rejectGroupSender({ chatId, messageId, reasonCode, mentioned }) {
   const action = groupRejectAction(config);
   if (action === 'silent') {
-    console.log(`[feishu] Group sender rejection stays silent chat=${chatId} reason=${reasonCode}`);
+    console.log(`[feishu] Group rejection stays silent chat=${chatId} reason=${reasonCode}`);
     return Promise.resolve(false);
   }
   if (!mentioned) {
-    console.log(`[feishu] Group sender rejection stays silent (no mention) chat=${chatId} reason=${reasonCode}`);
+    console.log(`[feishu] Group rejection stays silent (no mention) chat=${chatId} reason=${reasonCode}`);
     return Promise.resolve(false);
   }
   return replyToMessage(messageId, action.reply).then(() => true).catch(() => false);
@@ -1257,8 +1261,16 @@ async function handleMessage(data) {
     const senderIsOwner = isOwner(senderUserId, senderOpenId);
     const groupPolicy = config.groupPolicy || 'allowlist';
     if (groupPolicy === 'disabled') {
-      if (mentioned) {
-        replyToMessage(messageId, "Sorry, group chat is currently disabled.").catch(() => {});
+      // The denial result is unchanged (even the owner is refused in a disabled
+      // group); the configured reaction is only for non-owners.
+      if (mentioned && !senderIsOwner) {
+        console.log(`[feishu] Group policy disabled, rejecting group message from ${senderUserId}`);
+        rejectGroupSender({
+          chatId,
+          messageId,
+          reasonCode: 'ACCESS_GROUP_DISABLED',
+          mentioned,
+        }).catch(() => {});
       }
       console.log(`[feishu] Group policy disabled, ignoring group message from ${senderUserId}`);
       return;
@@ -1270,7 +1282,12 @@ async function handleMessage(data) {
     if (!allowedGroup && !(senderIsOwner && mentioned)) {
       if (mentioned) {
         console.log(`[feishu] Group ${chatId} not allowed by policy, rejecting`);
-        replyToMessage(messageId, "Sorry, I'm not available in this group.").catch(() => {});
+        rejectGroupSender({
+          chatId,
+          messageId,
+          reasonCode: 'ACCESS_GROUP_NOT_ALLOWED',
+          mentioned,
+        }).catch(() => {});
       } else {
         console.log(`[feishu] Group ${chatId} not allowed by policy, ignoring`);
       }

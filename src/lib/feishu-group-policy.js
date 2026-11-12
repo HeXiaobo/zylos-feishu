@@ -89,8 +89,10 @@ function crossTenantAllowList(config, groupConfig) {
  *      tenant list configured → legacy behavior, every group member allowed.
  *   5. Otherwise denied. An empty `tenantKey` can never satisfy step 3.
  *
- * An explicit sender list is authoritative for the group: when it denies a
- * sender, a tenant or cross-tenant grant for that same sender does not apply.
+ * The three grants are alternatives (union), not exceptions to each other: an
+ * `allowFrom` list that misses a sender does not veto a cross-tenant or tenant
+ * grant. The legacy per-group list therefore keeps working while the tenant
+ * lists are switched on for the same group.
  */
 export function isSenderAllowedInGroup(config, chatId, {
   userId,
@@ -103,7 +105,6 @@ export function isSenderAllowedInGroup(config, chatId, {
   const allowFrom = normalizeList(groupConfig?.allowFrom);
   if (allowFrom.includes('*')) return true;
   if (senderIds.some((id) => allowFrom.includes(id))) return true;
-  if (allowFrom.length > 0) return false;
 
   const crossTenantUsers = crossTenantAllowList(config, groupConfig);
   if (senderIds.some((id) => crossTenantUsers.includes(id))) return true;
@@ -114,7 +115,7 @@ export function isSenderAllowedInGroup(config, chatId, {
     return true;
   }
 
-  if (crossTenantUsers.length > 0 || tenants.length > 0) return false;
+  if (allowFrom.length > 0 || crossTenantUsers.length > 0 || tenants.length > 0) return false;
   return true;
 }
 
