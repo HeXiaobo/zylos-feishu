@@ -13,7 +13,14 @@ import crypto from 'crypto';
 import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { pathToFileURL } from 'node:url';
 import * as Lark from '@larksuiteoapi/node-sdk';
+
+// Reject library imports before loading credentials or initializing runtime state.
+// Tests and scripts must import pure modules from src/lib/ instead.
+if (!process.argv[1] || import.meta.url !== pathToFileURL(path.resolve(process.argv[1])).href) {
+  throw new Error('src/index.js is a service entry point; execute it directly and import src/lib/* for library use.');
+}
 
 // Load .env from ~/zylos/.env (absolute path, not cwd-dependent)
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
