@@ -72,7 +72,24 @@ zylos uninstall feishu
 | Smart group message | Receives all messages |
 | @mention in allowed group | Responds with recent context |
 | Owner @mention in any group | Always responds |
-| Unknown user | Ignored |
+| Allowed tenant / cross-tenant teammate | Responds like a group member |
+| Unknown user | Ignored silently (`groupRejectMode: "silent"`) |
+
+Group sender policy can admit a whole Feishu tenant (`groupAllowTenants`, with a
+per-group `allowTenants` override) and individual cross-tenant teammates
+(`internalCrossTenantUsers`). The three grants — per-group `allowFrom`, the
+cross-tenant list, and the tenant list — are a union: any one of them admits the
+sender, so a group that still has an old `allowFrom` list keeps working while
+tenant admission is switched on. A denied sender is ignored silently by default;
+`groupRejectMode: "reply"` answers once with `groupRejectText` and only on an
+explicit bot @mention. All group denials (disabled group, unregistered group,
+denied sender) follow that setting; DM rejections are unchanged. With none of
+these fields set, the previous `allowFrom` behavior is unchanged. All names live
+in `config.json`; no tenant or user is hardcoded.
+
+Known limitation: the historical-message backfill is not filtered by sender
+(Feishu's history API carries no trustworthy `tenant_key`), so a message the
+live ingress rejected can still appear as context for a later allowed message.
 
 ## Documentation
 

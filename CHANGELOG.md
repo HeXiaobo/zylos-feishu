@@ -8,6 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Group sender policy can admit a whole Feishu tenant (`groupAllowTenants`,
+  overridable per group with `groups.<chat_id>.allowTenants`) and individual
+  cross-tenant teammates (`internalCrossTenantUsers`, additive per group).
+- `groupRejectMode: "silent" | "reply"` controls what a denied group sender
+  sees. It defaults to `silent`; `reply` sends `groupRejectText` once and only
+  on an explicit bot @mention. Passive Smart-group traffic stays silent.
+- Admin CLI: `set-group-tenants`, `set-group-allow-tenants`,
+  `add-cross-tenant-user`, `remove-cross-tenant-user`, `set-group-reject-mode`.
+  `list-groups` and `list-dm-allow` print the new fields.
+
+### Changed
+- The local `isSenderAllowedInGroup` in `src/index.js` moved to
+  `src/lib/feishu-group-policy.js` and now receives `config` and the inbound
+  `sender.tenant_key`.
+- The three group grants (`allowFrom`, `internalCrossTenantUsers`, the applicable
+  `allowTenants`) are a union. An `allowFrom` miss no longer short-circuits the
+  cross-tenant and tenant checks, so an existing per-group sender list keeps
+  working after tenant admission is enabled for the same group.
+- Every group denial — disabled group, unregistered group, denied sender — now
+  follows `groupRejectMode`; previously only the sender-level denial did. The
+  denial result is unchanged and the owner is never sent a rejection.
+
+### Known limitation
+- The historical-message backfill is not filtered by sender. Feishu's history
+  API returns sender ids without a trustworthy `tenant_key`, so a message the
+  live ingress rejected can still be injected as group/topic context for a
+  later allowed message. Closing it needs a per-entry identity lookup; not in
+  this change.
+
+### Compatibility
+- Existing `config.json` files need no change. Missing `groupAllowTenants`,
+  `internalCrossTenantUsers`, `groupRejectMode`, and `groupRejectText` load as
+  `[]`, `[]`, `'silent'`, and `''`. With none of them configured, sender
+  decisions match the previous `allowFrom` behavior.
+- No tenant key or open_id is hardcoded; names come only from config.
+- This is a backport of the same change on `main` (PR #105); config field names
+  and the decision order are identical, so no config edit is needed when the
+  mirror later moves to `main`.
+
+### Added
 - **`[MEDIA:card]` sends a prepared Feishu card 2.0 file through C4.**
   `scripts/send.js` now accepts `[MEDIA:card]<absolute path>`, the third media
   type beside image and file, so an agent that generated a card JSON document
