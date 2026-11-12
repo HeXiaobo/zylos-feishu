@@ -27,6 +27,7 @@ import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermis
 import { getUserInfo } from './lib/contact.js';
 import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
+import { readInteractiveCard } from './lib/interactive-card-inbound.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 // 3ai-dedupe: one claim per message id, shared with the feishu-recovery poller.
@@ -1038,7 +1039,8 @@ function extractMessageContent(message) {
     case 'sticker':
       return { text: `[sticker, file_key: ${content.file_key || 'unknown'}]`, imageKeys: [], fileKey: null, fileName: null };
     case 'interactive':
-      return { text: extractInteractiveText(content), imageKeys: [], fileKey: null, fileName: null };
+      // Fetch card content only after the sender passes the access gate.
+      return { text: null, imageKeys: [], fileKey: null, fileName: null, deferredInteractiveCardId: message.message_id, eventCardContent: content };
     case 'merge_forward':
       // Deliberately no remote fetch here: this runs before any DM/group access
       // gate in handleMessageEvent, and fetchMergeForwardContent is a live
@@ -1130,11 +1132,12 @@ async function handleMessage(data) {
 
   const extracted = extractMessageContent(message);
   let { text } = extracted;
-  const { imageKeys, fileKey, fileName } = extracted;
+  let { imageKeys } = extracted;
+  const { fileKey, fileName } = extracted;
   // A pending merge_forward has no text yet (deliberately not fetched until the
   // DM/group access gate passes below) — log a fixed marker instead of real
   // content from a sender/chat that may end up rejected anyway.
-  console.log(`[feishu] ${chatType} message from ${senderUserId}: ${extracted.deferredMergeForwardId ? '[merge_forward, pending access check]' : ((text || '').substring(0, 50) || '[media]')}...`);
+  console.log(`[feishu] ${chatType} message from ${senderUserId}: ${(extracted.deferredMergeForwardId || extracted.deferredInteractiveCardId) ? '[message pending access check]' : ((text || '').substring(0, 50) || '[media]')}...`);
 
   // Build log text with file/image metadata
   let logText = text;
@@ -1155,6 +1158,24 @@ async function handleMessage(data) {
   // Thread context for topic messages
   let threadContext = null;
 
+  async function resolveInteractiveCard() {
+    if (!extracted.deferredInteractiveCardId) return;
+    try {
+      const { getClient } = await import('./lib/client.js');
+      const card = await readInteractiveCard(extracted.deferredInteractiveCardId, getClient(), extracted.eventCardContent);
+      text = card.text;
+      imageKeys = card.imageKeys;
+    } catch (error) {
+      console.error(`[feishu] interactive card read-back failed: ${error.message}`);
+      text = extractInteractiveText(extracted.eventCardContent);
+      imageKeys = [];
+    }
+    logText = text;
+    for (const imgKey of imageKeys) {
+      logText += `\n[image, image_key: ${imgKey}, msg_id: ${messageId}]`;
+    }
+  }
+
   // Private chat handling
   if (chatType === 'p2p') {
     if (!config.owner?.bound) {
@@ -1173,6 +1194,7 @@ async function handleMessage(data) {
       logText = text;
     }
 
+    await resolveInteractiveCard();
     await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
 
     // Add typing indicator
@@ -1286,6 +1308,8 @@ async function handleMessage(data) {
       text = await resolveMergeForwardText(extracted);
       logText = text;
     }
+
+    await resolveInteractiveCard();
 
     if (!smart && !mentioned) {
       if (allowedGroup) {
