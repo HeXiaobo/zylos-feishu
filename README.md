@@ -82,12 +82,27 @@ Outbound text defaults to interactive cards, including plain text. Set
 
 Received groups are registered automatically in smart mode unless an explicit
 mode already exists. `groupPolicy: disabled`, group `enabled: false`, and
-`allowFrom` restrictions still apply. Unknown groups default to external:
-`internal: false, gateMode: observe`. Mark a group `internal: true` only after
-confirming it has no external members; its default becomes `auto`. Per-group
-`gateMode` supports `off`, `observe`, `auto`. External groups always require a bot
-mention (or a reply to the bot) for delivery; other messages are gated and retained
-as context. No new Feishu event subscription is required.
+`allowFrom` restrictions still apply. On the first received message, the existing
+Feishu client calls `im.chat.get` and reads `external`. Internal groups automatically
+use `auto`; external groups use `observe`. The result is saved under
+`groups[chat_id].autoClassification`, cached for 24 hours, and refreshed on the next
+message after expiry. Failed queries retry on the next message; failure without
+cached evidence defaults to external. A cached result survives a failed refresh.
+
+The sender's `tenant_key` is also checked on every group message. A tenant outside
+`internalTenants` immediately marks automatic evidence external and switches to
+`observe`, including while a chat lookup is in flight. When `internalTenants` is
+absent, it contains only the bot's own tenant. The component obtains that identity
+from bot info or the authenticated tenant query and caches it as `bot.tenant_key`.
+If identity lookup is unavailable, an unknown sender tenant is treated as external.
+To add known internal tenants, configure `internalTenants: ["own_key", "other_key"]`.
+
+Manual `groups[chat_id].internal` and `gateMode` settings take precedence over
+automatic evidence. Leave `internal` absent to enable automatic classification;
+remove it to return to automatic classification. `gateMode` supports `off`,
+`observe`, `auto`. A group classified as external still requires a bot mention
+(or reply to the bot) for delivery; other messages are retained as context. No new
+Feishu event subscription is required.
 
 C4 supplies `C4_OUTBOUND_ID` (`C4_DELIVERY_ID` is an alias). The sender passes it
 as the Feishu `uuid`; later chunks use `:<index>`. The last stdout line is

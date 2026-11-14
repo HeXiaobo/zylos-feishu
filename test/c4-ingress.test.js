@@ -65,7 +65,7 @@ test('actual handler retains external unmentioned message without replies or typ
   const start = source.indexOf('async function handleMessage(data)');
   const end = source.indexOf('// Transport: WebSocket', start);
   const calls = []; const replies = [];
-  const context = { config: {}, botOpenId: 'ou_bot', botAppId: 'app_bot', isDuplicate: () => false,
+  const context = { config: {}, botOpenId: 'ou_bot', botAppId: 'app_bot', botTenantKey: 'own', classifyGroup: async () => false, isDuplicate: () => false,
     console: { log() {}, warn() {}, error() {} }, extractMessageContent: () => ({ text: '闲聊', imageKeys: [] }),
     buildEndpoint: () => 'oc_new|type:group', sendToC4: (...args) => calls.push(args),
     fetchQuotedMessage: async () => null, isBotMentioned, isOwner: () => false,

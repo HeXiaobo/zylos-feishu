@@ -26,7 +26,8 @@ import { ingressArgs, groupGatePolicy, smartGroup, receivedGroupAllowed, replyIs
 import { getConfig, watchConfig, saveConfig, DATA_DIR, getCredentials, stopWatching } from './lib/config.js';
 import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages } from './lib/message.js';
 import { getUserInfo } from './lib/contact.js';
-import { listChatMembers } from './lib/chat.js';
+import { listChatMembers, getChatInfo } from './lib/chat.js';
+import { createGroupClassifier } from './lib/group-classification.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
@@ -46,6 +47,8 @@ const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge
 // Bot identity (fetched at startup)
 let botOpenId = '';
 let botAppId = '';
+let botTenantKey = '';
+const classifyGroup = createGroupClassifier({ getChatInfo, saveConfig });
 let botAppName = '';
 
 // WSClient instance for graceful shutdown (websocket mode only)
@@ -1248,8 +1251,11 @@ async function handleMessage(data) {
     // explicit mode, allowFrom and internal settings take precedence.
     if (!config.groups?.[chatId] && isGroupAllowed(chatId)) {
       const mode = isSmartGroup(chatId) ? 'smart' : 'mention';
-      config.groups = { ...config.groups, [chatId]: { mode, internal: false } };
+      config.groups = { ...config.groups, [chatId]: { mode } };
       saveConfig(config);
+    }
+    if (isGroupAllowed(chatId)) {
+      await classifyGroup({ config, chatId, senderTenantKey: sender.tenant_key, botTenantKey });
     }
     const allowedGroup = isGroupAllowed(chatId);
     const smart = isSmartGroup(chatId);
@@ -1618,6 +1624,7 @@ if (!creds.app_id || !creds.app_secret) {
     if (res.code === 0 && res.bot) {
       botOpenId = res.bot.open_id;
       botAppName = res.bot.app_name || 'bot';
+      botTenantKey = res.bot.tenant_key || '';
       console.log(`[feishu] Bot identity: ${botAppName} (${botOpenId})`);
     } else {
       console.error(`[feishu] Warning: Could not fetch bot info: ${res.msg}`);
@@ -1625,6 +1632,20 @@ if (!creds.app_id || !creds.app_secret) {
   } catch (err) {
     // Never echo an Axios error object: it can contain the auth request body.
     safeLogger.error('[feishu] getBotInfo failed', err);
+  }
+
+  // Resolve the bot's own tenant with the existing authenticated SDK client.
+  // No additional event subscriptions or credentials are required.
+  if (!botTenantKey) {
+    try {
+      const { getClient } = await import('./lib/client.js');
+      const tenant = await getClient().tenant.tenant.query({});
+      if (tenant.code === 0) botTenantKey = tenant.data?.tenant?.tenant_key || '';
+    } catch { /* missing permission: unknown senders remain conservative */ }
+  }
+  if (botTenantKey && config.bot?.tenant_key !== botTenantKey) {
+    config.bot = { ...config.bot, tenant_key: botTenantKey };
+    saveConfig(config);
   }
 
   // Store app_id for exact bot message matching

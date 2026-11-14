@@ -1,4 +1,5 @@
 /** C4 ingress metadata, independent of SDK and network for contract tests. */
+import { effectiveInternal } from './group-classification.js';
 export function ingressArgs({ sourceId, chatId, senderId, mentioned = false, needsGate = false } = {}) {
   const args = [];
   for (const [flag, value] of [['--source-id', sourceId], ['--chat', chatId], ['--sender', senderId]]) {
@@ -9,11 +10,10 @@ export function ingressArgs({ sourceId, chatId, senderId, mentioned = false, nee
   return args;
 }
 
-// No existing tenant_key inventory is available. Only an explicit per-group
-// internal:true certifies an internal group. Unknown groups remain external.
+// Explicit user configuration wins over cached automatic evidence.
 export function groupGatePolicy(config, chatId) {
   const group = config.groups?.[chatId] || {};
-  const internal = group.internal === true;
+  const internal = effectiveInternal(group);
   let gateMode = group.gateMode || (internal ? 'auto' : 'observe');
   if (!['off', 'observe', 'auto'].includes(gateMode)) gateMode = 'observe';
   if (!internal && gateMode === 'auto') gateMode = 'observe';

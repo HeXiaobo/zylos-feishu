@@ -159,6 +159,7 @@ export async function getChatInfo(chatId) {
           description: res.data.description,
           memberCount: res.data.user_count,
           owner: res.data.owner_id,
+          external: res.data.external,
         },
       };
     } else {

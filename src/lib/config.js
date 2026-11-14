@@ -38,10 +38,13 @@ export const DEFAULT_CONFIG = {
   groupPolicy: 'allowlist',
   // Per-group configuration map
   // Format: { "oc_xxx": { name, mode, requireMention, allowFrom, historyLimit, internal, gateMode, enabled } }
-  // internal:true certifies no external members; unknown groups default external.
+  // internal is an optional manual override; autoClassification caches chat.external.
+  // Missing/failed evidence defaults external; successful evidence refreshes daily.
   // gateMode: off | observe | auto; external groups cannot use auto.
   // mode: "mention" (respond to @mentions) or "smart" (receive all messages)
   groups: {},
+  // Optional internal tenant allowlist. When absent, use bot.tenant_key only.
+  // internalTenants: ['tenant_key'],
   // Legacy fields (kept for backward compatibility, migrated to groups on upgrade)
   // group_whitelist: { enabled: true },
   // allowed_groups: [],
