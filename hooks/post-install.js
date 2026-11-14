@@ -23,6 +23,8 @@ import {
   installLarkCliSkills,
   syncCredentialsToLarkCli,
 } from './post-install-shared.js';
+import { installConfig } from './config-migrations.js';
+import { arch2Enabled } from '../src/lib/arch2.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,13 +34,10 @@ const HOME = process.env.HOME;
 const DATA_DIR = path.join(HOME, 'zylos/components/feishu');
 const ENV_FILE = path.join(HOME, 'zylos/.env');
 
-// Minimal initial config - full defaults are in src/lib/config.js
-const INITIAL_CONFIG = {
-  enabled: true,
-  connection_mode: 'websocket',
-  webhook_port: 3458,
-  message: { useMarkdownCard: true, alwaysCard: true }
-};
+// Minimal initial config - full defaults are in src/lib/config.js.
+// The arch2 additions (alwaysCard) are only seeded when the master switch is on,
+// so a fresh install with the switch off matches baseline 8c0a3e2 exactly.
+const INITIAL_CONFIG = installConfig({ arch2: arch2Enabled() });
 
 const isInteractive = process.stdin.isTTY === true;
 

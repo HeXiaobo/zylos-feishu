@@ -24,8 +24,14 @@ import { sendCard } from '../src/lib/card-send.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup as rawSendToGroup, sendMessage as rawSendMessage, uploadImage, sendImage as rawSendImage, uploadFile, sendFile as rawSendFile, replyToMessage as rawReplyToMessage, sendMarkdownCard as rawSendMarkdownCard, replyMarkdownCard as rawReplyMarkdownCard } from '../src/lib/message.js';
 import { createDelivery } from '../src/lib/c4-delivery.js';
+import { arch2Enabled } from '../src/lib/arch2.js';
 
-const deliveryId = process.env.C4_DELIVERY_ID || process.env.C4_OUTBOUND_ID;
+// The delivery receipt (uuid reuse, C4_RESULT line, non-zero exit on an
+// unconfirmed send) is an arch2 feature. With the master switch off the sender
+// behaves exactly like baseline 8c0a3e2: no uuid, no receipt line, no extra
+// failure modes, even if the caller passes C4_OUTBOUND_ID.
+const ARCH2 = arch2Enabled();
+const deliveryId = ARCH2 ? (process.env.C4_DELIVERY_ID || process.env.C4_OUTBOUND_ID) : undefined;
 const delivery = createDelivery(deliveryId);
 const sendToGroup = delivery.wrap(rawSendToGroup, 3);
 const sendMessage = delivery.wrap(rawSendMessage, 4);
@@ -35,9 +41,11 @@ const replyToMessage = delivery.wrap(rawReplyToMessage, 3);
 const sendMarkdownCard = delivery.wrap(rawSendMarkdownCard, 3);
 const replyMarkdownCard = delivery.wrap(rawReplyMarkdownCard, 2);
 // Synchronous exit hook also covers validation/disabled/usage failures.
-process.once('exit', code => {
-  console.log(`C4_RESULT ${JSON.stringify(delivery.result(code))}`);
-});
+if (ARCH2) {
+  process.once('exit', code => {
+    console.log(`C4_RESULT ${JSON.stringify(delivery.result(code))}`);
+  });
+}
 import { shouldUseCard } from '../src/lib/card-decision.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
@@ -232,7 +240,7 @@ async function sendCardChunk(chunk, isFirstChunk) {
  * Reply failures fall back to sendMessage (DM) or sendToGroup (group).
  */
 async function sendText(endpoint, text) {
-  const useCard = shouldUseCard(config.message, text);
+  const useCard = shouldUseCard(config.message, text, ARCH2);
   const maxLen = useCard ? CARD_MAX_LENGTH : MAX_LENGTH;
   const chunks = splitMessage(text, maxLen);
   const { chatId, root, parent, msg, type } = parsedEndpoint;

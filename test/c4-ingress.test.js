@@ -14,7 +14,7 @@ test('actual sendToC4 passes metadata through execFile; retry uses same source i
   const source = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
   const functionSource = source.slice(source.indexOf('function sendToC4('), source.indexOf('/**\n * Build structured endpoint'));
   const calls = [];
-  const context = { ingressArgs, INTERNAL_SECRET: 'fixture', C4_RECEIVE: '/fixture/c4-receive.js', process: { env: {} }, console: { log() {}, warn() {}, error() {} }, parseC4Response: () => null,
+  const context = { ingressArgs, arch2IngressArgs: (on, metadata) => (on ? ingressArgs(metadata) : []), ARCH2: true, INTERNAL_SECRET: 'fixture', C4_RECEIVE: '/fixture/c4-receive.js', process: { env: {} }, console: { log() {}, warn() {}, error() {} }, parseC4Response: () => null,
     setTimeout: cb => cb(), execFile: (_cmd, args, _opts, cb) => { calls.push(args); cb(calls.length === 1 ? Error('transient') : null, ''); } };
   vm.runInNewContext(`${functionSource}\nsendToC4('feishu','oc_1|type:group','hi',null,{sourceId:'om_1',chatId:'oc_1',senderId:'ou_1',mentioned:false,needsGate:true});`, context);
   assert.equal(calls.length, 2);
@@ -65,7 +65,7 @@ test('actual handler retains external unmentioned message without replies or typ
   const start = source.indexOf('async function handleMessage(data)');
   const end = source.indexOf('// Transport: WebSocket', start);
   const calls = []; const replies = [];
-  const context = { config: {}, botOpenId: 'ou_bot', botAppId: 'app_bot', botTenantKey: 'own', classifyGroup: async () => false, isDuplicate: () => false,
+  const context = { config: {}, ARCH2: true, botOpenId: 'ou_bot', botAppId: 'app_bot', botTenantKey: 'own', classifyGroup: async () => false, isDuplicate: () => false,
     console: { log() {}, warn() {}, error() {} }, extractMessageContent: () => ({ text: '闲聊', imageKeys: [] }),
     buildEndpoint: () => 'oc_new|type:group', sendToC4: (...args) => calls.push(args),
     fetchQuotedMessage: async () => null, isBotMentioned, isOwner: () => false,

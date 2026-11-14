@@ -21,6 +21,10 @@ import {
   installLarkCliSkills,
   syncCredentialsToLarkCli,
 } from './post-install-shared.js';
+import { migrateMessageSettings } from './config-migrations.js';
+import { arch2Enabled } from '../src/lib/arch2.js';
+
+const ARCH2 = arch2Enabled();
 
 requireMinCoreVersion();
 
@@ -213,36 +217,14 @@ if (fs.existsSync(configPath)) {
     }
 
     // Migration 8: Ensure message settings
-    if (!config.message) {
-      config.message = { context_messages: 10 };
-      migrated = true;
-      migrations.push('Added message settings');
-    } else {
-      if (config.message.context_messages === undefined) {
-        config.message.context_messages = 10;
+    // Message defaults live in hooks/config-migrations.js so the switch-off and
+    // switch-on paths are both testable. With arch2 off nothing new is written.
+    {
+      const messageMigration = migrateMessageSettings(config, { arch2: ARCH2 });
+      if (messageMigration.migrated) {
         migrated = true;
-        migrations.push('Added message.context_messages');
+        migrations.push(...messageMigration.migrations);
       }
-      // Clean up removed field
-      if (config.message.max_length !== undefined) {
-        delete config.message.max_length;
-        migrated = true;
-        migrations.push('Removed unused message.max_length');
-      }
-    }
-
-    // Migration 9: Default useMarkdownCard to true
-    if (config.message.useMarkdownCard === undefined) {
-      config.message.useMarkdownCard = true;
-      migrated = true;
-      migrations.push('Added message.useMarkdownCard=true');
-    }
-
-    // Default plain text to cards, preserving explicit false.
-    if (config.message.alwaysCard === undefined) {
-      config.message.alwaysCard = true;
-      migrated = true;
-      migrations.push('Added message.alwaysCard=true');
     }
 
     // Migration 10: Migrate legacy group config to new groups map

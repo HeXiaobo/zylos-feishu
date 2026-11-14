@@ -21,7 +21,8 @@ import { safeLogger } from './lib/safe-logger.js';
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 // zylos-lab-mention-patch: @everyone is not a mention of this bot.
 import { isBotMentioned } from './lib/feishu-group-policy.js';
-import { ingressArgs, groupGatePolicy, smartGroup, receivedGroupAllowed, replyIsBot } from './lib/c4-ingress.js';
+import { ingressArgs, arch2IngressArgs, groupGatePolicy, smartGroup, receivedGroupAllowed, replyIsBot } from './lib/c4-ingress.js';
+import { arch2Enabled } from './lib/arch2.js';
 
 import { getConfig, watchConfig, saveConfig, DATA_DIR, getCredentials, stopWatching } from './lib/config.js';
 import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages } from './lib/message.js';
@@ -43,6 +44,9 @@ import { isDmAllowed as isDmAllowedByConfig, isOwner as isOwnerByConfig } from '
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
+
+// Master compatibility switch (card F). Off means the pre-arch2 behaviour.
+const ARCH2 = arch2Enabled();
 
 // Bot identity (fetched at startup)
 let botOpenId = '';
@@ -674,14 +678,14 @@ function resolveGroupConfig(chatId) {
  * Also handles backward compat with legacy allowed_groups/smart_groups.
  */
 function isGroupAllowed(chatId) {
-  return receivedGroupAllowed(config, chatId);
+  return receivedGroupAllowed(config, chatId, ARCH2);
 }
 
 /**
  * Check if a group is in "smart" mode (receives all messages without @mention).
  */
 function isSmartGroup(chatId) {
-  return smartGroup(config, chatId);
+  return smartGroup(config, chatId, ARCH2);
 }
 
 /**
@@ -750,7 +754,7 @@ function sendToC4(source, endpoint, content, onReject, metadata = {}) {
     '--endpoint', endpoint,
     '--json',
     '--content', content,
-    ...ingressArgs(metadata),
+    ...arch2IngressArgs(ARCH2, metadata),
   ];
 
   execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
@@ -1134,7 +1138,9 @@ async function handleMessage(data) {
   const endpoint = buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId });
   const ingress = { sourceId: messageId, chatId, senderId: senderOpenId,
     mentioned: chatType !== 'group', needsGate: chatType === 'group' };
-  const deliverToC4 = (source, address, content, onReject) => sendToC4(source, address, content, onReject, ingress);
+  const deliverToC4 = (source, address, content, onReject) => (ARCH2
+    ? sendToC4(source, address, content, onReject, ingress)
+    : sendToC4(source, address, content, onReject));
 
   // quotedContent is fetched lazily after routing eligibility checks
   let quotedContent = null;
@@ -1235,7 +1241,9 @@ async function handleMessage(data) {
   // Group chat handling
   if (chatType === 'group') {
     // A reply to the bot counts as a direct mention. Resolve only its parent.
-    const reply = parentId ? await fetchQuotedMessage(parentId) : null;
+    // Baseline 8c0a3e2 only looks at real @mentions, so skip the extra fetch
+    // entirely when the master switch is off.
+    const reply = ARCH2 && parentId ? await fetchQuotedMessage(parentId) : null;
     const mentioned = isBotMentioned(mentions, botOpenId) || reply?.isBot === true;
     ingress.mentioned = mentioned;
     const senderIsOwner = isOwner(senderUserId, senderOpenId);
@@ -1249,19 +1257,21 @@ async function handleMessage(data) {
     }
     // Receiving a group message proves membership. Register once; existing
     // explicit mode, allowFrom and internal settings take precedence.
-    if (!config.groups?.[chatId] && isGroupAllowed(chatId)) {
+    if (ARCH2 && !config.groups?.[chatId] && isGroupAllowed(chatId)) {
       const mode = isSmartGroup(chatId) ? 'smart' : 'mention';
       config.groups = { ...config.groups, [chatId]: { mode } };
       saveConfig(config);
     }
-    if (isGroupAllowed(chatId)) {
+    if (ARCH2 && isGroupAllowed(chatId)) {
       await classifyGroup({ config, chatId, senderTenantKey: sender.tenant_key, botTenantKey });
     }
     const allowedGroup = isGroupAllowed(chatId);
     const smart = isSmartGroup(chatId);
     const smartNoMention = smart && !mentioned;
 
-    if (!allowedGroup) {
+    // Baseline lets the owner reach a bot @mentioned in an unlisted group.
+    const ownerReachesAnyGroup = !ARCH2 && senderIsOwner && mentioned;
+    if (!allowedGroup && !ownerReachesAnyGroup) {
       if (mentioned) {
         console.log(`[feishu] Group ${chatId} not allowed by policy, rejecting`);
         replyToMessage(messageId, "Sorry, I'm not available in this group.").catch(() => {});
@@ -1286,16 +1296,28 @@ async function handleMessage(data) {
       logText = text;
     }
 
-    // Send every permitted message to durable gating, including observe/off
-    // messages, so filtered context remains available. Never emit rejection
-    // replies or typing indicators for unmentioned messages in external groups.
-    const gatePolicy = groupGatePolicy(config, chatId);
-    if (!mentioned && (!smart || !gatePolicy.internal || gatePolicy.gateMode !== 'auto')) {
-      await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
-      const senderName = await resolveUserName(senderUserId, senderOpenId);
-      const msg = formatMessage('group', senderName, resolveMentions(logText, mentions) || '[media]', [], null, { groupName: getGroupName(chatId), smartHint: true });
-      deliverToC4('feishu', endpoint, msg, null);
-      return;
+    if (!ARCH2) {
+      // Baseline: only @mentions and smart groups are delivered; everything else
+      // is logged as context and dropped.
+      if (!smart && !mentioned) {
+        if (allowedGroup) {
+          await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
+        }
+        console.log(`[feishu] Group message without @mention, logged only`);
+        return;
+      }
+    } else {
+      // Send every permitted message to durable gating, including observe/off
+      // messages, so filtered context remains available. Never emit rejection
+      // replies or typing indicators for unmentioned messages in external groups.
+      const gatePolicy = groupGatePolicy(config, chatId);
+      if (!mentioned && (!smart || !gatePolicy.internal || gatePolicy.gateMode !== 'auto')) {
+        await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
+        const senderName = await resolveUserName(senderUserId, senderOpenId);
+        const msg = formatMessage('group', senderName, resolveMentions(logText, mentions) || '[media]', [], null, { groupName: getGroupName(chatId), smartHint: true });
+        deliverToC4('feishu', endpoint, msg, null);
+        return;
+      }
     }
 
     // Group user access is controlled by groupPolicy + groups config + per-group allowFrom.

@@ -14,7 +14,7 @@ function runSend(t, content = '普通文本', extra = {}, endpoint = 'oc_1|type:
   fs.mkdirSync(path.join(home, 'zylos/components/feishu'), { recursive: true });
   fs.writeFileSync(path.join(home, 'zylos/components/feishu/config.json'), JSON.stringify({ enabled: true }));
   const result = spawnSync(process.execPath, ['--no-warnings', '--experimental-loader', loader, 'scripts/send.js', endpoint, content], {
-    cwd: ROOT, env: { ...process.env, HOME: home, C4_OUTBOUND_ID: '42', C4_DELIVERY_ID: '', CARD_ENTRY_SEND_FAIL: '', ...extra }, encoding: 'utf8', timeout: 10000,
+    cwd: ROOT, env: { ...process.env, ZYLOS_ARCH2: '1', HOME: home, C4_OUTBOUND_ID: '42', C4_DELIVERY_ID: '', CARD_ENTRY_SEND_FAIL: '', ...extra }, encoding: 'utf8', timeout: 10000,
   });
   const lines = result.stdout.trim().split('\n');
   return { ...result, receipt: JSON.parse(lines.at(-1).replace(/^C4_RESULT /, '')),

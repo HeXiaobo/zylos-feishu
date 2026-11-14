@@ -74,6 +74,7 @@ test('scripts/send.js routes every [MEDIA:card] input through card validation', 
           env: {
             ...process.env,
             HOME: home,
+            ZYLOS_ARCH2: '1',
             FEISHU_APP_ID: '',
             FEISHU_APP_SECRET: '',
             FEISHU_INTERNAL_SECRET: 'test_entry_secret',

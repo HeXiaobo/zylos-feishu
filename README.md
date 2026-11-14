@@ -74,11 +74,33 @@ zylos uninstall feishu
 | Owner @mention in any group | Always responds |
 | Unknown user | Ignored |
 
+## Compatibility Switch `ZYLOS_ARCH2`
+
+All of the behaviour in the next section is gated by one environment variable.
+
+| `ZYLOS_ARCH2` | Behaviour |
+|---|---|
+| unset, `0`, or anything other than the literal `1` | Pre-arch2 behaviour (baseline `8c0a3e2`): allowlist-only groups, no automatic group registration, no automatic internal/external classification, markdown-only cards, sender attaches no `uuid` and prints no `C4_RESULT` line |
+| `1` | New architecture; the individual settings below apply on top |
+
+Only the literal string `1` enables it. A typo (`true`, `yes`, `" 1"`) stays on the old
+path, because a mistake here must never widen who the bot answers in a group.
+
+The switch is read from the process environment (put it in `~/zylos/.env`). The
+policy reads it once at startup; the install/upgrade hooks and `scripts/send.js`
+read it per process. Changing it requires a service restart.
+
+With the switch off, nothing new is written to `config.json`: the upgrade hook does
+not add `message.alwaysCard`, and the receiver does not register groups in
+`config.groups`.
+
 ## Card Output
 
 Outbound text defaults to interactive cards, including plain text. Set
 `message.alwaysCard: false` for markdown-only cards, or
 `message.useMarkdownCard: false` to disable cards. Explicit settings survive upgrades.
+This section describes the switch-on behaviour; with `ZYLOS_ARCH2` off the component
+sends cards only for markdown, exactly as before.
 
 Received groups are registered automatically in smart mode unless an explicit
 mode already exists. `groupPolicy: disabled`, group `enabled: false`, and

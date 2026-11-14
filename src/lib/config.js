@@ -7,6 +7,15 @@
 
 import fs from 'fs';
 import path from 'path';
+import { arch2Enabled } from './arch2.js';
+
+// Message defaults per master switch. Exported so tests can check both states
+// without reloading the module.
+export function defaultMessageConfig(arch2) {
+  return arch2
+    ? { context_messages: 10, useMarkdownCard: true, alwaysCard: true }
+    : { context_messages: 10, useMarkdownCard: false };
+}
 
 const HOME = process.env.HOME;
 export const DATA_DIR = path.join(HOME, 'zylos/components/feishu');
@@ -56,11 +65,10 @@ export const DEFAULT_CONFIG = {
     port: 0
   },
   // Message settings
-  message: {
-    context_messages: 10,
-    useMarkdownCard: true,
-    alwaysCard: true
-  }
+  // Baseline 8c0a3e2 disables markdown cards and has no alwaysCard. Arch2 turns
+  // cards on by default. The master switch decides which default applies, so an
+  // upgrade with the switch off keeps the old output format.
+  message: defaultMessageConfig(arch2Enabled())
 };
 
 let config = null;

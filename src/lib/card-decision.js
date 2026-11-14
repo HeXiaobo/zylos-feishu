@@ -26,10 +26,12 @@ export function hasMarkdownContent(text) {
 /**
  * Should this text be sent as an interactive card?
  *
- * Cards are the default. Explicit useMarkdownCard:false disables cards;
- * alwaysCard:false keeps markdown detection only.
+ * Arch2 (the default here) sends cards unless cards are explicitly disabled.
+ * With the master switch off the decision is exactly the pre-arch2 one:
+ * markdown-only cards, everything else plain text.
  */
-export function shouldUseCard(messageConfig, text) {
+export function shouldUseCard(messageConfig, text, arch2 = true) {
+  if (!arch2) return Boolean(messageConfig?.useMarkdownCard && hasMarkdownContent(text));
   if (messageConfig?.useMarkdownCard === false) return false;
   if (messageConfig?.alwaysCard !== false) return true;
   return hasMarkdownContent(text);
