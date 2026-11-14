@@ -132,6 +132,37 @@ as the Feishu `uuid`; later chunks use `:<index>`. The last stdout line is
 Failures exit nonzero with `status: failed`; `uncertain: true` requires verification
 before any retry. Chunked sends return the last confirmed platform message ID.
 
+## Worker Sessions Cannot Send
+
+`scripts/send.js` refuses to run when `ZYLOS_TICKET_ROLE=worker` and exits
+non-zero, before argument parsing, so neither text, cards nor media reach the
+Feishu API. A worker reports through `progress`/`report`/`ask`/`handback` and the
+front desk sends the result. Any other value, or no value, behaves as before.
+
+**This is a default guard, not a security boundary.** It stops a worker that
+follows its instructions; it does not stop one that runs the Feishu API directly,
+unsets `ZYLOS_TICKET_ROLE`, or writes the instance database — worker sessions run
+under the same system user as the front desk. Real isolation (separate OS
+identity, no channel credentials, read-only instance database, tool access
+confined to one ticket) is next version, together with the key cabinet.
+
+## Known Limitations
+
+- **Multi-chunk replies only record the last platform message id.** Outbound rows
+  keep one `platform_msg_id`; a long reply split into several Feishu messages
+  stores only the final chunk's id (`wt-feishu/src/lib/c4-delivery.js`). Every
+  chunk still carries a stable `uuid` (`<id>:<index>`), so a replay does not
+  duplicate messages. What is missing is a per-chunk mapping: a person who quotes
+  an *earlier* chunk cannot have that reply matched back to the ticket by platform
+  message id. Accepted for v1 (review R1 optional item 1) — adding it needs a
+  mapping table or several outbound rows per send, plus changes to the ticket
+  reply matching and its tests.
+- **Group classification is only as good as the Feishu fields.** The automatic
+  internal/external decision trusts `chat.external` and the sender's
+  `tenant_key`. 〔Unverified against the real Feishu API in this repository〕 Both
+  fields need the corresponding permission scopes; when a lookup fails the group
+  is treated as external until a lookup succeeds.
+
 ## Documentation
 
 - [SKILL.md](./SKILL.md) — Component specification

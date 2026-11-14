@@ -54,6 +54,20 @@ const MAX_LENGTH = 2000;  // Feishu message max length
 
 // Parse arguments
 const args = process.argv.slice(2);
+
+// A worker session (card F / review item 2) may not talk to people. Its own
+// tools are `progress`/`report`/`ask`/`handback`; the front desk sends the
+// result. This is the default guard for the channel, checked before any
+// argument parsing so no argument combination can skip it.
+//
+// NOT a security boundary: the same system user can still call the Feishu API
+// directly or unset the variable. Real isolation (separate OS identity, no
+// channel credentials, read-only instance database) is next version.
+if (process.env.ZYLOS_TICKET_ROLE === 'worker') {
+  console.error('Error: worker sessions cannot send messages; report the result to the front desk instead');
+  process.exit(1);
+}
+
 if (args.length < 2) {
   console.error('Usage: send.js <endpoint_id> <message>');
   console.error('       send.js <endpoint_id> "[MEDIA:image]/path/to/image.png"');
