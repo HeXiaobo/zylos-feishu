@@ -37,19 +37,25 @@ test('query failure without cache stays external and retries on next message', a
   f.response({ success: true, chat: { external: false } }); await f.run();
   assert.equal(f.calls(), 2); assert.equal(f.policy().gateMode, 'auto');
 });
-test('successful cache refreshes after 24 hours; failed refresh retains cache and retries', async () => {
+test('successful cache refreshes after 24 hours; a failed refresh degrades instead of trusting the cache', async () => {
+  // Card F / R1 item 9 changed this expectation: an expired cache whose refresh
+  // fails must degrade to observe, so stale evidence cannot keep a group open.
   const f = fixture(); await f.run(); await f.run(); assert.equal(f.calls(), 1);
   f.advance(GROUP_CLASSIFICATION_TTL_MS); f.response({ success: false }); await f.run();
-  assert.equal(f.calls(), 2); assert.equal(f.policy().gateMode, 'auto');
-  f.response({ success: true, chat: { external: true } }); await f.run();
-  assert.equal(f.calls(), 3); assert.equal(f.policy().gateMode, 'observe');
+  assert.equal(f.calls(), 2); assert.equal(f.policy().gateMode, 'observe');
+  f.response({ success: true, chat: { external: false } }); await f.run();
+  assert.equal(f.calls(), 3); assert.equal(f.policy().gateMode, 'auto', 'a successful refresh restores auto');
 });
-test('explicit internal and gateMode take precedence over automatic API and tenant evidence', async () => {
+test('manual internal and gateMode can only make a group more conservative', async () => {
+  // Card F / R1 item 9: external evidence outranks a manual internal=true. The
+  // stricter manual gateMode still applies.
   const f = fixture({ external: true, group: { internal: true, gateMode: 'off' } });
-  await f.run('outside'); assert.equal(f.calls(), 0);
-  assert.deepEqual(f.policy(), { internal: true, gateMode: 'off' });
+  // A manual setting no longer suppresses the evidence lookup: one query per TTL
+  // per group, so the component can still learn that the group became external.
+  await f.run('outside'); assert.equal(f.calls(), 1);
+  assert.deepEqual(f.policy(), { internal: false, gateMode: 'off' });
   const manualExternal = fixture({ group: { internal: false } }); await manualExternal.run();
-  assert.equal(manualExternal.calls(), 0); assert.equal(manualExternal.policy().gateMode, 'observe');
+  assert.equal(manualExternal.calls(), 1, 'a manual false still refreshes, it just never opens the group'); assert.equal(manualExternal.policy().gateMode, 'observe');
   const observe = fixture({ group: { gateMode: 'observe' } }); await observe.run();
   assert.deepEqual(observe.policy(), { internal: true, gateMode: 'observe' });
 });

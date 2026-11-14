@@ -28,7 +28,7 @@ import { getConfig, watchConfig, saveConfig, DATA_DIR, getCredentials, stopWatch
 import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages } from './lib/message.js';
 import { getUserInfo } from './lib/contact.js';
 import { listChatMembers, getChatInfo } from './lib/chat.js';
-import { createGroupClassifier } from './lib/group-classification.js';
+import { createGroupClassifier, normalizeGroupEvidence } from './lib/group-classification.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
@@ -62,6 +62,11 @@ let isShuttingDown = false;
 
 // Initialize
 let config = getConfig();
+// Persisted classification state is the verdict every reader acts on, including
+// the core group gate which cannot run this logic itself. Unsafe leftovers from
+// an older component (an "internal" cache whose refresh failed, or one past its
+// TTL) are demoted before anything reads the policy.
+if (ARCH2 && normalizeGroupEvidence(config)) saveConfig(config);
 const connectionMode = config.connection_mode || 'websocket';
 const INTERNAL_SECRET = crypto.randomUUID();
 // Persist token to file so send.js (spawned by C4 in a separate process tree) can read it

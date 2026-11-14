@@ -16,7 +16,8 @@ test('real C4 outbox to real Feishu sender records sent/failed/unknown with plat
   fs.writeFileSync(path.join(home, 'zylos/components/feishu/config.json'), '{"enabled":true}');
   fs.writeFileSync(path.join(scripts, 'send.js'), `import ${JSON.stringify(new URL('../scripts/send.js', import.meta.url).href)};`);
   const loader = new URL('../test-fixtures/card-entry-loader.mjs', import.meta.url).href;
-  const env = { HOME: home, ZYLOS_DIR: home, PATH: process.env.PATH, LANG: 'C', NODE_OPTIONS: `--no-warnings --experimental-loader=${loader}` };
+  // The uuid/carrier receipt contract is an arch2 feature; opt in explicitly.
+  const env = { HOME: home, ZYLOS_DIR: home, ZYLOS_ARCH2: '1', PATH: process.env.PATH, LANG: 'C', NODE_OPTIONS: `--no-warnings --experimental-loader=${loader}` };
   for (const [mode, expected] of [['success', 'sent'], ['rejected', 'failed'], ['uncertain', 'unknown']]) {
     const result = spawnSync(process.execPath, [path.join(core, 'skills/comm-bridge/scripts/c4-send.js'), 'feishu', 'oc_1|type:p2p', '普通文本'], {
       env: { ...env, CARD_ENTRY_SEND_FAIL: mode === 'rejected' ? '1' : '', CARD_ENTRY_UNCERTAIN: mode === 'uncertain' ? '1' : '' }, encoding: 'utf8', timeout: 10000,
