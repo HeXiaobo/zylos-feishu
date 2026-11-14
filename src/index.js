@@ -1662,15 +1662,17 @@ if (!creds.app_id || !creds.app_secret) {
   }
 
   // Resolve the bot's own tenant with the existing authenticated SDK client.
-  // No additional event subscriptions or credentials are required.
-  if (!botTenantKey) {
+  // No additional event subscriptions or credentials are required. Only the
+  // arch2 group gate needs it, so with the switch off nothing extra is written
+  // to the operator's config.
+  if (ARCH2 && !botTenantKey) {
     try {
       const { getClient } = await import('./lib/client.js');
       const tenant = await getClient().tenant.tenant.query({});
       if (tenant.code === 0) botTenantKey = tenant.data?.tenant?.tenant_key || '';
     } catch { /* missing permission: unknown senders remain conservative */ }
   }
-  if (botTenantKey && config.bot?.tenant_key !== botTenantKey) {
+  if (ARCH2 && botTenantKey && config.bot?.tenant_key !== botTenantKey) {
     config.bot = { ...config.bot, tenant_key: botTenantKey };
     saveConfig(config);
   }

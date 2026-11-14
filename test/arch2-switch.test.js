@@ -415,3 +415,22 @@ test('the sender adds the uuid and the receipt only with the switch on', t => {
   assert.deepEqual(JSON.parse(on.receipts[0].slice('C4_RESULT '.length)), { status: 'sent', platform_msg_id: 'om_test_entry' });
   assert.equal(on.calls[0].args.find(arg => arg && typeof arg === 'object').uuid, '42');
 });
+
+test('switch off performs no extra config writes at startup', () => {
+  const source = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  // Every automatic write must be inside an ARCH2 guard; the baseline only wrote
+  // config when it bound an owner or changed a group explicitly.
+  // Baseline writes are allowed by name: owner binding on the first DM, and an
+  // explicit group edit. The two automatic writes this card added must be gated.
+  const baselineWrites = ['if (!saveConfig(config)) {', 'saveConfig(config);'];
+  const writes = [...source.matchAll(/^.*saveConfig\(config\).*$/gm)].map(match => match[0].trim());
+  assert.ok(writes.length >= 4, 'the component still persists real changes');
+  for (const line of writes) {
+    assert.ok(baselineWrites.includes(line) || /ARCH2/.test(line), `unexpected unconditional write: ${line}`);
+  }
+  // The automatic classification write must carry its own guard.
+  assert.match(source, /if \(ARCH2 && !config\.groups\?\.\[chatId\] && isGroupAllowed\(chatId\)\) \{/);
+  // The two automatic ones (classification and tenant identity) are guarded.
+  assert.match(source, /if \(ARCH2 && normalizeGroupEvidence\(config\)\) saveConfig\(config\);/);
+  assert.match(source, /if \(ARCH2 && botTenantKey && config\.bot\?\.tenant_key !== botTenantKey\)/);
+});
