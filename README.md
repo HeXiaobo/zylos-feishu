@@ -74,6 +74,13 @@ zylos uninstall feishu
 | Owner @mention in any group | Always responds |
 | Unknown user | Ignored |
 
+## Card Output
+
+Outbound text is sent as an interactive card when it contains markdown, provided
+`message.useMarkdownCard` is enabled. Set `message.alwaysCard: true` to send
+**every** message as a card, including plain text (default: `false`, i.e. only
+markdown-bearing messages become cards).
+
 ## Documentation
 
 - [SKILL.md](./SKILL.md) — Component specification
