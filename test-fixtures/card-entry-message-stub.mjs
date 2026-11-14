@@ -14,6 +14,7 @@ function record(name, args) {
 }
 
 function ok() {
+  if (process.env.CARD_ENTRY_UNCERTAIN === '1') return { success: false, message: 'socket hang up' };
   return { ...result };
 }
 

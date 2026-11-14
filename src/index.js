@@ -21,6 +21,7 @@ import { safeLogger } from './lib/safe-logger.js';
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 // zylos-lab-mention-patch: @everyone is not a mention of this bot.
 import { isBotMentioned } from './lib/feishu-group-policy.js';
+import { ingressArgs, groupGatePolicy, smartGroup, receivedGroupAllowed, replyIsBot } from './lib/c4-ingress.js';
 
 import { getConfig, watchConfig, saveConfig, DATA_DIR, getCredentials, stopWatching } from './lib/config.js';
 import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages } from './lib/message.js';
@@ -670,36 +671,14 @@ function resolveGroupConfig(chatId) {
  * Also handles backward compat with legacy allowed_groups/smart_groups.
  */
 function isGroupAllowed(chatId) {
-  const normalizedChatId = chatId === undefined || chatId === null ? '' : String(chatId);
-  const groupPolicy = config.groupPolicy || 'allowlist';
-
-  if (groupPolicy === 'disabled') return false;
-  if (groupPolicy === 'open') return true;
-
-  // allowlist mode: check groups map
-  const groupConfig = resolveGroupConfig(normalizedChatId);
-  if (groupConfig) return true;
-
-  // Backward compat: check legacy arrays if groups map doesn't have this chat
-  const legacyAllowed = (config.allowed_groups || []).some(g => String(g.chat_id) === normalizedChatId);
-  const legacySmart = (config.smart_groups || []).some(g => String(g.chat_id) === normalizedChatId);
-  if (legacyAllowed || legacySmart) return true;
-
-  return false;
+  return receivedGroupAllowed(config, chatId);
 }
 
 /**
  * Check if a group is in "smart" mode (receives all messages without @mention).
  */
 function isSmartGroup(chatId) {
-  const normalizedChatId = chatId === undefined || chatId === null ? '' : String(chatId);
-  if ((config.groupPolicy || 'allowlist') === 'disabled') return false;
-  const groupConfig = resolveGroupConfig(normalizedChatId);
-  if (groupConfig) {
-    return groupConfig.mode === 'smart' || groupConfig.requireMention === false;
-  }
-  // Legacy fallback
-  return (config.smart_groups || []).some(g => String(g.chat_id) === normalizedChatId);
+  return smartGroup(config, chatId);
 }
 
 /**
@@ -756,7 +735,7 @@ function parseC4Response(stdout) {
 /**
  * Send message to Claude via C4 (with 1 retry on unexpected failure)
  */
-function sendToC4(source, endpoint, content, onReject) {
+function sendToC4(source, endpoint, content, onReject, metadata = {}) {
   if (!content) {
     console.error('[feishu] sendToC4 called with empty content');
     return;
@@ -767,7 +746,8 @@ function sendToC4(source, endpoint, content, onReject) {
     '--channel', source,
     '--endpoint', endpoint,
     '--json',
-    '--content', content
+    '--content', content,
+    ...ingressArgs(metadata),
   ];
 
   execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
@@ -855,7 +835,7 @@ async function fetchQuotedMessage(messageId) {
     if (res.code === 0 && res.data?.items?.[0]) {
       const msg = res.data.items[0];
       const senderName = await resolveUserName(null, msg.sender?.id);
-      return { sender: senderName, text: parseMessageItemText(msg, messageId) };
+      return { sender: senderName, text: parseMessageItemText(msg, messageId), isBot: replyIsBot(msg, botOpenId, botAppId) };
     }
   } catch (err) {
     console.log(`[feishu] Failed to fetch quoted message ${messageId}: ${err.message}`);
@@ -1149,6 +1129,9 @@ async function handleMessage(data) {
 
   // Build structured endpoint with routing metadata
   const endpoint = buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId });
+  const ingress = { sourceId: messageId, chatId, senderId: senderOpenId,
+    mentioned: chatType !== 'group', needsGate: chatType === 'group' };
+  const deliverToC4 = (source, address, content, onReject) => sendToC4(source, address, content, onReject, ingress);
 
   // quotedContent is fetched lazily after routing eligibility checks
   let quotedContent = null;
@@ -1214,10 +1197,10 @@ async function handleMessage(data) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('p2p', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, [], mediaPaths[0], { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply);
+        deliverToC4('feishu', endpoint, msg, rejectReply);
       } else {
         const msg = formatMessage('p2p', senderName, '[image download failed]', [], null, { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply);
+        deliverToC4('feishu', endpoint, msg, rejectReply);
       }
       return;
     }
@@ -1233,22 +1216,25 @@ async function handleMessage(data) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('p2p', senderName, `[file: ${fileName}]`, [], localPath, { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply);
+        deliverToC4('feishu', endpoint, msg, rejectReply);
       } else {
         const msg = formatMessage('p2p', senderName, `[file download failed: ${fileName}]`, [], null, { quotedContent, threadContext, threadRootId });
-        sendToC4('feishu', endpoint, msg, rejectReply);
+        deliverToC4('feishu', endpoint, msg, rejectReply);
       }
       return;
     }
 
     const msg = formatMessage('p2p', senderName, cleanText, [], null, { quotedContent, threadContext, threadRootId });
-    sendToC4('feishu', endpoint, msg, rejectReply);
+    deliverToC4('feishu', endpoint, msg, rejectReply);
     return;
   }
 
   // Group chat handling
   if (chatType === 'group') {
-    const mentioned = isBotMentioned(mentions, botOpenId);
+    // A reply to the bot counts as a direct mention. Resolve only its parent.
+    const reply = parentId ? await fetchQuotedMessage(parentId) : null;
+    const mentioned = isBotMentioned(mentions, botOpenId) || reply?.isBot === true;
+    ingress.mentioned = mentioned;
     const senderIsOwner = isOwner(senderUserId, senderOpenId);
     const groupPolicy = config.groupPolicy || 'allowlist';
     if (groupPolicy === 'disabled') {
@@ -1258,11 +1244,18 @@ async function handleMessage(data) {
       console.log(`[feishu] Group policy disabled, ignoring group message from ${senderUserId}`);
       return;
     }
+    // Receiving a group message proves membership. Register once; existing
+    // explicit mode, allowFrom and internal settings take precedence.
+    if (!config.groups?.[chatId] && isGroupAllowed(chatId)) {
+      const mode = isSmartGroup(chatId) ? 'smart' : 'mention';
+      config.groups = { ...config.groups, [chatId]: { mode, internal: false, gateMode: 'observe' } };
+      saveConfig(config);
+    }
     const allowedGroup = isGroupAllowed(chatId);
     const smart = isSmartGroup(chatId);
     const smartNoMention = smart && !mentioned;
 
-    if (!allowedGroup && !(senderIsOwner && mentioned)) {
+    if (!allowedGroup) {
       if (mentioned) {
         console.log(`[feishu] Group ${chatId} not allowed by policy, rejecting`);
         replyToMessage(messageId, "Sorry, I'm not available in this group.").catch(() => {});
@@ -1287,11 +1280,15 @@ async function handleMessage(data) {
       logText = text;
     }
 
-    if (!smart && !mentioned) {
-      if (allowedGroup) {
-        await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
-      }
-      console.log(`[feishu] Group message without @mention, logged only`);
+    // Send every permitted message to durable gating, including observe/off
+    // messages, so filtered context remains available. Never emit rejection
+    // replies or typing indicators for unmentioned messages in external groups.
+    const gatePolicy = groupGatePolicy(config, chatId);
+    if (!mentioned && (!smart || !gatePolicy.internal || gatePolicy.gateMode !== 'auto')) {
+      await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
+      const senderName = await resolveUserName(senderUserId, senderOpenId);
+      const msg = formatMessage('group', senderName, resolveMentions(logText, mentions) || '[media]', [], null, { groupName: getGroupName(chatId), smartHint: true });
+      deliverToC4('feishu', endpoint, msg, null);
       return;
     }
 
@@ -1337,7 +1334,7 @@ async function handleMessage(data) {
     if (imageKeys.length > 0) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || '[image]', contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        deliverToC4('feishu', endpoint, msg, groupRejectReply);
         return;
       }
 
@@ -1353,7 +1350,7 @@ async function handleMessage(data) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('group', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, contextMessages, mediaPaths[0], { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        deliverToC4('feishu', endpoint, msg, groupRejectReply);
       } else {
         removeTypingIndicator(messageId);
         sendThreadAwareMessage(chatId, 'Image download failed. Please resend the image.', { chatType, rootId, parentId, messageId })
@@ -1365,7 +1362,7 @@ async function handleMessage(data) {
     if (fileKey) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || `[file: ${fileName}]`, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        deliverToC4('feishu', endpoint, msg, groupRejectReply);
         return;
       }
 
@@ -1379,7 +1376,7 @@ async function handleMessage(data) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('group', senderName, `[file: ${fileName}]${cleanText ? ' ' + cleanText : ''}`, contextMessages, localPath, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        deliverToC4('feishu', endpoint, msg, groupRejectReply);
       } else {
         removeTypingIndicator(messageId);
         sendThreadAwareMessage(chatId, 'File download failed. Please resend the file.', { chatType, rootId, parentId, messageId })
@@ -1389,7 +1386,7 @@ async function handleMessage(data) {
     }
 
     const msg = formatMessage('group', senderName, cleanText || text, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: smartNoMention });
-    sendToC4('feishu', endpoint, msg, groupRejectReply);
+    deliverToC4('feishu', endpoint, msg, groupRejectReply);
   }
 }
 

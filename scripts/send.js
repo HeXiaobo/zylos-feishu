@@ -22,7 +22,23 @@ import { getConfig, DATA_DIR } from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { sendCard } from '../src/lib/card-send.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
-import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
+import { sendToGroup as rawSendToGroup, sendMessage as rawSendMessage, uploadImage, sendImage as rawSendImage, uploadFile, sendFile as rawSendFile, replyToMessage as rawReplyToMessage, sendMarkdownCard as rawSendMarkdownCard, replyMarkdownCard as rawReplyMarkdownCard } from '../src/lib/message.js';
+import { createDelivery } from '../src/lib/c4-delivery.js';
+
+const deliveryId = process.env.C4_DELIVERY_ID || process.env.C4_OUTBOUND_ID;
+const delivery = createDelivery(deliveryId);
+const sendToGroup = delivery.wrap(rawSendToGroup, 3);
+const sendMessage = delivery.wrap(rawSendMessage, 4);
+const sendImage = delivery.wrap(rawSendImage, 3);
+const sendFile = delivery.wrap(rawSendFile, 3);
+const replyToMessage = delivery.wrap(rawReplyToMessage, 3);
+const sendMarkdownCard = delivery.wrap(rawSendMarkdownCard, 3);
+const replyMarkdownCard = delivery.wrap(rawReplyMarkdownCard, 2);
+// Synchronous exit hook also covers validation/disabled/usage failures.
+process.once('exit', code => {
+  console.log(`C4_RESULT ${JSON.stringify(delivery.result(code))}`);
+});
+import { shouldUseCard } from '../src/lib/card-decision.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -68,7 +84,7 @@ const endpointId = parsedEndpoint.chatId;
 
 if (message.trim() === '[SKIP]') {
   markTypingDone(parsedEndpoint.msg);
-  process.exit(0);
+  process.exit(deliveryId ? 1 : 0);
 }
 
 // Check if component is enabled
@@ -166,23 +182,6 @@ function splitMessage(text, maxLength) {
   return chunks;
 }
 
-/**
- * Check if text contains markdown formatting worth rendering as a card.
- * Returns true for code blocks, headers, bold, lists, tables, etc.
- */
-function hasMarkdownContent(text) {
-  // Code blocks (``` or indented)
-  if (/```/.test(text)) return true;
-  // Headers (# at start of line)
-  if (/^#{1,6}\s/m.test(text)) return true;
-  // Bold (**text**)
-  if (/\*\*[^*]+\*\*/.test(text)) return true;
-  // Bullet or numbered lists (- item or 1. item at start of line)
-  if (/^[\s]*[-*]\s/m.test(text) || /^[\s]*\d+\.\s/m.test(text)) return true;
-  // Tables (| col | col |)
-  if (/\|.+\|/.test(text) && /^[\s]*\|[\s]*[-:]+/m.test(text)) return true;
-  return false;
-}
 
 // Card max content length (Feishu card body limit ~28KB JSON; keep text under 4000 for safety)
 const CARD_MAX_LENGTH = 4000;
@@ -207,6 +206,7 @@ async function sendCardChunk(chunk, isFirstChunk) {
     try {
       result = await replyMarkdownCard(replyTarget, cardChunk);
     } catch (err) {
+      if (deliveryId) throw err;
       console.log('[feishu] Card reply threw, falling back:', err.message);
       result = { success: false };
     }
@@ -223,6 +223,7 @@ async function sendCardChunk(chunk, isFirstChunk) {
 /**
  * Send text message with auto-chunking.
  * When useMarkdownCard is enabled and text contains markdown, sends as interactive card.
+ * When message.alwaysCard is also true, every message is sent as a card even without markdown.
  * Routing logic (unified for DM and group):
  *   - Topic/reply (root exists): ALL chunks reply to parent||root (stay in thread)
  *   - Group @mention (no root): first chunk replies to msg, rest use sendToGroup
@@ -231,7 +232,7 @@ async function sendCardChunk(chunk, isFirstChunk) {
  * Reply failures fall back to sendMessage (DM) or sendToGroup (group).
  */
 async function sendText(endpoint, text) {
-  const useCard = config.message?.useMarkdownCard && hasMarkdownContent(text);
+  const useCard = shouldUseCard(config.message, text);
   const maxLen = useCard ? CARD_MAX_LENGTH : MAX_LENGTH;
   const chunks = splitMessage(text, maxLen);
   const { chatId, root, parent, msg, type } = parsedEndpoint;
@@ -286,6 +287,7 @@ async function sendPlainTextChunk(endpoint, chunk, isFirstChunk) {
     try {
       result = await replyToMessage(replyTarget, chunk);
     } catch (err) {
+      if (deliveryId) throw err;
       console.log('[feishu] Reply threw, falling back:', err.message);
       result = { success: false };
     }
@@ -330,12 +332,13 @@ async function sendMedia(type, filePath) {
           console.log('[feishu] Image root reply fallback failed, falling back to sendImage:', rootReply.message);
         }
       } catch (err) {
+        if (deliveryId) throw err;
         console.log('[feishu] Image reply threw, falling back:', err.message);
         if (parent && root && parent !== root) {
           try {
             const rootReply = await replyToMessage(root, JSON.stringify({ image_key: uploadResult.imageKey }), 'image');
             if (rootReply.success) return;
-          } catch {}
+          } catch (error) { if (deliveryId) throw error; }
         }
       }
     }
@@ -359,12 +362,13 @@ async function sendMedia(type, filePath) {
           console.log('[feishu] File root reply fallback failed, falling back to sendFile:', rootReply.message);
         }
       } catch (err) {
+        if (deliveryId) throw err;
         console.log('[feishu] File reply threw, falling back:', err.message);
         if (parent && root && parent !== root) {
           try {
             const rootReply = await replyToMessage(root, JSON.stringify({ file_key: uploadResult.fileKey }), 'file');
             if (rootReply.success) return;
-          } catch {}
+          } catch (error) { if (deliveryId) throw error; }
         }
       }
     }
@@ -442,7 +446,7 @@ async function send() {
       // before anything is sent.
       const result = await sendCard(
         { ...parsedEndpoint, cardPath },
-        { replyToMessage, sendMessage },
+        { replyToMessage, sendMessage, noFallbackOnThrow: Boolean(deliveryId) },
       );
       console.log(`[feishu] card sent message_id=${result.messageId} via=${result.via}`);
       await recordOutgoing(`[sent card] ${result.summary}`);
@@ -456,6 +460,7 @@ async function send() {
     }
     // Mark the trigger message as replied (for typing indicator removal)
     markTypingDone(parsedEndpoint.msg);
+    if (deliveryId && delivery.result(0).status !== 'sent') throw new Error('No confirmed platform receipt');
     console.log('Message sent successfully');
     process.exit(0);
   } catch (err) {

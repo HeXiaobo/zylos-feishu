@@ -50,7 +50,7 @@ export function sendFailureResult(err) {
 /**
  * Send message to a chat (group or individual)
  */
-export async function sendMessage(receiveId, content, receiveIdType = 'chat_id', msgType = 'text') {
+export async function sendMessage(receiveId, content, receiveIdType = 'chat_id', msgType = 'text', options = {}) {
   const client = getClient();
 
   let messageContent;
@@ -64,6 +64,7 @@ export async function sendMessage(receiveId, content, receiveIdType = 'chat_id',
     const res = await client.im.message.create({
       params: { receive_id_type: receiveIdType },
       data: {
+        ...(options.uuid ? { uuid: options.uuid } : {}),
         receive_id: receiveId,
         msg_type: msgType,
         content: messageContent,
@@ -102,7 +103,7 @@ export async function sendMessage(receiveId, content, receiveIdType = 'chat_id',
  * Reply to a specific message (used for thread/topic routing and reply threading).
  * Uses the im.message.reply API to create a reply in the same thread.
  */
-export async function replyToMessage(messageId, content, msgType = 'text') {
+export async function replyToMessage(messageId, content, msgType = 'text', options = {}) {
   const client = getClient();
 
   let messageContent;
@@ -116,6 +117,7 @@ export async function replyToMessage(messageId, content, msgType = 'text') {
     const res = await client.im.message.reply({
       path: { message_id: messageId },
       data: {
+        ...(options.uuid ? { uuid: options.uuid } : {}),
         msg_type: msgType,
         content: messageContent,
       },
@@ -142,8 +144,8 @@ export async function replyToMessage(messageId, content, msgType = 'text') {
 /**
  * Send message to a group chat
  */
-export async function sendToGroup(chatId, content, msgType = 'text') {
-  return sendMessage(chatId, content, 'chat_id', msgType);
+export async function sendToGroup(chatId, content, msgType = 'text', options = {}) {
+  return sendMessage(chatId, content, 'chat_id', msgType, options);
 }
 
 /**
@@ -270,13 +272,14 @@ export async function uploadImage(imagePath, imageType = 'message') {
 /**
  * Send image message
  */
-export async function sendImage(receiveId, imageKey, receiveIdType = 'chat_id') {
+export async function sendImage(receiveId, imageKey, receiveIdType = 'chat_id', options = {}) {
   const client = getClient();
 
   try {
     const res = await client.im.message.create({
       params: { receive_id_type: receiveIdType },
       data: {
+        ...(options.uuid ? { uuid: options.uuid } : {}),
         receive_id: receiveId,
         msg_type: 'image',
         content: JSON.stringify({ image_key: imageKey }),
@@ -385,7 +388,7 @@ export function buildMarkdownCard(text) {
  * Send a markdown card message to a chat.
  * Interactive cards render code blocks, tables, and formatting properly.
  */
-export async function sendMarkdownCard(receiveId, text, receiveIdType = 'chat_id') {
+export async function sendMarkdownCard(receiveId, text, receiveIdType = 'chat_id', options = {}) {
   const client = getClient();
   const card = buildMarkdownCard(text);
 
@@ -393,6 +396,7 @@ export async function sendMarkdownCard(receiveId, text, receiveIdType = 'chat_id
     const res = await client.im.message.create({
       params: { receive_id_type: receiveIdType },
       data: {
+        ...(options.uuid ? { uuid: options.uuid } : {}),
         receive_id: receiveId,
         msg_type: 'interactive',
         content: JSON.stringify(card),
@@ -420,7 +424,7 @@ export async function sendMarkdownCard(receiveId, text, receiveIdType = 'chat_id
 /**
  * Reply to a message with a markdown card.
  */
-export async function replyMarkdownCard(messageId, text) {
+export async function replyMarkdownCard(messageId, text, options = {}) {
   const client = getClient();
   const card = buildMarkdownCard(text);
 
@@ -428,6 +432,7 @@ export async function replyMarkdownCard(messageId, text) {
     const res = await client.im.message.reply({
       path: { message_id: messageId },
       data: {
+        ...(options.uuid ? { uuid: options.uuid } : {}),
         msg_type: 'interactive',
         content: JSON.stringify(card),
       },
@@ -543,13 +548,14 @@ export function extractPermissionError(err) {
 /**
  * Send file message
  */
-export async function sendFile(receiveId, fileKey, receiveIdType = 'chat_id') {
+export async function sendFile(receiveId, fileKey, receiveIdType = 'chat_id', options = {}) {
   const client = getClient();
 
   try {
     const res = await client.im.message.create({
       params: { receive_id_type: receiveIdType },
       data: {
+        ...(options.uuid ? { uuid: options.uuid } : {}),
         receive_id: receiveId,
         msg_type: 'file',
         content: JSON.stringify({ file_key: fileKey }),

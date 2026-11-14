@@ -135,7 +135,7 @@ export function cardSummary(card) {
  */
 export async function sendCard(
   { chatId, type, root, parent, msg, cardPath } = {},
-  { replyToMessage, sendMessage, readCard = readCardFile } = {},
+  { replyToMessage, sendMessage, readCard = readCardFile, noFallbackOnThrow = false } = {},
 ) {
   const { card, content } = readCard(cardPath);
 
@@ -164,6 +164,7 @@ export async function sendCard(
         ? await sendMessage(chatId, content, 'chat_id', 'interactive')
         : await replyToMessage(attempt.target, content, 'interactive');
     } catch (err) {
+      if (noFallbackOnThrow) throw err;
       failures.push({ code: err?.code, message: err?.message });
       continue;
     }

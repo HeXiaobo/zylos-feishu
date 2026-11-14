@@ -74,6 +74,27 @@ zylos uninstall feishu
 | Owner @mention in any group | Always responds |
 | Unknown user | Ignored |
 
+## Card Output
+
+Outbound text defaults to interactive cards, including plain text. Set
+`message.alwaysCard: false` for markdown-only cards, or
+`message.useMarkdownCard: false` to disable cards. Explicit settings survive upgrades.
+
+Received groups are registered automatically in smart mode unless an explicit
+mode already exists. `groupPolicy: disabled`, group `enabled: false`, and
+`allowFrom` restrictions still apply. Unknown groups default to external:
+`internal: false, gateMode: observe`. Mark a group `internal: true` only after
+confirming it has no external members; its default becomes `auto`. Per-group
+`gateMode` supports `off`, `observe`, `auto`. External groups always require a bot
+mention (or a reply to the bot) for delivery; other messages are gated and retained
+as context. No new Feishu event subscription is required.
+
+C4 supplies `C4_OUTBOUND_ID` (`C4_DELIVERY_ID` is an alias). The sender passes it
+as the Feishu `uuid`; later chunks use `:<index>`. The last stdout line is
+`C4_RESULT {"status":"sent","platform_msg_id":"om_…"}` on confirmed success.
+Failures exit nonzero with `status: failed`; `uncertain: true` requires verification
+before any retry. Chunked sends return the last confirmed platform message ID.
+
 ## Documentation
 
 - [SKILL.md](./SKILL.md) — Component specification

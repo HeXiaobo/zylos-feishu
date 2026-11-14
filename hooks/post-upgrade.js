@@ -238,6 +238,13 @@ if (fs.existsSync(configPath)) {
       migrations.push('Added message.useMarkdownCard=true');
     }
 
+    // Default plain text to cards, preserving explicit false.
+    if (config.message.alwaysCard === undefined) {
+      config.message.alwaysCard = true;
+      migrated = true;
+      migrations.push('Added message.alwaysCard=true');
+    }
+
     // Migration 10: Migrate legacy group config to new groups map
     if ((Array.isArray(config.allowed_groups) && config.allowed_groups.length > 0) ||
         (Array.isArray(config.smart_groups) && config.smart_groups.length > 0) ||

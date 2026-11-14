@@ -37,7 +37,7 @@ const INITIAL_CONFIG = {
   enabled: true,
   connection_mode: 'websocket',
   webhook_port: 3458,
-  message: { useMarkdownCard: true }
+  message: { useMarkdownCard: true, alwaysCard: true }
 };
 
 const isInteractive = process.stdin.isTTY === true;

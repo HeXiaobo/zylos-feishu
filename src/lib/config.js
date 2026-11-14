@@ -34,10 +34,12 @@ export const DEFAULT_CONFIG = {
   dmPolicy: 'owner',
   // DM allowlist — user_id or open_id values (used when dmPolicy = 'allowlist')
   dmAllowFrom: [],
-  // Group policy: 'open' (all groups), 'allowlist' (only configured groups), 'disabled' (no groups)
+  // Group policy: received groups are registered automatically; disabled blocks all.
   groupPolicy: 'allowlist',
   // Per-group configuration map
-  // Format: { "oc_xxx": { name, mode, requireMention, allowFrom, historyLimit } }
+  // Format: { "oc_xxx": { name, mode, requireMention, allowFrom, historyLimit, internal, gateMode, enabled } }
+  // internal:true certifies no external members; unknown groups default external.
+  // gateMode: off | observe | auto; external groups cannot use auto.
   // mode: "mention" (respond to @mentions) or "smart" (receive all messages)
   groups: {},
   // Legacy fields (kept for backward compatibility, migrated to groups on upgrade)
@@ -53,7 +55,8 @@ export const DEFAULT_CONFIG = {
   // Message settings
   message: {
     context_messages: 10,
-    useMarkdownCard: false
+    useMarkdownCard: true,
+    alwaysCard: true
   }
 };
 
@@ -69,7 +72,8 @@ export function loadConfig() {
     if (fs.existsSync(CONFIG_PATH)) {
       const content = fs.readFileSync(CONFIG_PATH, 'utf8');
       const parsed = JSON.parse(content);
-      config = { ...DEFAULT_CONFIG, ...parsed };
+      config = { ...DEFAULT_CONFIG, ...parsed,
+        message: { ...DEFAULT_CONFIG.message, ...parsed.message } };
       // Runtime backward-compat: derive groupPolicy from legacy group_whitelist,
       // but only if the file doesn't already have an explicit groupPolicy
       if (config.group_whitelist !== undefined && !('groupPolicy' in parsed)) {
