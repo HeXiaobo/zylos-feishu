@@ -198,6 +198,11 @@ const MESSAGE_CASES = [
   ['disabled group, mention', { groups: { oc_1: { enabled: false } } }, groupMessage({ mentioned: true })],
   ['disabled policy, mention', { groupPolicy: 'disabled' }, groupMessage({ mentioned: true })],
   ['reply to a non-bot message', { groups: { oc_1: { mode: 'smart' } } }, groupMessage({ parentId: 'om_parent' })],
+  ['smart group whose quoted parent is the bot', { groups: { oc_1: { mode: 'smart' } } }, groupMessage({ parentId: 'om_bot' })],
+  ['topic thread in a smart group', { groups: { oc_1: { mode: 'smart' } } },
+    { ...groupMessage(), message: { ...groupMessage().message, root_id: 'om_root', thread_id: 'omt_1' } }],
+  ['unlisted group where the owner is @mentioned', {}, groupMessage({ mentioned: true })],
+  ['group with an allowFrom list', { groups: { oc_1: { mode: 'smart', allowFrom: ['someone-else'] } } }, groupMessage()],
   ['smart group, external sender', { groups: { oc_1: { mode: 'smart' } } }, groupMessage({ tenantKey: 'other_tenant' })],
   ['private chat', {}, {
     message: { chat_type: 'p2p', chat_id: 'oc_dm', message_id: 'om_dm', mentions: [] },
@@ -207,7 +212,9 @@ const MESSAGE_CASES = [
 
 test('with the switch off every message path matches baseline 8c0a3e2 exactly', { skip }, async () => {
   for (const [name, config, message] of MESSAGE_CASES) {
-    const quoted = message.message.parent_id ? { sender: '其他同事', text: '上文', isBot: false } : null;
+    const quoted = message.message.parent_id
+      ? { sender: message.message.parent_id === 'om_bot' ? '机器人' : '其他同事', text: '上文', isBot: message.message.parent_id === 'om_bot' }
+      : null;
     const base = createHarness({ source: baselineSource, arch2: false, config: structuredClone(config), quoted });
     const off = createHarness({ source: currentSource, arch2: false, config: structuredClone(config), quoted });
     await base.run(structuredClone(message));
