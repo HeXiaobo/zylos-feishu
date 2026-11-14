@@ -23,6 +23,7 @@ import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { sendCard } from '../src/lib/card-send.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
+import { shouldUseCard } from '../src/lib/card-decision.js';
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -166,23 +167,6 @@ function splitMessage(text, maxLength) {
   return chunks;
 }
 
-/**
- * Check if text contains markdown formatting worth rendering as a card.
- * Returns true for code blocks, headers, bold, lists, tables, etc.
- */
-function hasMarkdownContent(text) {
-  // Code blocks (``` or indented)
-  if (/```/.test(text)) return true;
-  // Headers (# at start of line)
-  if (/^#{1,6}\s/m.test(text)) return true;
-  // Bold (**text**)
-  if (/\*\*[^*]+\*\*/.test(text)) return true;
-  // Bullet or numbered lists (- item or 1. item at start of line)
-  if (/^[\s]*[-*]\s/m.test(text) || /^[\s]*\d+\.\s/m.test(text)) return true;
-  // Tables (| col | col |)
-  if (/\|.+\|/.test(text) && /^[\s]*\|[\s]*[-:]+/m.test(text)) return true;
-  return false;
-}
 
 // Card max content length (Feishu card body limit ~28KB JSON; keep text under 4000 for safety)
 const CARD_MAX_LENGTH = 4000;
@@ -223,6 +207,7 @@ async function sendCardChunk(chunk, isFirstChunk) {
 /**
  * Send text message with auto-chunking.
  * When useMarkdownCard is enabled and text contains markdown, sends as interactive card.
+ * When message.alwaysCard is also true, every message is sent as a card even without markdown.
  * Routing logic (unified for DM and group):
  *   - Topic/reply (root exists): ALL chunks reply to parent||root (stay in thread)
  *   - Group @mention (no root): first chunk replies to msg, rest use sendToGroup
@@ -231,7 +216,7 @@ async function sendCardChunk(chunk, isFirstChunk) {
  * Reply failures fall back to sendMessage (DM) or sendToGroup (group).
  */
 async function sendText(endpoint, text) {
-  const useCard = config.message?.useMarkdownCard && hasMarkdownContent(text);
+  const useCard = shouldUseCard(config.message, text);
   const maxLen = useCard ? CARD_MAX_LENGTH : MAX_LENGTH;
   const chunks = splitMessage(text, maxLen);
   const { chatId, root, parent, msg, type } = parsedEndpoint;
