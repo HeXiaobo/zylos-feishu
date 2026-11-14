@@ -1248,7 +1248,7 @@ async function handleMessage(data) {
     // explicit mode, allowFrom and internal settings take precedence.
     if (!config.groups?.[chatId] && isGroupAllowed(chatId)) {
       const mode = isSmartGroup(chatId) ? 'smart' : 'mention';
-      config.groups = { ...config.groups, [chatId]: { mode, internal: false, gateMode: 'observe' } };
+      config.groups = { ...config.groups, [chatId]: { mode, internal: false } };
       saveConfig(config);
     }
     const allowedGroup = isGroupAllowed(chatId);

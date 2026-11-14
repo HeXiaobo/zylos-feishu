@@ -83,6 +83,8 @@ test('actual handler retains external unmentioned message without replies or typ
   assert.equal(calls[0][4].needsGate, true);
   assert.equal(calls[0][4].mentioned, false);
   assert.equal(context.config.groups.oc_new.mode, 'smart');
-  assert.equal(context.config.groups.oc_new.gateMode, 'observe');
+  assert.equal(groupGatePolicy(context.config, 'oc_new').gateMode, 'observe');
+  context.config.groups.oc_new.internal = true;
+  assert.equal(groupGatePolicy(context.config, 'oc_new').gateMode, 'auto');
   assert.deepEqual(replies, []);
 });
