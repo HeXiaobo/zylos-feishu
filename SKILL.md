@@ -454,7 +454,16 @@ membership events. Without the subscription the 24h cache still applies.
 ### Status File (arch2)
 
 `~/zylos/components/feishu/status.json` is rewritten at startup, on every config
-reload and after a verdict changes:
+reload and after a verdict changes. Scope checks:
+
+| scope | probe | `missing` when |
+|---|---|---|
+| `tenant:tenant:readonly` | `tenant.tenant.query` | the denial names this scope |
+| `im:message.group_msg` | `im.message.list` (one page, known group) | the denial names this scope; `im.chat.get` is not used because it only proves `im:chat` |
+
+A denial that names another scope, a denial naming no scope, no probe-able group
+and any network error are `unknown`. `unknown` never counts as granted, and the
+tenant scope is probed even when `bot.tenant_key` is already cached.
 
 ```json
 {

@@ -42,21 +42,39 @@ async function runProbe(probe) {
 
 function classifyProbe({ scope, why }, probed) {
   if (!probed) return checkResult(scope, why, 'unknown', 'no probe was provided');
-  if (!probed.ok) return checkResult(scope, why, 'unknown', describeScopeError(probed.error) || probed.error?.message || 'probe failed');
+  // A thrown SDK/Axios error is evidence too: `err.response.data` carries the
+  // same `{code, msg}` a resolved failure would, including the scope it names.
+  if (!probed.ok) {
+    const viaError = fromDenial(scope, why, probed.error);
+    if (viaError) return viaError;
+    return checkResult(scope, why, 'unknown', probed.error?.message || 'probe failed');
+  }
   const value = probed.value;
   if (value && value.code === 0) return checkResult(scope, why, 'granted', 'ok');
+  const viaResult = fromDenial(scope, why, value);
+  if (viaResult) return viaResult;
+  return checkResult(scope, why, 'unknown', describeScopeError(value) || 'probe returned no code');
+}
+
+/**
+ * Turn a permission denial into a check result, keeping "missing" and "unknown"
+ * apart: only a denial that names *this* scope proves it is missing.
+ */
+function fromDenial(scope, why, value) {
   const parsed = parseScopeError(value);
-  if (parsed?.permissionDenied) {
-    const reason = describeScopeError(value);
-    // Only a denial that names this scope proves it is missing. Feishu rejects a
-    // call with 99991672 listing whichever scopes it wanted; if our scope is not
-    // among them the call failed for another reason and our scope is unknown.
-    if (parsed.scopes.includes(scope)) {
-      return checkResult(scope, why, 'missing', reason, { code: parsed.code, named_scope: true });
-    }
+  if (!parsed?.permissionDenied) return null;
+  const reason = describeScopeError(value);
+  if (parsed.scopes.length === 0) {
+    // A denial with no scope named (e.g. a bot-side "no permission on this
+    // resource") does not tell us which permission is absent.
     return checkResult(scope, why, 'unknown', reason, { code: parsed.code, named_scope: false });
   }
-  return checkResult(scope, why, 'unknown', describeScopeError(value) || 'probe returned no code');
+  if (!parsed.scopes.includes(scope)) {
+    // Feishu rejects a call listing whichever scopes it wanted; if ours is not
+    // among them the call failed for another reason and ours stays unknown.
+    return checkResult(scope, why, 'unknown', reason, { code: parsed.code, named_scope: false });
+  }
+  return checkResult(scope, why, 'missing', reason, { code: parsed.code, named_scope: true });
 }
 
 /**
@@ -68,7 +86,7 @@ export async function checkGroupPermissions({ probeTenant, probeGroupMessages, c
   const tenant = classifyProbe(tenantScope, await runProbe(probeTenant));
   const groups = probeGroupMessages
     ? classifyProbe(groupScope, await runProbe(probeGroupMessages))
-    : checkResult(groupScope.scope, groupScope.why, 'unknown', 'no group chat id to probe; set a group in config or check the app console');
+    : checkResult(groupScope.scope, groupScope.why, 'unknown', 'no group chat id to probe; this scope needs a group the bot is in');
   const checks = [tenant, groups];
   const missing = checks.filter(check => check.status === 'missing').map(check => check.scope);
   const unknown = checks.filter(check => check.status === 'unknown').map(check => check.scope);

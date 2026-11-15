@@ -24,10 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each re-judge bumps a per-chat epoch; a classification that was already in
     flight when the event arrived discards its older answer instead of writing it.
 - **`~/zylos/components/feishu/status.json`** records the startup scope check and
-  every group's verdict, source and reason. `im:message.group_msg` and
-  `tenant:tenant:readonly` are each reported `granted` / `missing` / `unknown`;
-  `unknown` (no group to probe, network error, a denial naming another scope) is
-  never reported as granted. Non-granted scopes are also logged at startup.
+  every group's verdict, source and reason. Each scope is probed with the call
+  that actually needs it — `tenant.tenant.query` for `tenant:tenant:readonly`,
+  `im.message.list` (one page, known group) for `im:message.group_msg`;
+  `im.chat.get` only proves `im:chat` and is not used. Each scope is reported
+  `granted` / `missing` / `unknown`; `missing` requires a denial that names that
+  scope, including one thrown as `err.response.data`. `unknown` (no group to
+  probe, network error, a denial naming another scope or naming none) is never
+  reported as granted, and the tenant scope is probed even when `bot.tenant_key`
+  was already cached. Non-granted scopes are also logged at startup.
 
 ### Changed
 - A failed classification now records **why**: `permission_denied` (with the
@@ -35,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `refresh_failed` (timeout, network, anything ambiguous). Both stay external.
 - `getChatInfo` and `listMessages` keep Feishu's raw `msg` on failure so a
   missing-scope denial can be recognized by the scope it names.
+- **Invalidation is conservative for the core gate, not only for the component.**
+  `invalidateGroupEvidence` now sets `group.internal = false` and moves a manual
+  claim into `internalDemoted`; the core gate (`c4-gate.js policyFor`) prefers
+  `group.internal`, so leaving a manual `true` there answered already-queued
+  unmentioned messages during the async re-judge. The claim is restored only after
+  a successful lookup. A config change also bumps the per-chat epoch of **every**
+  invalidated group, so a lookup that was already pending under the old tenant
+  list cannot write its stale verdict back.
 - **`[MEDIA:card]` sends a prepared Feishu card 2.0 file through C4.**
   `scripts/send.js` now accepts `[MEDIA:card]<absolute path>`, the third media
   type beside image and file, so an agent that generated a card JSON document

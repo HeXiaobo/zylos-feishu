@@ -120,23 +120,34 @@ function restore(group) {
 /**
  * Drop a cached verdict so the next message re-judges it.
  *
- * The verdict becomes "not internal, needs a lookup" (`retry: true`), which is
- * the conservative direction: `effectiveInternal` returns false until a lookup
- * succeeds. A demoted manual `internal: true` is put back first, so the
- * operator's claim survives the invalidation and is re-verified instead of
- * being silently deleted.
+ * The persisted verdict becomes "not internal, needs a lookup" (`retry: true`).
+ * That has to hold for **both** readers:
+ *   - `effectiveInternal()` reads `internalDemoted` first;
+ *   - the core gate (`c4-gate.js policyFor`) reads `group.internal` directly and
+ *     prefers it over `autoClassification`, so `group.internal` must be `false`
+ *     for the whole asynchronously re-judged window. Leaving a manual `true`
+ *     there answers already-queued unmentioned messages in a now-external group.
+ *
+ * The operator's manual claim is not deleted: it is remembered in
+ * `internalDemoted` and restored only when a lookup verifies it (`restore()`).
+ *
+ * @param {(chatId?: string) => void} [onInvalidate] called per invalidated group
+ *   so a creator that tracks per-chat ordering can bump its epoch.
  */
 export function invalidateGroupEvidence(group, reason, at = Date.now()) {
   if (!group || typeof group !== 'object') return false;
   const cached = group.autoClassification || {};
-  if (group.internalDemoted) {
-    group.internal = true;
-    delete group.internalDemoted;
+  const wasInternal = cached.internal === true || group.internal === true;
+  if (group.internal === true) {
+    // Conservative for every reader, and keep the manual intent for a later
+    // successful restore instead of dropping the operator's setting.
+    group.internal = false;
+    group.internalDemoted = group.internalDemoted || { at, reason };
   }
   group.autoClassification = {
     ...cached,
     internal: false,
-    lastKnownInternal: cached.internal === true,
+    lastKnownInternal: wasInternal,
     retry: true,
     source: cached.source || 'unavailable',
     invalidatedAt: at,
@@ -146,10 +157,12 @@ export function invalidateGroupEvidence(group, reason, at = Date.now()) {
 }
 
 /** Invalidate every registered group; returns the number of groups touched. */
-export function invalidateAllGroups(config, reason, at = Date.now()) {
+export function invalidateAllGroups(config, reason, at = Date.now(), onInvalidate = null) {
   let count = 0;
-  for (const group of Object.values(config.groups || {})) {
-    if (invalidateGroupEvidence(group, reason, at)) count++;
+  for (const [chatId, group] of Object.entries(config.groups || {})) {
+    if (!invalidateGroupEvidence(group, reason, at)) continue;
+    count++;
+    if (onInvalidate) onInvalidate(chatId);
   }
   return count;
 }
@@ -296,7 +309,11 @@ export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now,
     if (fingerprint === null) { fingerprint = next; return false; }
     if (next === fingerprint) return false;
     fingerprint = next;
-    const count = invalidateAllGroups(config, 'config_changed', now());
+    // Bump every invalidated chat's epoch *while* invalidating. A classification
+    // that was already waiting on `im.chat.get` under the old tenant list would
+    // otherwise still match the epoch when it resolves and write a verdict that
+    // belongs to the previous configuration.
+    const count = invalidateAllGroups(config, 'config_changed', now(), bumpEpoch);
     // Persist immediately: a restart between the change and the next message must
     // not resurrect a verdict recorded under the previous tenant list.
     if (count > 0) saveConfig(config);

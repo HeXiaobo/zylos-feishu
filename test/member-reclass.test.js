@@ -15,6 +15,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
+import vm from 'node:vm';
+import * as classificationModule from '../src/lib/group-classification.js';
 import { createGroupClassifier, effectiveInternal, groupEvidence } from '../src/lib/group-classification.js';
 import { groupGatePolicy } from '../src/lib/c4-ingress.js';
 import { buildStatus, groupStatus } from '../src/lib/status-file.js';
@@ -316,4 +318,131 @@ test('groupStatus reports the rejudged verdict with its reason and source', asyn
   const built = buildStatus({ config: f.config, groups: [status], now: () => 1_700_000_000_000 });
   assert.equal(built.updated_at, '2023-11-14T22:13:20.000Z');
   assert.equal(built.groups[0].chat_id, 'oc_1');
+});
+
+// ---------------------------------------------------------------------------
+// 7. Leader review 1: invalidation must bump the epoch of every group it voids.
+//    Otherwise a lookup that was already waiting under the old tenant list has
+//    the same epoch when it resolves and writes its stale answer back.
+// ---------------------------------------------------------------------------
+test('a config change invalidates a lookup that was already in flight', async () => {
+  const f = fixture({ external: false, tenants: ['own'] });
+  await f.run();
+  assert.equal(f.policy().internal, true);
+
+  // Let the cache expire so the next message really starts a lookup, then hold
+  // it open: this is the "already waiting under the old configuration" case.
+  f.state.time += 24 * 60 * 60 * 1000 + 1;
+  let finishOld;
+  f.state.pending = new Promise(resolve => { finishOld = resolve; });
+  const inflight = f.run('own');
+  await Promise.resolve();
+  // The configuration changes while that lookup is pending; the new list makes
+  // this group external for the same sender.
+  f.config.internalTenants = ['partner'];
+  assert.equal(f.classify.syncConfig(f.config), true, 'the watcher invalidates while the lookup hangs');
+  assert.equal(f.policy().internal, false, 'conservative immediately, before anything awaits');
+
+  // The old lookup now resolves saying "internal". It must be discarded.
+  f.state.pending = null;
+  f.state.response = { success: true, chat: { external: false } };
+  finishOld({ success: true, chat: { external: false } });
+  await inflight;
+  assert.equal(f.policy().internal, false, 'the pre-change verdict must not be written back');
+  assert.equal(f.group().autoClassification.invalidatedReason, 'config_changed');
+});
+
+test('a second message after the invalidation re-judges under the new configuration', async () => {
+  const f = fixture({ external: false, tenants: ['own'] });
+  await f.run();
+  f.state.time += 24 * 60 * 60 * 1000 + 1;
+  let finishOld;
+  f.state.pending = new Promise(resolve => { finishOld = resolve; });
+  const inflight = f.run('own');
+  await Promise.resolve();
+  f.config.internalTenants = ['partner'];
+  f.classify.syncConfig(f.config);
+  finishOld({ success: true, chat: { external: false } });
+  await inflight;
+
+  f.state.response = { success: true, chat: { external: false } };
+  const before = f.state.calls;
+  await f.run('partner');
+  assert.equal(f.state.calls, before + 1, 'the invalidated group is looked up again');
+  assert.equal(f.policy().internal, true, 'the new configuration decides the verdict');
+});
+
+// ---------------------------------------------------------------------------
+// 8. Leader review 2: the persisted fields must be conservative for BOTH
+//    readers during the async window. `effectiveInternal` and the core gate
+//    (`policyFor`) must agree, or already-queued unmentioned rows leak.
+// ---------------------------------------------------------------------------
+function corePolicyFor() {
+  const core = process.env.ARCH2_CORE_DIR;
+  if (!core) return null;
+  const source = fs.readFileSync(`${core}/skills/comm-bridge/scripts/c4-gate.js`, 'utf8');
+  const start = source.indexOf('export function policyFor');
+  const end = source.indexOf('\n}\n', start) + 3;
+  const ctx = vm.createContext({ env: {} });
+  vm.runInContext(`${source.slice(start, end).replace('export ', '')}\nthis.policyFor = policyFor;`, ctx);
+  return ctx.policyFor;
+}
+
+test('a manual internal=true is conservative for the core gate for the whole async window', async () => {
+  const f = fixture({ external: false, group: { internal: true } });
+  await f.run();
+  assert.equal(f.policy().gateMode, 'auto');
+
+  // Invalidate (as a member event or config change does) and inspect the
+  // persisted fields before any lookup resolves.
+  let finishLookup;
+  f.state.pending = new Promise(resolve => { finishLookup = resolve; });
+  const event = f.member('added', [insideUser]);   // any membership change voids
+  assert.equal(f.group().internal, false, 'group.internal must be false while re-judging (core reads it first)');
+  assert.equal(f.policy().internal, false);
+  assert.equal(f.policy().gateMode, 'observe');
+  assert.equal(f.group().internalDemoted.reason, 'member_joined', 'the manual intent is kept for restore');
+
+  const policy = corePolicyFor();
+  if (policy) {
+    const core = policy({ chat_id: 'oc_1', endpoint_id: 'oc_1|type=group', sender_id: 'ou_person', content: 'hi' },
+      { groups: { oc_1: f.group() } }, {});
+    assert.equal(core.internal, false, 'core policyFor must agree with the component');
+    assert.equal(core.mode, 'observe', 'an unmentioned queued message must not be answered');
+  }
+
+  f.state.pending = null;
+  f.state.response = { success: true, chat: { external: false } };
+  finishLookup({ success: true, chat: { external: false } });
+  await event;
+  assert.equal(f.group().internal, true, 'the manual claim comes back after verification');
+  assert.equal(f.group().internalDemoted, undefined);
+});
+
+test('a config change is conservative for the core gate and for effectiveInternal', async () => {
+  const f = fixture({ external: false, group: { internal: true }, tenants: ['own'] });
+  await f.run();
+  f.config.internalTenants = ['own', 'partner'];
+  f.classify.syncConfig(f.config);
+  assert.equal(effectiveInternal(f.group()), false);
+  assert.equal(f.group().internal, false);
+  const policy = corePolicyFor();
+  if (policy) {
+    const core = policy({ chat_id: 'oc_1', endpoint_id: 'oc_1|type=group', sender_id: 'ou_person', content: 'x' },
+      { groups: { oc_1: f.group() } }, {});
+    assert.equal(core.internal, false);
+    assert.equal(core.mode, 'observe');
+  }
+});
+
+test('invalidateGroupEvidence leaves both readers conservative and keeps the manual intent', () => {
+  const { invalidateGroupEvidence } = classificationModule;
+  const group = { internal: true, autoClassification: { internal: true, checkedAt: 5, retry: false, source: 'chat_info' } };
+  invalidateGroupEvidence(group, 'member_left', 10);
+  assert.equal(group.internal, false);
+  assert.equal(group.internalDemoted.reason, 'member_left');
+  assert.equal(effectiveInternal(group), false);
+  assert.equal(group.autoClassification.retry, true);
+  assert.equal(group.autoClassification.internal, false);
+  assert.equal(group.autoClassification.lastKnownInternal, true);
 });

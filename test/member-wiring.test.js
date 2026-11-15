@@ -180,3 +180,10 @@ test('the permission check runs at startup and its result reaches status.json', 
   assert.match(source, /permission: permissionReport/);
   assert.match(source, /Scope \$\{check\.scope\} \$\{check\.status\}/, 'a non-granted scope is logged');
 });
+
+// Leader review 3: the startup probe must really call the API for each scope.
+test('startup probes tenant.tenant.query and im.message.list, not im.chat.get', () => {
+  assert.match(source, /createScopeProbes\(\{ client: getClient\(\), chatId: probeChatId \}\)/);
+  assert.ok(!/getChatInfo\(probeChatId\)/.test(source), 'im.chat.get only proves im:chat, not im:message.group_msg');
+  assert.ok(!/already known/.test(source), 'the tenant scope must be probed even when bot.tenant_key is already cached');
+});

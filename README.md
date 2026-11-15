@@ -147,9 +147,19 @@ A cached verdict is not final. Three things void it and re-judge the group:
    timeout, anything ambiguous) are kept apart.
 
 Every verdict, its source and the reason are written to
-`~/zylos/components/feishu/status.json` together with the startup scope check
-(`im:message.group_msg`, `tenant:tenant:readonly`): each scope is `granted`,
-`missing` or `unknown`, and `unknown` is never reported as granted.
+`~/zylos/components/feishu/status.json` together with the startup scope check:
+
+| scope | probe | why that call |
+|---|---|---|
+| `tenant:tenant:readonly` | `tenant.tenant.query` | the only way to read the bot's own tenant key |
+| `im:message.group_msg` | `im.message.list` on a known group, `page_size: 1` | proves the group-message scope; `im.chat.get` only proves `im:chat` |
+
+Each scope is `granted`, `missing` or `unknown`. `missing` requires the denial to
+name that scope (`99991672 … scopes is required: [x]` or `230027 … need scope: x`,
+whether returned or thrown as `err.response.data`). A denial naming another scope,
+a denied call that names no scope, no group to probe, or a network failure are
+`unknown`. `unknown` is never reported as granted, and the tenant scope is probed
+even when `bot.tenant_key` is already cached from an earlier start.
 
 C4 supplies `C4_OUTBOUND_ID` (`C4_DELIVERY_ID` is an alias). The sender passes it
 as the Feishu `uuid`; later chunks use `:<index>`. The last stdout line is

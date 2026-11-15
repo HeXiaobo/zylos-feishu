@@ -1771,26 +1771,31 @@ if (!creds.app_id || !creds.app_secret) {
   // No additional event subscriptions or credentials are required. Only the
   // arch2 group gate needs it, so with the switch off nothing extra is written
   // to the operator's config.
-  let tenantProbe = { ok: true, skipped: true };
+  if (ARCH2 && !botTenantKey) {
+    try {
+      const { getClient } = await import('./lib/client.js');
+      const tenant = await getClient().tenant.tenant.query({});
+      if (tenant.code === 0) botTenantKey = tenant.data?.tenant?.tenant_key || '';
+    } catch { /* missing permission: unknown senders remain conservative */ }
+  }
   if (ARCH2) {
-    const { getClient } = await import('./lib/client.js');
-    const client = getClient();
-    const probeTenant = async () => {
-      const tenant = await client.tenant.tenant.query({});
-      if (tenant.code === 0) botTenantKey = botTenantKey || tenant.data?.tenant?.tenant_key || '';
-      return tenant;
-    };
-    if (!botTenantKey) {
-      tenantProbe = await probeTenant().then(value => ({ ok: true, value }), error => ({ ok: false, error }));
-    }
     // Issue #162 item 4: check both scopes the group gate depends on and report
-    // what is missing. The group-message scope is probed through `im.chat.get`,
-    // the only group call the component already makes; a denial there names the
-    // scope it needed. No group yet → per-scope "unknown", never "granted".
+    // what is missing. The probes return the raw SDK response/error so a denial
+    // can name its scope; `tenant.tenant.query` and `im.message.list` each need
+    // exactly one of the two scopes. `im.chat.get` is deliberately not used — it
+    // only proves `im:chat`. No group yet → `im:message.group_msg` is `unknown`,
+    // never `granted`.
+    const { getClient } = await import('./lib/client.js');
     const probeChatId = Object.keys(config.groups || {})[0] || null;
+    const { createScopeProbes } = await import('./lib/api-probes.js');
+    const probes = createScopeProbes({ client: getClient(), chatId: probeChatId });
     permissionReport = await checkGroupPermissions({
-      probeTenant: () => (tenantProbe.skipped ? { code: 0, msg: 'already known' } : tenantProbe.ok ? tenantProbe.value : Promise.reject(tenantProbe.error)),
-      probeGroupMessages: probeChatId ? () => getChatInfo(probeChatId) : undefined,
+      probeTenant: async () => {
+        const tenant = await probes.probeTenant();
+        if (tenant?.code === 0) botTenantKey = botTenantKey || tenant.data?.tenant?.tenant_key || '';
+        return tenant;
+      },
+      probeGroupMessages: probes.probeGroupMessages,
       chatId: probeChatId,
     });
     console.log(`[feishu] Scope check: ${permissionSummary(permissionReport)}`);
