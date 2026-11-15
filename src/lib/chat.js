@@ -166,6 +166,8 @@ export async function getChatInfo(chatId) {
       return {
         success: false,
         message: `Failed to get chat info: ${res.msg}`,
+        // Kept verbatim so a missing-scope denial can name the scope (#162).
+        msg: res.msg,
         code: res.code,
       };
     }
