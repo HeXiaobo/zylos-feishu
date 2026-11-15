@@ -28,7 +28,9 @@ import { getConfig, watchConfig, saveConfig, DATA_DIR, getCredentials, stopWatch
 import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages } from './lib/message.js';
 import { getUserInfo } from './lib/contact.js';
 import { listChatMembers, getChatInfo } from './lib/chat.js';
-import { createGroupClassifier, normalizeGroupEvidence } from './lib/group-classification.js';
+import { createGroupClassifier, normalizeGroupEvidence, groupEvidence } from './lib/group-classification.js';
+import { checkGroupPermissions, permissionSummary } from './lib/permissions.js';
+import { buildStatus, groupStatus, writeStatus } from './lib/status-file.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
@@ -52,7 +54,15 @@ const ARCH2 = arch2Enabled();
 let botOpenId = '';
 let botAppId = '';
 let botTenantKey = '';
-const classifyGroup = createGroupClassifier({ getChatInfo, saveConfig });
+const classifyGroup = createGroupClassifier({
+  getChatInfo,
+  // Every verdict the classifier persists is also the reason status.json exists.
+  saveConfig: nextConfig => { const saved = saveConfig(nextConfig); scheduleStatus(); return saved; },
+  log: message => console.log(`[feishu] ${message}`),
+});
+// Filled in at startup by checkGroupPermissions; null until the probe has run so
+// status.json says "not checked" instead of implying everything is granted.
+let permissionReport = null;
 let botAppName = '';
 
 // WSClient instance for graceful shutdown (websocket mode only)
@@ -160,11 +170,45 @@ if (connectionMode === 'webhook' && !config.bot?.verification_token) {
 watchConfig((newConfig) => {
   console.log(`[feishu] Config reloaded`);
   config = newConfig;
+  if (ARCH2) {
+    // Issue #162 item 2: a changed internalTenants / bot tenant voids every
+    // cached verdict right away, so the next message is judged by the new
+    // configuration — no restart, no manual cache clear.
+    try { classifyGroup.syncConfig(newConfig); } catch (err) {
+      console.warn(`[feishu] Config-change reclassification failed: ${err.message}`);
+    }
+  }
   if (!newConfig.enabled) {
     console.log(`[feishu] Component disabled, stopping...`);
     shutdown();
   }
 });
+
+// ============================================================
+// Component status (issue #162 item 4)
+// ============================================================
+let statusTimer = null;
+
+/** Write status.json: permission readiness plus each group's verdict and reason. */
+function persistStatus() {
+  if (!ARCH2) return null;
+  const groups = Object.keys(config.groups || {}).map(chatId =>
+    groupStatus(chatId, config, { evidenceFor: groupEvidence }));
+  const result = writeStatus(DATA_DIR, buildStatus({
+    config, permission: permissionReport, groups, arch2: true,
+    extra: { connection_mode: connectionMode, bot_tenant_key: config.bot?.tenant_key || null },
+  }));
+  if (!result.ok) console.warn(`[feishu] Failed to write status.json: ${result.error}`);
+  return result;
+}
+
+// Debounced: the message path saves config often (evidence refreshes), and each
+// write of status.json is a full rewrite.
+function scheduleStatus() {
+  if (!ARCH2 || statusTimer) return;
+  statusTimer = setTimeout(() => { statusTimer = null; persistStatus(); }, 200);
+  statusTimer.unref?.();
+}
 
 // Load/save group cursors
 function loadCursors() {
@@ -1268,6 +1312,8 @@ async function handleMessage(data) {
       saveConfig(config);
     }
     if (ARCH2 && isGroupAllowed(chatId)) {
+      // A change of verdict is persisted through the wrapped saveConfig above,
+      // which is what refreshes status.json; no save means nothing to report.
       await classifyGroup({ config, chatId, senderTenantKey: sender.tenant_key, botTenantKey });
     }
     const allowedGroup = isGroupAllowed(chatId);
@@ -1424,6 +1470,55 @@ async function handleMessage(data) {
 }
 
 // ============================================================
+// Group membership events (issue #162 item 1)
+// ============================================================
+//
+// Feishu pushes these three when the bot is in the group and the app
+// subscribed "消息与群组" events (verified field shapes in the SDK types:
+// `im.chat.member.user.added_v1` / `.deleted_v1` / `.withdrawn_v1` carry
+// `chat_id` and `users[].tenant_key`). Missing subscription is not an error: the
+// group stays on the 24h cache, which is exactly the pre-fix behaviour.
+const MEMBER_EVENT_TYPES = {
+  'im.chat.member.user.added_v1': 'added',
+  'im.chat.member.user.deleted_v1': 'deleted',
+  'im.chat.member.user.withdrawn_v1': 'withdrawn',
+};
+
+async function handleMemberEvent(eventType, data) {
+  const type = MEMBER_EVENT_TYPES[eventType];
+  if (!ARCH2 || !type) return;
+  // WSClient hands `{...event, event_type}`; the webhook payload nests the same
+  // fields under `event`. Accept both instead of inventing a third shape.
+  const payload = data?.event && typeof data.event === 'object' ? data.event : data;
+  const chatId = payload?.chat_id;
+  if (!chatId) return;
+  try {
+    const result = await classifyGroup.handleMemberEvent({
+      config,
+      chatId,
+      event: {
+        type,
+        users: Array.isArray(payload.users) ? payload.users : [],
+        operatorTenantKey: payload.operator_tenant_key || null,
+      },
+      botTenantKey,
+    });
+    if (result.handled) scheduleStatus();
+  } catch (err) {
+    console.error(`[feishu] Error handling member event ${eventType}: ${err.message}`);
+  }
+}
+
+/** The event dispatch map shared by both transports. */
+function memberEventHandlers() {
+  const handlers = {};
+  for (const eventType of Object.keys(MEMBER_EVENT_TYPES)) {
+    handlers[eventType] = data => handleMemberEvent(eventType, data);
+  }
+  return handlers;
+}
+
+// ============================================================
 // Transport: WebSocket mode (Feishu SDK WSClient)
 // ============================================================
 
@@ -1447,7 +1542,8 @@ function startWebSocket(creds) {
         } catch (err) {
           console.error(`[feishu] Error handling message: ${err.message}`);
         }
-      }
+      },
+      ...memberEventHandlers(),
     })
   });
 }
@@ -1518,6 +1614,16 @@ function startWebhook(creds) {
       handleMessage(data).catch(err => {
         console.error(`[feishu] Error handling message: ${err.message}`);
       });
+    }
+
+    // Group membership events (issue #162): same conservative re-judge as the
+    // WebSocket path. Events are acknowledged first, the re-judge runs after.
+    if (MEMBER_EVENT_TYPES[event.header?.event_type]) {
+      if (event.event && typeof event.event === 'object') {
+        handleMemberEvent(event.header.event_type, event.event).catch(err => {
+          console.error(`[feishu] Error handling member event: ${err.message}`);
+        });
+      }
     }
   });
 
@@ -1665,12 +1771,34 @@ if (!creds.app_id || !creds.app_secret) {
   // No additional event subscriptions or credentials are required. Only the
   // arch2 group gate needs it, so with the switch off nothing extra is written
   // to the operator's config.
-  if (ARCH2 && !botTenantKey) {
-    try {
-      const { getClient } = await import('./lib/client.js');
-      const tenant = await getClient().tenant.tenant.query({});
-      if (tenant.code === 0) botTenantKey = tenant.data?.tenant?.tenant_key || '';
-    } catch { /* missing permission: unknown senders remain conservative */ }
+  let tenantProbe = { ok: true, skipped: true };
+  if (ARCH2) {
+    const { getClient } = await import('./lib/client.js');
+    const client = getClient();
+    const probeTenant = async () => {
+      const tenant = await client.tenant.tenant.query({});
+      if (tenant.code === 0) botTenantKey = botTenantKey || tenant.data?.tenant?.tenant_key || '';
+      return tenant;
+    };
+    if (!botTenantKey) {
+      tenantProbe = await probeTenant().then(value => ({ ok: true, value }), error => ({ ok: false, error }));
+    }
+    // Issue #162 item 4: check both scopes the group gate depends on and report
+    // what is missing. The group-message scope is probed through `im.chat.get`,
+    // the only group call the component already makes; a denial there names the
+    // scope it needed. No group yet → per-scope "unknown", never "granted".
+    const probeChatId = Object.keys(config.groups || {})[0] || null;
+    permissionReport = await checkGroupPermissions({
+      probeTenant: () => (tenantProbe.skipped ? { code: 0, msg: 'already known' } : tenantProbe.ok ? tenantProbe.value : Promise.reject(tenantProbe.error)),
+      probeGroupMessages: probeChatId ? () => getChatInfo(probeChatId) : undefined,
+      chatId: probeChatId,
+    });
+    console.log(`[feishu] Scope check: ${permissionSummary(permissionReport)}`);
+    for (const check of permissionReport.checks) {
+      if (check.status === 'granted') continue;
+      const level = check.status === 'missing' ? 'error' : 'warn';
+      console[level](`[feishu] Scope ${check.scope} ${check.status} (${check.why}): ${check.reason}`);
+    }
   }
   if (ARCH2 && botTenantKey && config.bot?.tenant_key !== botTenantKey) {
     config.bot = { ...config.bot, tenant_key: botTenantKey };
@@ -1682,6 +1810,10 @@ if (!creds.app_id || !creds.app_secret) {
     const creds2 = getCredentials();
     botAppId = creds2.app_id || '';
   } catch {}
+
+  // Status is written before the transports start, so an operator can see the
+  // scope result even when the transport cannot connect.
+  persistStatus();
 
   // Start selected transport
   if (connectionMode === 'webhook') {

@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A group's internal/external verdict is re-judged when something changes
+  (issue #162).** Three triggers no longer wait for the 24h cache:
+  - `im.chat.member.user.added_v1` / `.deleted_v1` / `.withdrawn_v1` (subscribe
+    用户进群 / 用户出群 / 撤销拉用户进群 under 消息与群组). The verdict flips
+    **synchronously, before the handler awaits**, so a message right behind the
+    event is already conservative: an outside tenant joining makes the group
+    external immediately, any other membership change marks the cache void
+    (`internal: false, retry: true`) until `im.chat.get` answers. A lookup
+    returning `external: false` cannot cancel a newer outside-join event.
+  - A change of `internalTenants` or `bot.tenant_key` voids **every** group's
+    verdict, including idle groups and "external sender" evidence, and the next
+    message is judged by the new list. Detected on the message path *and* in the
+    config watcher, so a hot reload needs no restart and no manual cache clear.
+  - Each re-judge bumps a per-chat epoch; a classification that was already in
+    flight when the event arrived discards its older answer instead of writing it.
+- **`~/zylos/components/feishu/status.json`** records the startup scope check and
+  every group's verdict, source and reason. `im:message.group_msg` and
+  `tenant:tenant:readonly` are each reported `granted` / `missing` / `unknown`;
+  `unknown` (no group to probe, network error, a denial naming another scope) is
+  never reported as granted. Non-granted scopes are also logged at startup.
+
+### Changed
+- A failed classification now records **why**: `permission_denied` (with the
+  scope Feishu named, e.g. `im:chat:readonly`) is kept apart from
+  `refresh_failed` (timeout, network, anything ambiguous). Both stay external.
+- `getChatInfo` and `listMessages` keep Feishu's raw `msg` on failure so a
+  missing-scope denial can be recognized by the scope it names.
 - **`[MEDIA:card]` sends a prepared Feishu card 2.0 file through C4.**
   `scripts/send.js` now accepts `[MEDIA:card]<absolute path>`, the third media
   type beside image and file, so an agent that generated a card JSON document

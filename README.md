@@ -123,8 +123,33 @@ Manual `groups[chat_id].internal` and `gateMode` settings take precedence over
 automatic evidence. Leave `internal` absent to enable automatic classification;
 remove it to return to automatic classification. `gateMode` supports `off`,
 `observe`, `auto`. A group classified as external still requires a bot mention
-(or reply to the bot) for delivery; other messages are retained as context. No new
-Feishu event subscription is required.
+(or reply to the bot) for delivery; other messages are retained as context.
+
+### Re-judging on change (issue #162)
+
+A cached verdict is not final. Three things void it and re-judge the group:
+
+1. **Member joined or left.** Subscribe the app to `用户进群`
+   (`im.chat.member.user.added_v1`), `用户出群` (`im.chat.member.user.deleted_v1`)
+   and `撤销拉用户进群` (`im.chat.member.user.withdrawn_v1`) under 消息与群组. The
+   verdict changes **synchronously**, before the handler awaits anything, so a
+   message right behind the event is already treated conservatively: an outside
+   tenant joining makes the group external at once, any other membership change
+   voids the cache (`internal: false, retry: true`) until `im.chat.get` answers.
+   A lookup that says `external: false` cannot cancel a newer outside-join event.
+   Without the subscription nothing breaks; the group stays on the 24h cache.
+2. **`internalTenants` or `bot.tenant_key` changed.** The next message (and the
+   config watcher, on a hot reload) voids **every** group's verdict — not only
+   the "external sender" evidence — and judges the group by the new list. No
+   restart and no manual cache clear.
+3. **A lookup failed.** The group is external, and the reason is recorded:
+   `permission_denied` (the scope Feishu named) versus `refresh_failed` (network,
+   timeout, anything ambiguous) are kept apart.
+
+Every verdict, its source and the reason are written to
+`~/zylos/components/feishu/status.json` together with the startup scope check
+(`im:message.group_msg`, `tenant:tenant:readonly`): each scope is `granted`,
+`missing` or `unknown`, and `unknown` is never reported as granted.
 
 C4 supplies `C4_OUTBOUND_ID` (`C4_DELIVERY_ID` is an alias). The sender passes it
 as the Feishu `uuid`; later chunks use `:<index>`. The last stdout line is
@@ -162,6 +187,16 @@ confined to one ticket) is next version, together with the key cabinet.
   `tenant_key`. 〔Unverified against the real Feishu API in this repository〕 Both
   fields need the corresponding permission scopes; when a lookup fails the group
   is treated as external until a lookup succeeds.
+- **The membership events are built from the documented payload, not from a live
+  push.** `im.chat.member.user.added_v1` / `.deleted_v1` / `.withdrawn_v1` and
+  their `chat_id` + `users[].tenant_key` fields come from the SDK type
+  definitions (`@larksuiteoapi/node-sdk` 1.58.0). The re-judge itself was only
+  exercised with constructed events; nobody has yet pulled a real outside member
+  into a real group while watching the bot. 〔未验证：真人拉外部成员入群〕
+- **A membership event only re-judges groups the bot already knows.** A group the
+  bot has never received a message from has no `groups[chat_id]` row, and an
+  event must not create one (that would turn an event into an allowlist entry).
+  The first message from that group classifies it as before.
 
 ## Documentation
 

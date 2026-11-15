@@ -189,7 +189,9 @@ export async function listMessages(chatId, limit = 20, sortType = 'desc', startT
 
       return { success: true, messages, hasMore: res.data.has_more };
     } else {
-      return { success: false, message: `Failed to list messages: ${res.msg}`, code: res.code };
+      // `msg` is kept verbatim: a missing-scope denial is only recognizable by the
+      // scope name inside it (issue #162).
+      return { success: false, message: `Failed to list messages: ${res.msg}`, msg: res.msg, code: res.code };
     }
   } catch (err) {
     return { success: false, message: err.message };

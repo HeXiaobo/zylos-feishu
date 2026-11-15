@@ -428,6 +428,52 @@ Groups are stored in a map keyed by `chat_id`:
 - `mode`: `"mention"` (respond to @mentions only) or `"smart"` (receive all messages)
 - `allowFrom`: Optional list of user_id/open_id. Empty = all group members allowed. `"*"` = wildcard.
 - `historyLimit`: Optional per-group context message limit (overrides `message.context_messages`)
+- `internal`: Optional manual claim, arch2 only. Caution is free: `false` always wins;
+  a `true` is re-verified and demoted by outside evidence (an outside member, a
+  sender tenant outside `internalTenants`, a failed lookup).
+- `gateMode`: `off` | `observe` | `auto`. `auto` is only possible while the group
+  is internal; a stricter value always survives.
+- `autoClassification`: Written by the component, not by hand. Holds the current
+  verdict (`internal`), its `source` (`chat_info`, `member_event`,
+  `external_sender`), `retry`, `invalidatedReason` and `lastError`. A verdict is
+  voided by a membership event, by a change of `internalTenants`/`bot.tenant_key`,
+  or by a failed refresh — never by a silent fallback.
+
+### Re-judging triggers (arch2)
+
+| What happened | Effect on the group | Effect on an unmentioned message |
+|---|---|---|
+| outside tenant joined (`im.chat.member.user.added_v1`) | external at once, synchronous; a later `chat.external=false` cannot cancel it | logged as context only |
+| any other join / a departure (`...deleted_v1`, `...withdrawn_v1`) | cache void (`retry: true`), then `im.chat.get` decides | not delivered until the lookup succeeds |
+| `internalTenants` / `bot.tenant_key` changed | every group voided, next message judged by the new list | decided by the new list |
+| lookup failed | external; reason `permission_denied` or `refresh_failed` | logged as context only |
+
+Subscribe 消息与群组 → 用户进群 / 用户出群 / 撤销拉用户进群 for the three
+membership events. Without the subscription the 24h cache still applies.
+
+### Status File (arch2)
+
+`~/zylos/components/feishu/status.json` is rewritten at startup, on every config
+reload and after a verdict changes:
+
+```json
+{
+  "updated_at": "2026-11-15T11:00:00.000Z",
+  "permissions": {
+    "ok": false,
+    "missing": ["tenant:tenant:readonly"],
+    "unknown": [],
+    "checks": [{ "scope": "tenant:tenant:readonly", "status": "missing", "reason": "code=99991672 scopes=tenant:tenant:readonly msg=…" }]
+  },
+  "groups": [
+    { "chat_id": "oc_…", "internal": false, "source": "member_event",
+      "reason": "member_joined_external", "degraded": false }
+  ]
+}
+```
+
+`status: unknown` means the probe could not run (no group to ask about, network
+failure, or a denial naming a different scope). It is never reported as granted.
 
 ### Markdown Card
 
