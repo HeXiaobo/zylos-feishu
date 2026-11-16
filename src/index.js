@@ -43,6 +43,9 @@ import { extractPostText, resolveMentions } from './lib/message-text.js';
 // merge-forward resource-id rule is unit-testable (see the module's docblock).
 import { parseMessageItemText } from './lib/message-item-text.js';
 import { isDmAllowed as isDmAllowedByConfig, isOwner as isOwnerByConfig } from './lib/dm-policy.js';
+// issue #171：拍板卡回调。校验/路由在 lib，这里只做接线。
+import { createAskCardRuntime, parseAskCardEvent } from './lib/ask-card-runtime.js';
+import { readCardContent, patchCardContent } from './lib/ask-card-message.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
@@ -1519,6 +1522,87 @@ function memberEventHandlers() {
 }
 
 // ============================================================
+// 拍板卡回调（issue #171）
+// ============================================================
+//
+// 用户在拍板卡上点了一个按钮。这条回调和普通消息是两条不同的路：
+//   普通消息 → `im.message.receive_v1` → 入站收件箱 → 前台;
+//   卡片回调 → 这里 → `c4-receive --callback-ticket-id` → route-input → 干活会话。
+// 第二条不经前台，因为单号已经在按钮值里，前台再问一遍没有意义。
+//
+// 归单只投一条 C4 入站消息（带 `--callback-ticket-id`），没有新开一条入站路径。
+
+function askCardRuntime() {
+  return createAskCardRuntime({
+    readCard: messageId => readCardContent({client: getClient(), messageId}),
+    patchCard: (messageId, card) => patchCardContent({client: getClient(), messageId, card}),
+    receive: async ({ticketId, content, messageId, actorId}) => {
+      // 先把「这次点击算不算」问引擎（纯读）：单子不在等人、卡是上一轮的、点
+      // 的人不是被问的，都在这一步被拒，不往库里投任何东西。
+      const verdict = await executeTicketCli(['asktap', ticketId, '--by', actorId, '--json']);
+      if (verdict?.accepted === false) {
+        return {accepted: false, toast: verdict.reason === 'not the asked person' ? '这张卡不是问你的' : '这张单已经答过了'};
+      }
+      // 归单：复用 callback_ticket_id 这条路，`route-input` 会直接 `ticket input`。
+      // endpoint 必须带 chat 段：归单后的回复要能回到这个会话。
+      const chatId = await ticketChatId(ticketId);
+      if (!chatId) throw new Error(`ticket ${ticketId} has no feishu origin to reply to`);
+      const response = await executeC4Receive([
+        C4_RECEIVE,
+        '--channel', 'feishu',
+        '--endpoint', `${chatId}|type:group|msg:${messageId}`,
+        '--callback-ticket-id', ticketId,
+        '--source-id', `ask-card-${messageId}-${actorId}`,
+        '--sender', actorId,
+        '--mentioned', '1',
+        '--content', content,
+        '--json',
+      ]);
+      return response || {ok: true};
+    },
+    onError: message => console.error(`[feishu] Ask card tap: ${message}`),
+  });
+}
+
+/** 用工单自己的 CLI 跑一条只读判定。失败当作「判不了」——不投单。 */
+function executeTicketCli(args) {
+  const script = path.join(process.env.HOME, 'zylos/.claude/skills/tickets/scripts/ticket.js');
+  return new Promise((resolve, reject) => {
+    execFile('node', [script, ...args], {encoding: 'utf8', timeout: 15000, env: process.env}, (error, stdout) => {
+      if (error) { reject(new Error(error.message)); return; }
+      try { resolve(JSON.parse(stdout)); } catch (err) { reject(new Error(`ticket ${args[0]} answered non-JSON: ${err.message}`)); }
+    });
+  });
+}
+
+/** 这张单的来源会话 id（endpoint 的第一段）。读不到就返回 null。 */
+function ticketChatId(ticketId) {
+  const script = path.join(process.env.HOME, 'zylos/.claude/skills/tickets/scripts/ticket.js');
+  return new Promise(resolve => {
+    execFile('node', [script, 'show', ticketId, '--json'], {encoding: 'utf8', timeout: 15000, env: process.env}, (error, stdout) => {
+      if (error) { resolve(null); return; }
+      try {
+        const ticket = JSON.parse(stdout);
+        const chatId = String(ticket.origin_endpoint || '').split('|')[0];
+        resolve(chatId || null);
+      } catch { resolve(null); }
+    });
+  });
+}
+
+/** 两个传输共用的卡片回调处理器：WebSocket 与 Webhook 都走这里。 */
+async function handleAskCardAction(data) {
+  try {
+    const out = await askCardRuntime().handle(data);
+    if (out.handled) console.log(`[feishu] Ask card tap handled: ${out.toast?.type || 'ok'}`);
+    return out.handled ? out.toast : undefined;
+  } catch (err) {
+    console.error(`[feishu] Ask card tap failed: ${err.message}`);
+    return {type: 'error', content: '这张单没接住这次点击，请直接在聊天里回复'};
+  }
+}
+
+// ============================================================
 // Transport: WebSocket mode (Feishu SDK WSClient)
 // ============================================================
 
@@ -1544,6 +1628,12 @@ function startWebSocket(creds) {
         }
       },
       ...memberEventHandlers(),
+      // issue #171：拍板卡按钮。WSClient 把回调当事件推，event_type 就是
+      // `card.action.trigger`，所以和普通事件走同一个 map。
+      'card.action.trigger': async (data) => {
+        const toast = await handleAskCardAction(data);
+        return toast ? {toast} : undefined;
+      },
     })
   });
 }
@@ -1560,7 +1650,7 @@ function startWebhook(creds) {
   const app = express();
   app.use(express.json());
 
-  app.post('/webhook', (req, res) => {
+  app.post('/webhook', async (req, res) => {
     console.log('[feishu] Received webhook request');
 
     let event = req.body;
@@ -1591,6 +1681,19 @@ function startWebhook(creds) {
     if (event.type === 'url_verification') {
       console.log('[feishu] URL verification challenge received');
       return res.json({ challenge: event.challenge });
+    }
+
+    // issue #171: 拍板卡回调。只能同步回 toast —— 飞书把 HTTP 响应体当成
+    // 「更新这张卡」的指令，先 res.json 掉就丢了这个通道。归单本身很短（一次
+    // 只读判定 + 一条 c4-receive），不阻塞其它请求。
+    if (event.header?.event_type === 'card.action.trigger' || event.header?.event_type === 'card.action.trigger_v1') {
+      try {
+        const toast = await handleAskCardAction(event.event || event);
+        return toast ? res.json({ toast }) : res.json({});
+      } catch (err) {
+        console.error(`[feishu] Ask card callback failed: ${err.message}`);
+        return res.json({ toast: {type: 'error', content: '这张单没接住这次点击，请直接在聊天里回复'} });
+      }
     }
 
     // Respond immediately to prevent Feishu retry (timeout ~15s)
