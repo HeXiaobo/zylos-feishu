@@ -24,13 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     missed. Concurrent messages share the request; it is never repeated,
     whatever the result (at most 2 `getBotInfo` calls per process, no timed
     retries);
-  - messages arriving while the startup call is still in flight share one
-    bounded (5s) wait for it. If startup is still pending after that, the
-    message is handled with the unknown identity (a group @mention counts as
-    "not mentioned") and the next message uses the one-shot refetch; if
-    startup fails within that wait, the same message uses the refetch right
-    away and waits up to 5s more. A message waits at most two 5s windows
-    (under 10s). `getBotInfo` itself is now bounded (10s timeout);
+  - the transport only starts after the startup fetch has finished, so in
+    feishu no message can arrive while it is in flight. A message therefore
+    waits at most one 5s window (the one-shot refetch). `getBotInfo` itself
+    is now bounded (10s timeout);
   - all identity readers share one object, so a recovery applies without a
     restart (`src/lib/bot-identity.js`). The startup fetch now uses
     `getBotInfo` from `src/lib/client.js` instead of an inline client.
