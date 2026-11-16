@@ -1,6 +1,6 @@
 ---
 name: feishu
-version: 0.3.6
+version: 0.3.7
 description: >-
   Feishu (飞书, China) communication channel. WebSocket and webhook modes.
   Use when: (1) replying to Feishu messages (DM or group @mentions),
@@ -452,6 +452,10 @@ Configuration in `config.json`:
 ```
 
 Message logs are stored in `~/zylos/components/feishu/logs/<chat_id>.log`.
+
+### Group @mentions ignored (bot identity unknown)
+
+Group @mention detection needs the bot's own `open_id`. It is fetched once at startup (`getBotInfo`) and cached in `config.json` as `bot.open_id` + `bot.app_id`; later starts use the cache immediately (ignored if `bot.app_id` differs from `FEISHU_APP_ID`). If the startup fetch fails and there is no usable cache, the first received message triggers exactly one more fetch; there are no further retries. While the identity is unknown, `[feishu] ERROR bot identity unknown ...` is logged every 10 minutes (`pm2 logs zylos-feishu`); in webhook mode `curl -s localhost:3458/health` also shows `botIdentity.status: "unknown"` (otherwise `cached` / `fetched`). Fix the network or credentials, then `pm2 restart zylos-feishu`.
 
 ## Service Management
 

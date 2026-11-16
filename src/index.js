@@ -25,14 +25,11 @@ import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
+import { getBotInfo } from './lib/client.js';
+import { createBotIdentity, isBotMentioned, botIdentityConfigUpdate } from './lib/bot-identity.js';
 
 // C4 receive interface path
 const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
-
-// Bot identity (fetched at startup)
-let botOpenId = '';
-let botAppId = '';
-let botAppName = '';
 
 // WSClient instance for graceful shutdown (websocket mode only)
 let wsClient = null;
@@ -107,6 +104,25 @@ if (connectionMode === 'webhook' && !config.bot?.verification_token) {
   console.error(`[feishu] Set it in ~/zylos/components/feishu/config.json (get from developer console → Event Subscriptions).`);
   process.exit(1);
 }
+
+// Bot identity: one object read by every consumer so a later recovery takes
+// effect without a restart (see src/lib/bot-identity.js).
+let currentAppId = '';
+try {
+  currentAppId = getCredentials().app_id || '';
+} catch {}
+const botIdentity = createBotIdentity({
+  fetchBotInfo: getBotInfo,
+  appId: currentAppId,
+  // Persist open_id + app_id so the next start has the identity without an
+  // API call. Skipped when already current.
+  persist: (identity) => {
+    const next = botIdentityConfigUpdate(config, identity);
+    if (!next) return;
+    if (saveConfig(next)) config = next;
+  },
+});
+botIdentity.loadCached(config.bot);
 
 // Watch for config changes
 watchConfig((newConfig) => {
@@ -515,6 +531,7 @@ async function resolveUserName(userId, openId) {
   if (!id) return 'unknown';
 
   // Recognize bot's own messages (exact open_id or app_id match)
+  const { openId: botOpenId, appId: botAppId, appName: botAppName } = botIdentity;
   if (botOpenId && id === botOpenId) return botAppName || 'bot';
   if (botAppId && id === botAppId) return botAppName || 'bot';
 
@@ -704,16 +721,6 @@ function getGroupName(chatId) {
   const legacySmart = (config.smart_groups || []).find(g => String(g.chat_id) === String(chatId));
   if (legacySmart?.name) return legacySmart.name;
   return String(chatId || 'unknown');
-}
-
-// Check if bot is mentioned
-function isBotMentioned(mentions, botId) {
-  if (!mentions || !Array.isArray(mentions)) return false;
-  const normalizedBotId = botId === undefined || botId === null ? '' : String(botId);
-  return mentions.some(m => {
-    const mentionId = m.id?.open_id || m.id?.user_id || m.id?.app_id || '';
-    return (normalizedBotId && String(mentionId) === normalizedBotId) || m.key === '@_all';
-  });
 }
 
 /**
@@ -1215,8 +1222,8 @@ async function handleMessage(data) {
 
   const senderId = sender.sender_id?.open_id || sender.sender_id?.app_id || sender.sender_id?.user_id || '';
   if (senderId && (
-    String(senderId) === String(botAppId || '') ||
-    String(senderId) === String(botOpenId || '') ||
+    String(senderId) === String(botIdentity.appId || '') ||
+    String(senderId) === String(botIdentity.openId || '') ||
     String(senderId) === String(config.app_id || '') ||
     String(senderId) === String(config.bot_open_id || '')
   )) return;
@@ -1236,6 +1243,11 @@ async function handleMessage(data) {
 
   // Unified dedup check (both websocket and webhook modes)
   if (isDuplicate(messageId)) return;
+
+  // If the startup getBotInfo failed and no cached identity exists, the first
+  // received message triggers one bounded refetch before any mention check.
+  // This is the only place a message waits for the bot identity.
+  await botIdentity.ensureForMessage();
 
   const extracted = extractMessageContent(message);
   let { text } = extracted;
@@ -1357,7 +1369,7 @@ async function handleMessage(data) {
 
   // Group chat handling
   if (chatType === 'group') {
-    const mentioned = isBotMentioned(mentions, botOpenId);
+    const mentioned = isBotMentioned(mentions, botIdentity.openId);
     const senderIsOwner = isOwner(senderUserId, senderOpenId);
     const groupPolicy = config.groupPolicy || 'allowlist';
     if (groupPolicy === 'disabled') {
@@ -1605,7 +1617,8 @@ function startWebhook(creds) {
       status: 'ok',
       service: 'zylos-feishu',
       mode: 'webhook',
-      cursors: Object.keys(groupCursors).length
+      cursors: Object.keys(groupCursors).length,
+      botIdentity: botIdentity.status()
     });
   });
 
@@ -1621,8 +1634,8 @@ function startWebhook(creds) {
     const entry = {
       timestamp: new Date().toISOString(),
       message_id: messageId || `bot_${Date.now()}`,
-      user_id: botOpenId || 'bot',
-      user_name: botAppName || 'bot',
+      user_id: botIdentity.openId || 'bot',
+      user_name: botIdentity.appName || 'bot',
       text
     };
     // Thread messages go to thread only (context isolation)
@@ -1674,6 +1687,7 @@ function shutdown() {
   clearInterval(dedupCleanupInterval);
   clearInterval(typingCheckInterval);
   clearInterval(userCachePersistInterval);
+  botIdentity.stop();
 
   stopWatching();
   persistUserCache();
@@ -1712,35 +1726,7 @@ if (!creds.app_id || !creds.app_secret) {
 
 // Fetch bot identity, then start the selected transport
 (async () => {
-  try {
-    const client = new Lark.Client({
-      appId: creds.app_id,
-      appSecret: creds.app_secret,
-      appType: Lark.AppType.SelfBuild,
-      domain: Lark.Domain.Feishu
-    });
-
-    const res = await client.request({
-      method: 'GET',
-      url: '/open-apis/bot/v3/info',
-    });
-
-    if (res.code === 0 && res.bot) {
-      botOpenId = res.bot.open_id;
-      botAppName = res.bot.app_name || 'bot';
-      console.log(`[feishu] Bot identity: ${botAppName} (${botOpenId})`);
-    } else {
-      console.error(`[feishu] Warning: Could not fetch bot info: ${res.msg}`);
-    }
-  } catch (err) {
-    console.error(`[feishu] Warning: getBotInfo failed: ${err.message}`);
-  }
-
-  // Store app_id for exact bot message matching
-  try {
-    const creds2 = getCredentials();
-    botAppId = creds2.app_id || '';
-  } catch {}
+  await botIdentity.fetchAtStartup();
 
   // Start selected transport
   if (connectionMode === 'webhook') {
