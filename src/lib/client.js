@@ -9,7 +9,10 @@
 
 import * as lark from '@larksuiteoapi/node-sdk';
 // zylos-lab-safe-logger: never print request bodies/headers (app_secret).
-import { safeLogger } from './safe-logger.js';
+// Since upstream 0.4.0 the SDK logger is createRedactingLogger() (src/lib/redact.js);
+// it masks the same app_secret plus Feishu token shapes and Authorization
+// headers. safe-logger.js is kept as the canonical lab module (zylos-core
+// verifies its hash) but has no importer left.
 import { getCredentials } from './config.js';
 import { explainBotInfoError } from './bot-identity.js';
 import { createRedactingLogger, registerSecrets } from './redact.js';
