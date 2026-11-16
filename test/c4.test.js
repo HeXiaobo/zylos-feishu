@@ -432,7 +432,7 @@ describe('createRejectReply callback', () => {
     assert.deepEqual(log, ['typing-removed', 'cursor']);
   });
 
-  test('stored (null) without onStored (feishu DM and group handlers): removes typing only', () => {
+  test('stored (null) without onStored (feishu DM handler): removes typing only', () => {
     const { reply, log } = make(false);
     reply(null);
     assert.deepEqual(log, ['typing-removed']);
@@ -466,22 +466,24 @@ describe('index.js wiring (source checks)', () => {
 
   test('every inbound call goes through the wrapper that passes FEISHU_INTERNAL_SECRET', () => {
     assert.match(src, /import \{ sendToC4 as sendToC4Core, createRejectReply \} from '\.\/lib\/c4\.js';/);
-    const wrapper = src.slice(src.indexOf('function sendToC4(source, endpoint, content, onReject) {'));
+    const wrapper = src.slice(src.indexOf('function sendToC4(source, endpoint, content, onReject, onSuccess = null) {'));
     assert.ok(wrapper.length < src.length, 'local sendToC4 wrapper exists');
     const body = wrapper.slice(0, wrapper.indexOf('\n}\n'));
-    assert.match(body, /sendToC4Core\(source, endpoint, content, onReject, null,/);
+    assert.match(body, /sendToC4Core\(source, endpoint, content, onReject, onSuccess,/);
     assert.match(body, /env: \{ \.\.\.process\.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET \}/);
     assert.equal(src.match(/sendToC4Core\(/g).length, 1, 'only the wrapper calls lib/c4.js directly');
     assert.ok(!/\bexecFile\b/.test(src), 'index.js no longer spawns c4-receive itself');
   });
 
-  test('DM and group reject notices go through sendThreadAwareMessage, with no onStored', () => {
+  test('DM and group reject notices go through sendThreadAwareMessage; only the group one advances the cursor when stored', () => {
     const callbacks = src.match(/createRejectReply\(\{[\s\S]*?\n    \}\);/g);
     assert.equal(callbacks.length, 2);
     for (const cb of callbacks) {
       assert.match(cb, /removeTyping: \(\) => removeTypingIndicator\(messageId\)/);
       assert.match(cb, /deliver: \(errMsg\) => sendThreadAwareMessage\(chatId, errMsg, \{ chatType, rootId, parentId, messageId \}\)/);
-      assert.ok(!cb.includes('onStored'), 'group cursor already moved before sending');
     }
+    const [dm, group] = callbacks;
+    assert.ok(!dm.includes('onStored'), 'DMs have no group cursor');
+    assert.match(group, /onStored: markCursorDelivered,/);
   });
 });

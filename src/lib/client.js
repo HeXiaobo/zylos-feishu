@@ -10,6 +10,7 @@
 import * as lark from '@larksuiteoapi/node-sdk';
 import { getCredentials } from './config.js';
 import { explainBotInfoError } from './bot-identity.js';
+import { createRedactingLogger, registerSecrets } from './redact.js';
 
 let clientInstance = null;
 
@@ -27,11 +28,15 @@ export function getClient() {
     throw new Error('FEISHU_APP_ID and FEISHU_APP_SECRET must be set in ~/zylos/.env');
   }
 
+  registerSecrets(creds.app_secret);
   clientInstance = new lark.Client({
     appId: creds.app_id,
     appSecret: creds.app_secret,
     appType: lark.AppType.SelfBuild,
     domain: lark.Domain.Feishu,  // Chinese version (feishu.cn)
+    // The SDK's default logger prints caught AxiosErrors verbatim, including
+    // the tenant-token request body (app_secret). See src/lib/redact.js.
+    logger: createRedactingLogger(),
   });
 
   return clientInstance;

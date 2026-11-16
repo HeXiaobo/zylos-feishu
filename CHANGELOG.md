@@ -61,11 +61,53 @@ These also apply on older Cores:
   component log.
 - A rejection that Core reports as already stored (`error.persisted`
   non-empty) no longer shows an error to the user; the typing indicator is
-  cleared. (The group context cursor already moves before the message is
-  handed to Core; that is unchanged.)
+  cleared, and the group context cursor moves past the message.
+- **The group context cursor now moves only after Core confirms delivery**
+  (`markCursorDelivered`, as in zylos-lark). It used to move before the
+  message was handed to Core, so after a try-later / may-not-have-reached-me
+  notice, or a crash between the webhook ack and Core's answer, the message
+  had already been passed. The cursor is now also read again: group context is
+  the messages after the cursor (capped at `context_messages`), so an
+  undelivered message is included as context with the next handled message in
+  that group, and delivered ones are not repeated. A confirmation for an older
+  message never moves the cursor back. Context entries are sorted
+  chronologically, also when they mix Feishu's epoch-millisecond and ISO
+  timestamps (`src/lib/group-context.js`, `src/index.js`).
 - When the retry also failed without a structured result, the user got no
   reply and the typing indicator stayed; the user now gets the "may not have
   reached me" notice.
+- **Secrets no longer reach the service logs** (port of zylos-lark #115).
+  When the tenant-access-token request failed (e.g. `ECONNREFUSED`), the
+  SDK's default logger printed the whole AxiosError to `out.log`, including
+  `config.data` with the plaintext `app_secret`. Every SDK client (the API
+  `Client` in `src/lib/client.js`, and the `WSClient` and `EventDispatcher` of
+  WebSocket mode) now gets a redacting logger with the same `[error]:` /
+  `[info]:` format, and the service and `scripts/send.js` wrap `console` with
+  the same redaction (`src/lib/redact.js`). Log arguments are formatted into
+  one line first and then redacted, so `console.log('token=%s', v)` and
+  `('[x] token:', v)` are masked too. Axios errors are logged as name,
+  message, code, method, url, status, cause and redacted response data (no
+  raw config/request/headers); AggregateError `errors` and URL objects are
+  kept (redacted). Values of secret keys (`app_secret`, access/refresh
+  tokens, `Authorization` with any scheme, `encrypt_key`,
+  `verification_token`, `ticket`, `secret_key`, `api_key`, `private_key`,
+  `x-internal-token`, ...) are masked in nested objects, JSON strings, query
+  strings (also percent-encoded) and `Bearer` headers, as are standalone
+  tokens in either Feishu shape (legacy `t-`/`u-`/`a-`/`ur-` plus at least 30
+  characters including a digit, not inside paths; and JWS-shaped `eyJ…`
+  header.payload.signature values such as OAuth v2 user and refresh tokens)
+  and the configured secret values themselves (`FEISHU_APP_SECRET`,
+  `bot.encrypt_key`, `bot.verification_token`, also after a config reload,
+  and the internal record-outgoing secret). The bare `token` key stays masked
+  (it carries the verification token in webhook v1 event callbacks). Webhook
+  mode never logs raw request bodies, headers or tokens. Log copies are
+  bounded (first 100 items per array/object with a "… N more" marker, depth
+  6, 5000 values in all) and shared references are copied once, so large
+  payloads no longer slow logging down. Copies keep class names, symbol keys
+  and the `[cause]` / `[errors]` presentation; DESIGN.md lists the remaining
+  differences from plain `util.format` output. `admin.js show` masks the
+  same secret fields (`bot.encrypt_key`, `bot.verification_token`) and prints
+  the rest of the config unchanged.
 
 ## [0.3.7] - 2026-11-16
 
