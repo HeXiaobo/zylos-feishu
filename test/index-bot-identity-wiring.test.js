@@ -1,4 +1,4 @@
-// Wiring guard for the bot-identity fix (#49) inside src/index.js.
+// Wiring guard for the bot-identity fix inside src/index.js.
 //
 // src/index.js starts the service on import, so these checks read its source
 // instead of executing it. They pin the three call sites that the unit tests
