@@ -10,7 +10,6 @@
 import dotenv from 'dotenv';
 import express from 'express';
 import crypto from 'crypto';
-import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import * as Lark from '@larksuiteoapi/node-sdk';
@@ -25,11 +24,11 @@ import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
+import { sendToC4 as sendToC4Core, createRejectReply } from './lib/c4.js';
+import { buildEndpoint } from './lib/endpoint.js';
+import { recordChatType } from './lib/session-group.js';
 import { getBotInfo } from './lib/client.js';
 import { createBotIdentity, isBotMentioned, botIdentityConfigUpdate } from './lib/bot-identity.js';
-
-// C4 receive interface path
-const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
 
 // WSClient instance for graceful shutdown (websocket mode only)
 let wsClient = null;
@@ -745,87 +744,12 @@ function resolveMentions(text, mentions, { stripBot = false, botOpenId: botId } 
 }
 
 /**
- * Parse c4-receive JSON response from stdout.
- */
-function parseC4Response(stdout) {
-  if (!stdout) return null;
-  try {
-    return JSON.parse(stdout.trim());
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Send message to Claude via C4 (with 1 retry on unexpected failure)
+ * Send a message to the agent via C4 (src/lib/c4.js). c4-receive gets
+ * FEISHU_INTERNAL_SECRET in its environment, as before.
  */
 function sendToC4(source, endpoint, content, onReject) {
-  if (!content) {
-    console.error('[feishu] sendToC4 called with empty content');
-    return;
-  }
-  const childEnv = { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET };
-  const args = [
-    C4_RECEIVE,
-    '--channel', source,
-    '--endpoint', endpoint,
-    '--json',
-    '--content', content
-  ];
-
-  execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
-    if (!error) {
-      console.log(`[feishu] Sent to C4: ${content.substring(0, 50)}...`);
-      return;
-    }
-    const response = parseC4Response(error.stdout || stdout);
-    if (response && response.ok === false && response.error?.message) {
-      console.warn(`[feishu] C4 rejected (${response.error.code}): ${response.error.message}`);
-      if (onReject) onReject(response.error.message);
-      return;
-    }
-    console.warn(`[feishu] C4 send failed, retrying in 2s: ${error.message}`);
-    setTimeout(() => {
-      execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (retryError, retryStdout) => {
-        if (!retryError) {
-          console.log(`[feishu] Sent to C4 (retry): ${content.substring(0, 50)}...`);
-          return;
-        }
-        const retryResponse = parseC4Response(retryError.stdout || retryStdout);
-        if (retryResponse && retryResponse.ok === false && retryResponse.error?.message) {
-          console.error(`[feishu] C4 rejected after retry (${retryResponse.error.code}): ${retryResponse.error.message}`);
-          if (onReject) onReject(retryResponse.error.message);
-        } else {
-          console.error(`[feishu] C4 send failed after retry: ${retryError.message}`);
-        }
-      });
-    }, 2000);
-  });
-}
-
-/**
- * Build structured endpoint string for C4.
- * Format: chatId|type:group|root:rootId|parent:parentId|msg:messageId
- * C4 treats endpoint as opaque string; send.js parses it.
- */
-function buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId } = {}) {
-  let endpoint = chatId;
-  if (chatType) {
-    endpoint += `|type:${chatType}`;
-  }
-  if (rootId) {
-    endpoint += `|root:${rootId}`;
-  }
-  if (parentId) {
-    endpoint += `|parent:${parentId}`;
-  }
-  if (messageId) {
-    endpoint += `|msg:${messageId}`;
-  }
-  if (threadId) {
-    endpoint += `|thread:${threadId}`;
-  }
-  return endpoint;
+  sendToC4Core(source, endpoint, content, onReject, null,
+    { env: { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET } });
 }
 
 // Params shared by every `im.message.get` call.
@@ -1270,6 +1194,9 @@ async function handleMessage(data) {
 
   // Build structured endpoint with routing metadata
   const endpoint = buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId });
+  // Remember DM vs group so a bare chat id (proactive send) maps to its
+  // session group without an API call (scripts/session-group.js).
+  recordChatType(chatId, chatType);
 
   // quotedContent is fetched lazily after routing eligibility checks
   let quotedContent = null;
@@ -1315,11 +1242,11 @@ async function handleMessage(data) {
     const senderName = await resolveUserName(senderUserId, senderOpenId);
     const cleanText = resolveMentions(text, mentions);
     const threadRootId = threadId ? rootId : null;
-    const rejectReply = (errMsg) => {
-      removeTypingIndicator(messageId);
-      sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
-        .catch(e => console.error('[feishu] reject reply failed:', e.message));
-    };
+    const rejectReply = createRejectReply({
+      removeTyping: () => removeTypingIndicator(messageId),
+      deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
+        .catch(e => console.error('[feishu] reject reply failed:', e.message))
+    });
 
     // Handle images (lazy download: only when message is being sent to C4)
     if (imageKeys.length > 0) {
@@ -1448,11 +1375,12 @@ async function handleMessage(data) {
     const cleanText = resolveMentions(text, mentions);
     const cleanLogText = resolveMentions(logText, mentions);
     const threadRootId = threadId ? rootId : null;
-    const groupRejectReply = (errMsg) => {
-      removeTypingIndicator(messageId);
-      sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
-        .catch(e => console.error('[feishu] reject reply failed:', e.message));
-    };
+    // No onStored: the group context cursor already moved before sending (updateCursor above).
+    const groupRejectReply = createRejectReply({
+      removeTyping: () => removeTypingIndicator(messageId),
+      deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
+        .catch(e => console.error('[feishu] reject reply failed:', e.message))
+    });
 
     // Handle images (lazy download: only for messages being sent to C4)
     if (imageKeys.length > 0) {
