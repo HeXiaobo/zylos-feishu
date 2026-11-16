@@ -9,8 +9,13 @@
 
 import * as lark from '@larksuiteoapi/node-sdk';
 // zylos-lab-safe-logger: never print request bodies/headers (app_secret).
-import { safeLogger } from './safe-logger.js';
+// Since upstream 0.4.0 the SDK logger is createRedactingLogger() (src/lib/redact.js);
+// it masks the same app_secret plus Feishu token shapes and Authorization
+// headers. safe-logger.js is kept as the canonical lab module (zylos-core
+// verifies its hash) but has no importer left.
 import { getCredentials } from './config.js';
+import { explainBotInfoError } from './bot-identity.js';
+import { createRedactingLogger, registerSecrets } from './redact.js';
 
 let clientInstance = null;
 
@@ -28,12 +33,18 @@ export function getClient() {
     throw new Error('FEISHU_APP_ID and FEISHU_APP_SECRET must be set in ~/zylos/.env');
   }
 
+  registerSecrets(creds.app_secret);
   clientInstance = new lark.Client({
     appId: creds.app_id,
     appSecret: creds.app_secret,
     appType: lark.AppType.SelfBuild,
     domain: lark.Domain.Feishu,  // Chinese version (feishu.cn)
-    logger: safeLogger,
+    // zylos-lab-safe-logger: never print request bodies/headers (app_secret).
+    // Since upstream 0.4.0 this is createRedactingLogger() from src/lib/redact.js:
+    // it masks the same app_secret plus token shapes and Authorization headers.
+    // The SDK's default logger prints caught AxiosErrors verbatim, including
+    // the tenant-token request body (app_secret). See src/lib/redact.js.
+    logger: createRedactingLogger(),
   });
 
   return clientInstance;
@@ -46,17 +57,31 @@ export function resetClient() {
   clientInstance = null;
 }
 
+export const BOT_INFO_TIMEOUT_MS = 10_000;
+
 /**
  * Get bot info (open_id, name, etc.)
  * Uses the /bot/v3/info endpoint
  */
 export async function getBotInfo() {
   const client = getClient();
+  // Bounded so a hung request (the SDK's axios instance has no timeout, and
+  // the tenant-token fetch it makes first takes no per-call timeout) cannot
+  // leave the caller waiting forever. `timeout` also reaches axios for the
+  // bot/info request itself.
+  let timer;
   try {
-    const res = await client.request({
-      method: 'GET',
-      url: '/open-apis/bot/v3/info',
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`bot info request timed out after ${BOT_INFO_TIMEOUT_MS}ms`)), BOT_INFO_TIMEOUT_MS);
     });
+    const res = await Promise.race([
+      client.request({
+        method: 'GET',
+        url: '/open-apis/bot/v3/info',
+        timeout: BOT_INFO_TIMEOUT_MS,
+      }),
+      timeout,
+    ]);
     if (res.code === 0 && res.bot) {
       return {
         success: true,
@@ -66,7 +91,9 @@ export async function getBotInfo() {
     }
     return { success: false, message: `API error: ${res.msg}` };
   } catch (err) {
-    return { success: false, message: err.message };
+    return { success: false, message: explainBotInfoError(err.message) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

@@ -22,8 +22,12 @@ import { getConfig, DATA_DIR } from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { sendCard } from '../src/lib/card-send.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
+import { installConsoleRedaction, registerSecrets } from '../src/lib/redact.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
 import { shouldUseCard } from '../src/lib/card-decision.js';
+
+// Same log redaction as the service (src/lib/redact.js).
+installConsoleRedaction();
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -390,6 +394,7 @@ async function recordOutgoing(text) {
       internalSecret = fs.readFileSync(path.join(DATA_DIR, '.internal-token'), 'utf8').trim();
     } catch {}
   }
+  registerSecrets(internalSecret);
   if (!internalSecret) {
     console.warn('[feishu] Warning: FEISHU_INTERNAL_SECRET not set — record-outgoing will be rejected (403)');
     return;
