@@ -7,6 +7,11 @@
  */
 
 import { loadConfig, saveConfig } from './lib/config.js';
+import { redact } from './lib/redact.js';
+
+// `show` prints the whole config: mask secret fields (bot.encrypt_key,
+// bot.verification_token, ...) but keep everything else complete.
+const SHOW_LIMITS = { maxDepth: Infinity, maxItems: Infinity, maxNodes: Infinity };
 
 // ============================================================
 // Helper: get the groups map (new format) or derive from legacy
@@ -28,7 +33,7 @@ function saveConfigOrExit(config) {
 const commands = {
   'show': () => {
     const config = loadConfig();
-    console.log(JSON.stringify(config, null, 2));
+    console.log(JSON.stringify(redact(config, SHOW_LIMITS), null, 2));
   },
 
   'list-groups': () => {

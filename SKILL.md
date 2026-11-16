@@ -222,7 +222,7 @@ Manage bot configuration via `admin.js`:
 ADM="node ~/zylos/.claude/skills/feishu/src/admin.js"
 
 # General
-$ADM show                                    # Show full config
+$ADM show                                    # Show full config (encrypt_key / verification_token masked)
 $ADM show-owner                              # Show current owner
 $ADM help                                    # Show all commands
 

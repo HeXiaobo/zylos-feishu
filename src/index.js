@@ -27,6 +27,10 @@ import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { sendToC4 as sendToC4Core, createRejectReply } from './lib/c4.js';
 import { buildEndpoint } from './lib/endpoint.js';
 import { selectContextWindow, isBehindCursor, createCursorMarker } from './lib/group-context.js';
+import { installConsoleRedaction, registerSecrets, createRedactingLogger } from './lib/redact.js';
+
+// Keep credentials out of the PM2 logs, whatever logs them (src/lib/redact.js).
+installConsoleRedaction();
 import { recordChatType } from './lib/session-group.js';
 import { getBotInfo } from './lib/client.js';
 import { createBotIdentity, isBotMentioned, botIdentityConfigUpdate } from './lib/bot-identity.js';
@@ -40,6 +44,7 @@ let isShuttingDown = false;
 let config = getConfig();
 const connectionMode = config.connection_mode || 'websocket';
 const INTERNAL_SECRET = crypto.randomUUID();
+registerSecrets(INTERNAL_SECRET, getCredentials().app_secret, config.bot?.encrypt_key, config.bot?.verification_token);
 // Persist token to file so send.js (spawned by C4 in a separate process tree) can read it
 const TOKEN_FILE = path.join(DATA_DIR, '.internal-token');
 try {
@@ -128,6 +133,7 @@ botIdentity.loadCached(config.bot);
 watchConfig((newConfig) => {
   console.log(`[feishu] Config reloaded`);
   config = newConfig;
+  registerSecrets(newConfig.bot?.encrypt_key, newConfig.bot?.verification_token);
   if (!newConfig.enabled) {
     console.log(`[feishu] Component disabled, stopping...`);
     shutdown();
@@ -1464,13 +1470,14 @@ function startWebSocket(creds) {
     appSecret: creds.app_secret,
     domain: Lark.Domain.Feishu,
     loggerLevel: Lark.LoggerLevel.info,
+    logger: createRedactingLogger(),
     autoReconnect: true
   });
 
   console.log('[feishu] Connecting to Feishu via WebSocket...');
 
   wsClient.start({
-    eventDispatcher: new Lark.EventDispatcher({}).register({
+    eventDispatcher: new Lark.EventDispatcher({ logger: createRedactingLogger() }).register({
       'im.message.receive_v1': async (data) => {
         try {
           await handleMessage(data);
