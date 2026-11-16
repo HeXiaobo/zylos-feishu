@@ -61,8 +61,18 @@ These also apply on older Cores:
   component log.
 - A rejection that Core reports as already stored (`error.persisted`
   non-empty) no longer shows an error to the user; the typing indicator is
-  cleared. (The group context cursor already moves before the message is
-  handed to Core; that is unchanged.)
+  cleared, and the group context cursor moves past the message.
+- **The group context cursor now moves only after Core confirms delivery**
+  (`markCursorDelivered`, as in zylos-lark). It used to move before the
+  message was handed to Core, so after a try-later / may-not-have-reached-me
+  notice, or a crash between the webhook ack and Core's answer, the message
+  had already been passed. The cursor is now also read again: group context is
+  the messages after the cursor (capped at `context_messages`), so an
+  undelivered message is included as context with the next handled message in
+  that group, and delivered ones are not repeated. A confirmation for an older
+  message never moves the cursor back. Context entries are sorted
+  chronologically, also when they mix Feishu's epoch-millisecond and ISO
+  timestamps (`src/lib/group-context.js`, `src/index.js`).
 - When the retry also failed without a structured result, the user got no
   reply and the typing indicator stayed; the user now gets the "may not have
   reached me" notice.

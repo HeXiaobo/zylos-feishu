@@ -485,8 +485,11 @@ Core adds the `feishu:` namespace (e.g. `feishu:dm-oc_...`).
   "may not have reached me" notice, never resent). It is retried (once, after
   2s) only when the process could not be started at all. Smart-mode messages
   without an @mention are handled the same way.
-- The group context cursor is unchanged: it still moves before the message is
-  handed to Core, whatever Core answers.
+- The group context cursor moves only after Core confirms the message (accepted,
+  or rejected after storing it). If Core answers with either notice above, or
+  the service stops before Core answers, the cursor stays put and the next
+  handled message in that group still includes the one that did not get through
+  as context.
 
 Look up the session group for an endpoint:
 
@@ -514,7 +517,11 @@ An endpoint with `|type:` (the `reply via` value, or `<chat_id>|type:p2p` /
 
 When responding to @mentions in groups, the bot includes recent message context
 so Claude understands the conversation. Context is retrieved from logged messages
-since the last response.
+since the last group message the agent received (the group cursor in
+`group-cursors.json`), capped at `context_messages`. The cursor only moves after
+Core confirms delivery, so a message that was not delivered (try-later or
+may-not-have-reached-me notice, or a restart before Core answered) is still
+included as context with the next handled message in that group.
 
 Configuration in `config.json`:
 ```json

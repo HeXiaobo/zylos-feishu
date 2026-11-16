@@ -78,7 +78,7 @@ zylos-feishu is a Zylos communication component that enables bidirectional messa
 ```
 ~/zylos/components/feishu/
 ├── config.json           # Runtime configuration
-├── group-cursors.json    # Group message cursors (tracks processed messages)
+├── group-cursors.json    # Group context cursors: last group message Core confirmed, per chat
 ├── user-cache.json       # User name cache
 ├── media/                # Media file storage (images, files, etc.)
 └── logs/                 # Log directory (managed by PM2)
@@ -136,6 +136,7 @@ zylos-feishu is a Zylos communication component that enables bidirectional messa
 | C4 | lib/c4.js | Call c4-receive, pass `--session-group` when Core supports it, handle rejections |
 | Session group | lib/session-group.js | Derive the session group from an endpoint (fixed rules); chat type cache for bare chat ids |
 | Endpoint | lib/endpoint.js | Build/parse the structured endpoint string |
+| Group context | lib/group-context.js | Group context window after the cursor; `markCursorDelivered` (cursor moves only after Core confirms) |
 | Send | scripts/send.js | C4 standard interface for sending text and media |
 | Session group query | scripts/session-group.js | Print the session group for an endpoint |
 | Admin | src/admin.js | CLI for managing config (groups, whitelist, owner) |
@@ -239,6 +240,20 @@ node send.js "oc_xxx" "[MEDIA:file]/path/to/document.pdf"
 # With image
 [Feishu DM] Howard said: [image] What is this ---- file: ~/zylos/components/feishu/media/feishu-xxx.png
 ```
+
+**Group context window** (`src/lib/group-context.js`): the context of a handled
+group message is the in-memory history of that chat in chronological order,
+without the message itself, starting after the group cursor and capped at
+`historyLimit` / `context_messages`. The cursor (`group-cursors.json`) is the id
+of the last group message Core confirmed: it is moved by `markCursorDelivered`,
+which is passed to `sendToC4` as `onSuccess` and to the reject callback as
+`onStored`, and runs at most once per message. TRY_LATER / MAYBE_LOST, a throw
+before sending, or a crash before Core answers leave the cursor where it was, so
+the next handled message still carries the undelivered one as context. A
+confirmation for a message that is older than the current cursor (two
+@mentions in one chat finishing out of order) does not move the cursor back. A
+cursor that is no longer in memory means no lower bound (last N messages).
+
 
 ---
 

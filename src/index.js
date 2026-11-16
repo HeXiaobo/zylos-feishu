@@ -26,6 +26,7 @@ import { extractInteractiveText } from './lib/card-text.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { sendToC4 as sendToC4Core, createRejectReply } from './lib/c4.js';
 import { buildEndpoint } from './lib/endpoint.js';
+import { selectContextWindow, isBehindCursor, createCursorMarker } from './lib/group-context.js';
 import { recordChatType } from './lib/session-group.js';
 import { getBotInfo } from './lib/client.js';
 import { createBotIdentity, isBotMentioned, botIdentityConfigUpdate } from './lib/bot-identity.js';
@@ -400,20 +401,17 @@ function recordHistoryEntry(historyKey, entry) {
 }
 
 /**
- * Get recent context messages from in-memory history.
- * Excludes the current message itself.
+ * Get recent context messages from in-memory history (chronological).
+ * Excludes the current message itself; with options.afterMessageId (the group
+ * cursor) only entries after it (src/lib/group-context.js).
  */
-function getInMemoryContext(historyKey, currentMessageId) {
+function getInMemoryContext(historyKey, currentMessageId, options = {}) {
   const history = chatHistories.get(historyKey);
   if (!history || history.length === 0) return [];
 
   const baseChatId = historyKey.includes(':') ? historyKey.split(':')[0] : historyKey;
   const limit = getGroupHistoryLimit(baseChatId);
-
-  // Filter out the current message and get recent entries
-  const filtered = history.filter(m => m.message_id !== currentMessageId);
-  const count = Math.min(limit, filtered.length);
-  return filtered.slice(-count);
+  return selectContextWindow(history, currentMessageId, limit, options);
 }
 
 /**
@@ -474,9 +472,9 @@ async function preloadGroupMembers(chatId) {
   }
 }
 
-async function getContextWithFallback(containerId, currentMessageId, containerType = 'chat', historyKey = containerId, historyLimit = null) {
+async function getContextWithFallback(containerId, currentMessageId, containerType = 'chat', historyKey = containerId, historyLimit = null, options = {}) {
   if (_lazyLoadedContainers.has(historyKey)) {
-    return getInMemoryContext(historyKey, currentMessageId);
+    return getInMemoryContext(historyKey, currentMessageId, options);
   }
 
   // First access after restart — try to fetch from API
@@ -516,12 +514,12 @@ async function getContextWithFallback(containerId, currentMessageId, containerTy
         }
         console.log(`[feishu] Lazy-loaded ${msgs.length} messages for ${containerType} ${historyKey}`);
       }
-      return getInMemoryContext(historyKey, currentMessageId);
+      return getInMemoryContext(historyKey, currentMessageId, options);
     }
   } catch (err) {
     console.log(`[feishu] Lazy-load failed for ${containerType} ${historyKey}: ${err.message}`);
   }
-  return getInMemoryContext(historyKey, currentMessageId);
+  return getInMemoryContext(historyKey, currentMessageId, options);
 }
 
 // Resolve user_id (or open_id fallback) to name (with TTL-based in-memory cache)
@@ -620,12 +618,22 @@ async function logMessage(chatType, chatId, userId, openId, text, messageId, tim
   console.log(`[feishu] Logged: [${userName}] ${(resolvedText || '').substring(0, 30)}...`);
 }
 
-// Get group context messages (with API fallback after restart)
+// Get group context messages (with API fallback after restart): only what
+// came after the last group message Core confirmed (the cursor).
 async function getGroupContext(chatId, currentMessageId) {
-  return getContextWithFallback(chatId, currentMessageId, 'chat');
+  return getContextWithFallback(chatId, currentMessageId, 'chat', chatId, null, {
+    afterMessageId: groupCursors[chatId] || null
+  });
 }
 
+// Move the group cursor to a message Core confirmed. Called only through
+// markCursorDelivered (after delivery), never before sending.
 function updateCursor(chatId, messageId) {
+  if (isBehindCursor(chatHistories.get(chatId), groupCursors[chatId], messageId)) {
+    // An older @mention confirmed after a newer one: keep the newer cursor.
+    console.log(`[feishu] Cursor for ${chatId} already past ${messageId}, not moving it back`);
+    return;
+  }
   groupCursors[chatId] = messageId;
   if (!saveCursors(groupCursors)) {
     console.log(`[feishu] Failed to persist cursor for ${chatId}`);
@@ -747,8 +755,8 @@ function resolveMentions(text, mentions, { stripBot = false, botOpenId: botId } 
  * Send a message to the agent via C4 (src/lib/c4.js). c4-receive gets
  * FEISHU_INTERNAL_SECRET in its environment, as before.
  */
-function sendToC4(source, endpoint, content, onReject) {
-  sendToC4Core(source, endpoint, content, onReject, null,
+function sendToC4(source, endpoint, content, onReject, onSuccess = null) {
+  sendToC4Core(source, endpoint, content, onReject, onSuccess,
     { env: { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET } });
 }
 
@@ -1351,7 +1359,11 @@ async function handleMessage(data) {
     console.log(`[feishu] ${smart ? 'Smart group' : 'Bot @mentioned in'} group ${chatId}`);
     await preloadGroupMembers(chatId);
     const contextMessages = await getGroupContext(chatId, messageId);
-    updateCursor(chatId, messageId);
+    // The cursor moves only once Core confirms delivery (sent, or stored then
+    // rejected). TRY_LATER / MAYBE_LOST, a throw below, or a crash before Core
+    // answers leave it where it was, so the next @mention still carries this
+    // message as context.
+    const markCursorDelivered = createCursorMarker(() => updateCursor(chatId, messageId));
 
     // Smart mode without @mention may skip reply entirely ([SKIP]), so do not show typing.
     if (!smartNoMention) {
@@ -1375,9 +1387,9 @@ async function handleMessage(data) {
     const cleanText = resolveMentions(text, mentions);
     const cleanLogText = resolveMentions(logText, mentions);
     const threadRootId = threadId ? rootId : null;
-    // No onStored: the group context cursor already moved before sending (updateCursor above).
     const groupRejectReply = createRejectReply({
       removeTyping: () => removeTypingIndicator(messageId),
+      onStored: markCursorDelivered,
       deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
         .catch(e => console.error('[feishu] reject reply failed:', e.message))
     });
@@ -1386,7 +1398,7 @@ async function handleMessage(data) {
     if (imageKeys.length > 0) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || '[image]', contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
         return;
       }
 
@@ -1402,7 +1414,7 @@ async function handleMessage(data) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('group', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, contextMessages, mediaPaths[0], { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
       } else {
         removeTypingIndicator(messageId);
         sendThreadAwareMessage(chatId, 'Image download failed. Please resend the image.', { chatType, rootId, parentId, messageId })
@@ -1414,7 +1426,7 @@ async function handleMessage(data) {
     if (fileKey) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || `[file: ${fileName}]`, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
         return;
       }
 
@@ -1428,7 +1440,7 @@ async function handleMessage(data) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('group', senderName, `[file: ${fileName}]${cleanText ? ' ' + cleanText : ''}`, contextMessages, localPath, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
       } else {
         removeTypingIndicator(messageId);
         sendThreadAwareMessage(chatId, 'File download failed. Please resend the file.', { chatType, rootId, parentId, messageId })
@@ -1438,7 +1450,7 @@ async function handleMessage(data) {
     }
 
     const msg = formatMessage('group', senderName, cleanText || text, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: smartNoMention });
-    sendToC4('feishu', endpoint, msg, groupRejectReply);
+    sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
   }
 }
 
