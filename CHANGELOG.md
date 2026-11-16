@@ -77,6 +77,175 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This supersedes the 0.3.5 note that forward resources were not downloadable
   at all: that conclusion came from a measurement that used the wrong id.
 
+### Changed
+- **Merged upstream `zylos-ai/zylos-feishu` `3018e4b4` (13 commits, v0.4.0).**
+  Upstream features are taken as-is: session groups for multi-session Core
+  (`src/lib/session-group.js`, `src/lib/c4.js`, `src/lib/endpoint.js`), the
+  delivery-gated group context cursor (`src/lib/group-context.js`), the bot
+  identity retry with cached `config.bot.open_id` (`src/lib/bot-identity.js`,
+  `src/lib/client.js`) and log redaction (`src/lib/redact.js`). The fork's own
+  patches are kept: one dedupe claim shared with the `feishu-recovery` poller,
+  `@_all` is not a mention of this bot, the forward resource-id rule, and the
+  independent install of the Feishu business tools.
+  Two conflicts needed a hand decision inside upstream's own change:
+  - **`isBotMentioned`.** Upstream 0.4.0 moved the function into
+    `src/lib/bot-identity.js`, and that copy counts `@_all` as a mention of the
+    bot. `src/index.js` keeps the lab's `src/lib/feishu-group-policy.js` as its
+    single call site, so a group message that only @-alls still never reaches
+    Core. `bot-identity.js` is otherwise used whole (cached identity, startup
+    fetch, one-shot refetch), and `index.js` now reads the identity from
+    `botIdentity` instead of the removed `botOpenId`/`botAppId`/`botAppName`
+    globals.
+  - **SDK logger.** `src/index.js` and `src/lib/client.js` now pass upstream's
+    `createRedactingLogger()` instead of `safeLogger`. `redact.js` masks the
+    same values plus Feishu token shapes and `Authorization` headers, and
+    `installConsoleRedaction()` covers the service's own output. The canonical
+    `src/lib/safe-logger.js` is still shipped byte-identical to zylos-core's
+    `cli/lib/runtime/feishu-safe-logger.js`.
+  `src/lib/safe-logger.js` therefore has no importer left; see the deployment
+  risk in the 3018e4b4 merge report before upgrading the image.
+
+## [0.4.0] - 2026-11-16
+
+### Added
+- **Session groups for multi-session zylos-core.** Each inbound message is
+  passed to `c4-receive` with `--session-group`, derived only from its
+  endpoint: `dm-<chat_id>` for private chats (threads not split),
+  `group-<chat_id>` for groups (quote/reply chains included), and
+  `group-<chat_id>:topic-<thread_id>` for group messages with a `thread_id`
+  (ordinary groups and topic groups alike). Core adds the `feishu:` namespace.
+  The rules are fixed: group names are Core's memory keys. Ids are used
+  verbatim; on a multi-session Core an endpoint that cannot be mapped is not
+  sent and the user is asked to try again later (never the overall group).
+  The option is passed only when the installed Core lists it in
+  `c4-receive-options.json` (re-read on every message); on older Cores no
+  session group is derived at all, so they receive exactly the same arguments
+  as before and no endpoint is rejected for lacking a group. WebSocket and
+  webhook mode share the same path (`src/lib/session-group.js`,
+  `src/lib/c4.js`, `src/lib/endpoint.js`). Same rules as zylos-lark 0.4.0.
+- `scripts/session-group.js <endpoint>` prints the session group for an
+  endpoint (exit 0), or exits 1 with empty stdout for bad input. A bare
+  `<chat_id>` without `|type:` (as used for proactive sends) maps to
+  `dm-<chat_id>` or `group-<chat_id>` (never a topic). The type comes from a
+  local cache (`~/zylos/components/feishu/chat-type-cache.json`, written for
+  every inbound message and after each successful lookup; a missing or
+  corrupt file counts as empty), or on a cache miss from Feishu `im.chat.get`
+  (`chat_mode` `p2p` -> DM, `group`/`topic` -> group) with a 4s timeout, under
+  Core's 6.5s limit for this query. If the lookup fails the script logs to
+  stderr and exits 1 with empty stdout; DM vs group is never guessed
+  (`src/lib/session-group.js`, `src/index.js`, `src/lib/chat.js`).
+- SKILL.md proactive-send examples use `<chat_id>|type:p2p` /
+  `<chat_id>|type:group`. Older Cores accept them, and `scripts/send.js` sends
+  them as plain messages to the chat, exactly as a bare `<chat_id>`.
+
+### Changed
+These also apply on older Cores:
+- A `c4-receive` that exceeds the 35s timeout is killed and treated as an
+  unknown outcome: the user is told the message may not have arrived and it
+  is not resent (previously it was retried, which could duplicate a message
+  Core had already stored).
+- Only a `c4-receive` that could not be started is retried (once, after 2s).
+  Any other failure without a structured result is not resent; the user is
+  told the message may not have arrived.
+- Rejection notices are two fixed English sentences: "Sorry, I couldn't take
+  this message right now. Please try again later." (not stored) and "Sorry,
+  this message may not have reached me. If you don't get a reply in a few
+  minutes, please send it again." (outcome unknown). They are still delivered
+  with the chat-type-aware sender (plain message in a DM, reply in a group).
+- `c4-receive` is resolved from `$ZYLOS_DIR` (default `$HOME/zylos`) and run
+  with the current Node binary (`process.execPath`) instead of `node` from
+  `PATH`. It still receives `FEISHU_INTERNAL_SECRET` in its environment.
+
+### Fixed
+- Core's raw error text is no longer sent to Feishu users; it only goes to the
+  component log.
+- A rejection that Core reports as already stored (`error.persisted`
+  non-empty) no longer shows an error to the user; the typing indicator is
+  cleared, and the group context cursor moves past the message.
+- **The group context cursor now moves only after Core confirms delivery**
+  (`markCursorDelivered`, as in zylos-lark). It used to move before the
+  message was handed to Core, so after a try-later / may-not-have-reached-me
+  notice, or a crash between the webhook ack and Core's answer, the message
+  had already been passed. The cursor is now also read again: group context is
+  the messages after the cursor (capped at `context_messages`), so an
+  undelivered message is included as context with the next handled message in
+  that group, and delivered ones are not repeated. A confirmation for an older
+  message never moves the cursor back. Context entries are sorted
+  chronologically, also when they mix Feishu's epoch-millisecond and ISO
+  timestamps (`src/lib/group-context.js`, `src/index.js`).
+- When the retry also failed without a structured result, the user got no
+  reply and the typing indicator stayed; the user now gets the "may not have
+  reached me" notice.
+- **Secrets no longer reach the service logs** (port of zylos-lark #115).
+  When the tenant-access-token request failed (e.g. `ECONNREFUSED`), the
+  SDK's default logger printed the whole AxiosError to `out.log`, including
+  `config.data` with the plaintext `app_secret`. Every SDK client (the API
+  `Client` in `src/lib/client.js`, and the `WSClient` and `EventDispatcher` of
+  WebSocket mode) now gets a redacting logger with the same `[error]:` /
+  `[info]:` format, and the service and `scripts/send.js` wrap `console` with
+  the same redaction (`src/lib/redact.js`). Log arguments are formatted into
+  one line first and then redacted, so `console.log('token=%s', v)` and
+  `('[x] token:', v)` are masked too. Axios errors are logged as name,
+  message, code, method, url, status, cause and redacted response data (no
+  raw config/request/headers); AggregateError `errors` and URL objects are
+  kept (redacted). Values of secret keys (`app_secret`, access/refresh
+  tokens, `Authorization` with any scheme, `encrypt_key`,
+  `verification_token`, `ticket`, `secret_key`, `api_key`, `private_key`,
+  `x-internal-token`, ...) are masked in nested objects, JSON strings, query
+  strings (also percent-encoded) and `Bearer` headers, as are standalone
+  tokens in either Feishu shape (legacy `t-`/`u-`/`a-`/`ur-` plus at least 30
+  characters including a digit, not inside paths; and JWS-shaped `eyJ…`
+  header.payload.signature values such as OAuth v2 user and refresh tokens)
+  and the configured secret values themselves (`FEISHU_APP_SECRET`,
+  `bot.encrypt_key`, `bot.verification_token`, also after a config reload,
+  and the internal record-outgoing secret). The bare `token` key stays masked
+  (it carries the verification token in webhook v1 event callbacks). Webhook
+  mode never logs raw request bodies, headers or tokens. Log copies are
+  bounded (first 100 items per array/object with a "… N more" marker, depth
+  6, 5000 values in all) and shared references are copied once, so large
+  payloads no longer slow logging down. Copies keep class names, symbol keys
+  and the `[cause]` / `[errors]` presentation; DESIGN.md lists the remaining
+  differences from plain `util.format` output. `admin.js show` masks the
+  same secret fields (`bot.encrypt_key`, `bot.verification_token`) and prints
+  the rest of the config unchanged.
+
+## [0.3.7] - 2026-11-16
+
+### Fixed
+- **Group @mentions no longer stay silently ignored when the startup bot
+  identity fetch fails (#49).** Previously the bot info (`/bot/v3/info`) was
+  fetched once at startup; if it failed (e.g. the service started before the
+  network), the bot's `open_id` stayed empty and every group @mention was
+  treated as "not mentioned" until a manual restart. Now:
+  - the bot identity cached in `config.json` (`bot.open_id`) is used
+    immediately at startup when `bot.app_id` matches `FEISHU_APP_ID` (a cache
+    without `bot.app_id` is also used); a successful fetch writes back
+    `bot.open_id` + `bot.app_id`, and a fetched value replaces a different
+    cached one;
+  - if the startup fetch fails and there is no usable cached identity, the
+    first received message triggers exactly one more `getBotInfo` call,
+    awaited (up to 5s) before the mention check, so that message is not
+    missed. Concurrent messages share the request; it is never repeated,
+    whatever the result (at most 2 `getBotInfo` calls per process, no timed
+    retries);
+  - the transport only starts after the startup fetch has finished, so in
+    feishu no message can arrive while it is in flight. A message therefore
+    waits at most one 5s window (the one-shot refetch). `getBotInfo` itself
+    is now bounded (10s timeout);
+  - all identity readers share one object, so a recovery applies without a
+    restart (`src/lib/bot-identity.js`). The startup fetch now uses
+    `getBotInfo` from `src/lib/client.js` instead of an inline client.
+  - Same defect and same fix as zylos-lark 0.4.2 (lark #102).
+
+### Added
+- While the bot identity is unknown, an error is logged every 10 minutes
+  (log only, no requests). In webhook mode `/health` reports
+  `botIdentity: { status: cached | fetched | unknown, since, attempts, refetchUsed }`
+  (websocket mode has no HTTP server; use the logs).
+- The SDK's `Cannot destructure property 'tenant_access_token'` error now
+  carries a hint (tenant token fetch failed: network unreachable or bad app
+  credentials).
+
 ## [0.3.6] - 2026-08-10
 
 ### Fixed

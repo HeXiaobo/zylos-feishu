@@ -10,16 +10,22 @@
 import dotenv from 'dotenv';
 import express from 'express';
 import crypto from 'crypto';
-import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import * as Lark from '@larksuiteoapi/node-sdk';
 // zylos-lab-safe-logger: never print request bodies/headers (app_secret).
-import { safeLogger } from './lib/safe-logger.js';
+// Kept as the canonical lab logger module; since upstream 0.4.0 the SDK clients
+// below use src/lib/redact.js's createRedactingLogger(), which redacts the same
+// values and more (token shapes, Authorization headers), so safeLogger is no
+// longer wired into a client. The file stays byte-identical to zylos-core's
+// cli/lib/runtime/feishu-safe-logger.js so lab.mjs can still verify it.
 
 // Load .env from ~/zylos/.env (absolute path, not cwd-dependent)
 dotenv.config({ path: path.join(process.env.HOME, 'zylos/.env') });
 // zylos-lab-mention-patch: @everyone is not a mention of this bot.
+// Upstream 0.4.0 also exports an isBotMentioned() from ./lib/bot-identity.js,
+// but that one counts `@_all` as a mention of the bot; the lab patch keeps the
+// stricter policy module as the single call site (see feishu-group-policy.js).
 import { isBotMentioned } from './lib/feishu-group-policy.js';
 
 import { getConfig, watchConfig, saveConfig, DATA_DIR, getCredentials, stopWatching } from './lib/config.js';
@@ -38,14 +44,16 @@ import { extractPostText, resolveMentions } from './lib/message-text.js';
 // merge-forward resource-id rule is unit-testable (see the module's docblock).
 import { parseMessageItemText } from './lib/message-item-text.js';
 import { isDmAllowed as isDmAllowedByConfig, isOwner as isOwnerByConfig } from './lib/dm-policy.js';
+import { sendToC4 as sendToC4Core, createRejectReply } from './lib/c4.js';
+import { buildEndpoint } from './lib/endpoint.js';
+import { selectContextWindow, isBehindCursor, createCursorMarker } from './lib/group-context.js';
+import { installConsoleRedaction, registerSecrets, createRedactingLogger } from './lib/redact.js';
 
-// C4 receive interface path
-const C4_RECEIVE = path.join(process.env.HOME, 'zylos/.claude/skills/comm-bridge/scripts/c4-receive.js');
-
-// Bot identity (fetched at startup)
-let botOpenId = '';
-let botAppId = '';
-let botAppName = '';
+// Keep credentials out of the PM2 logs, whatever logs them (src/lib/redact.js).
+installConsoleRedaction();
+import { recordChatType } from './lib/session-group.js';
+import { getBotInfo } from './lib/client.js';
+import { createBotIdentity, botIdentityConfigUpdate } from './lib/bot-identity.js';
 
 // WSClient instance for graceful shutdown (websocket mode only)
 let wsClient = null;
@@ -56,6 +64,7 @@ let isShuttingDown = false;
 let config = getConfig();
 const connectionMode = config.connection_mode || 'websocket';
 const INTERNAL_SECRET = crypto.randomUUID();
+registerSecrets(INTERNAL_SECRET, getCredentials().app_secret, config.bot?.encrypt_key, config.bot?.verification_token);
 // Persist token to file so send.js (spawned by C4 in a separate process tree) can read it
 const TOKEN_FILE = path.join(DATA_DIR, '.internal-token');
 try {
@@ -143,10 +152,30 @@ if (connectionMode === 'webhook' && !config.bot?.verification_token) {
   process.exit(1);
 }
 
+// Bot identity: one object read by every consumer so a later recovery takes
+// effect without a restart (see src/lib/bot-identity.js).
+let currentAppId = '';
+try {
+  currentAppId = getCredentials().app_id || '';
+} catch {}
+const botIdentity = createBotIdentity({
+  fetchBotInfo: getBotInfo,
+  appId: currentAppId,
+  // Persist open_id + app_id so the next start has the identity without an
+  // API call. Skipped when already current.
+  persist: (identity) => {
+    const next = botIdentityConfigUpdate(config, identity);
+    if (!next) return;
+    if (saveConfig(next)) config = next;
+  },
+});
+botIdentity.loadCached(config.bot);
+
 // Watch for config changes
 watchConfig((newConfig) => {
   console.log(`[feishu] Config reloaded`);
   config = newConfig;
+  registerSecrets(newConfig.bot?.encrypt_key, newConfig.bot?.verification_token);
   if (!newConfig.enabled) {
     console.log(`[feishu] Component disabled, stopping...`);
     shutdown();
@@ -420,20 +449,17 @@ function recordHistoryEntry(historyKey, entry) {
 }
 
 /**
- * Get recent context messages from in-memory history.
- * Excludes the current message itself.
+ * Get recent context messages from in-memory history (chronological).
+ * Excludes the current message itself; with options.afterMessageId (the group
+ * cursor) only entries after it (src/lib/group-context.js).
  */
-function getInMemoryContext(historyKey, currentMessageId) {
+function getInMemoryContext(historyKey, currentMessageId, options = {}) {
   const history = chatHistories.get(historyKey);
   if (!history || history.length === 0) return [];
 
   const baseChatId = historyKey.includes(':') ? historyKey.split(':')[0] : historyKey;
   const limit = getGroupHistoryLimit(baseChatId);
-
-  // Filter out the current message and get recent entries
-  const filtered = history.filter(m => m.message_id !== currentMessageId);
-  const count = Math.min(limit, filtered.length);
-  return filtered.slice(-count);
+  return selectContextWindow(history, currentMessageId, limit, options);
 }
 
 /**
@@ -494,9 +520,9 @@ async function preloadGroupMembers(chatId) {
   }
 }
 
-async function getContextWithFallback(containerId, currentMessageId, containerType = 'chat', historyKey = containerId, historyLimit = null) {
+async function getContextWithFallback(containerId, currentMessageId, containerType = 'chat', historyKey = containerId, historyLimit = null, options = {}) {
   if (_lazyLoadedContainers.has(historyKey)) {
-    return getInMemoryContext(historyKey, currentMessageId);
+    return getInMemoryContext(historyKey, currentMessageId, options);
   }
 
   // First access after restart — try to fetch from API
@@ -536,12 +562,12 @@ async function getContextWithFallback(containerId, currentMessageId, containerTy
         }
         console.log(`[feishu] Lazy-loaded ${msgs.length} messages for ${containerType} ${historyKey}`);
       }
-      return getInMemoryContext(historyKey, currentMessageId);
+      return getInMemoryContext(historyKey, currentMessageId, options);
     }
   } catch (err) {
     console.log(`[feishu] Lazy-load failed for ${containerType} ${historyKey}: ${err.message}`);
   }
-  return getInMemoryContext(historyKey, currentMessageId);
+  return getInMemoryContext(historyKey, currentMessageId, options);
 }
 
 // Resolve user_id (or open_id fallback) to name (with TTL-based in-memory cache)
@@ -550,6 +576,7 @@ async function resolveUserName(userId, openId) {
   if (!id) return 'unknown';
 
   // Recognize bot's own messages (exact open_id or app_id match)
+  const { openId: botOpenId, appId: botAppId, appName: botAppName } = botIdentity;
   if (botOpenId && id === botOpenId) return botAppName || 'bot';
   if (botAppId && id === botAppId) return botAppName || 'bot';
 
@@ -639,12 +666,22 @@ async function logMessage(chatType, chatId, userId, openId, text, messageId, tim
   console.log(`[feishu] Logged: [${userName}] ${(resolvedText || '').substring(0, 30)}...`);
 }
 
-// Get group context messages (with API fallback after restart)
+// Get group context messages (with API fallback after restart): only what
+// came after the last group message Core confirmed (the cursor).
 async function getGroupContext(chatId, currentMessageId) {
-  return getContextWithFallback(chatId, currentMessageId, 'chat');
+  return getContextWithFallback(chatId, currentMessageId, 'chat', chatId, null, {
+    afterMessageId: groupCursors[chatId] || null
+  });
 }
 
+// Move the group cursor to a message Core confirmed. Called only through
+// markCursorDelivered (after delivery), never before sending.
 function updateCursor(chatId, messageId) {
+  if (isBehindCursor(chatHistories.get(chatId), groupCursors[chatId], messageId)) {
+    // An older @mention confirmed after a newer one: keep the newer cursor.
+    console.log(`[feishu] Cursor for ${chatId} already past ${messageId}, not moving it back`);
+    return;
+  }
   groupCursors[chatId] = messageId;
   if (!saveCursors(groupCursors)) {
     console.log(`[feishu] Failed to persist cursor for ${chatId}`);
@@ -742,87 +779,12 @@ function getGroupName(chatId) {
 }
 
 /**
- * Parse c4-receive JSON response from stdout.
+ * Send a message to the agent via C4 (src/lib/c4.js). c4-receive gets
+ * FEISHU_INTERNAL_SECRET in its environment, as before.
  */
-function parseC4Response(stdout) {
-  if (!stdout) return null;
-  try {
-    return JSON.parse(stdout.trim());
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Send message to Claude via C4 (with 1 retry on unexpected failure)
- */
-function sendToC4(source, endpoint, content, onReject) {
-  if (!content) {
-    console.error('[feishu] sendToC4 called with empty content');
-    return;
-  }
-  const childEnv = { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET };
-  const args = [
-    C4_RECEIVE,
-    '--channel', source,
-    '--endpoint', endpoint,
-    '--json',
-    '--content', content
-  ];
-
-  execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
-    if (!error) {
-      console.log(`[feishu] Sent to C4: ${content.substring(0, 50)}...`);
-      return;
-    }
-    const response = parseC4Response(error.stdout || stdout);
-    if (response && response.ok === false && response.error?.message) {
-      console.warn(`[feishu] C4 rejected (${response.error.code}): ${response.error.message}`);
-      if (onReject) onReject(response.error.message);
-      return;
-    }
-    console.warn(`[feishu] C4 send failed, retrying in 2s: ${error.message}`);
-    setTimeout(() => {
-      execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (retryError, retryStdout) => {
-        if (!retryError) {
-          console.log(`[feishu] Sent to C4 (retry): ${content.substring(0, 50)}...`);
-          return;
-        }
-        const retryResponse = parseC4Response(retryError.stdout || retryStdout);
-        if (retryResponse && retryResponse.ok === false && retryResponse.error?.message) {
-          console.error(`[feishu] C4 rejected after retry (${retryResponse.error.code}): ${retryResponse.error.message}`);
-          if (onReject) onReject(retryResponse.error.message);
-        } else {
-          console.error(`[feishu] C4 send failed after retry: ${retryError.message}`);
-        }
-      });
-    }, 2000);
-  });
-}
-
-/**
- * Build structured endpoint string for C4.
- * Format: chatId|type:group|root:rootId|parent:parentId|msg:messageId
- * C4 treats endpoint as opaque string; send.js parses it.
- */
-function buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId } = {}) {
-  let endpoint = chatId;
-  if (chatType) {
-    endpoint += `|type:${chatType}`;
-  }
-  if (rootId) {
-    endpoint += `|root:${rootId}`;
-  }
-  if (parentId) {
-    endpoint += `|parent:${parentId}`;
-  }
-  if (messageId) {
-    endpoint += `|msg:${messageId}`;
-  }
-  if (threadId) {
-    endpoint += `|thread:${threadId}`;
-  }
-  return endpoint;
+function sendToC4(source, endpoint, content, onReject, onSuccess = null) {
+  sendToC4Core(source, endpoint, content, onReject, onSuccess,
+    { env: { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET } });
 }
 
 // Params shared by every `im.message.get` call.
@@ -1106,8 +1068,8 @@ async function handleMessage(data) {
 
   const senderId = sender.sender_id?.open_id || sender.sender_id?.app_id || sender.sender_id?.user_id || '';
   if (senderId && (
-    String(senderId) === String(botAppId || '') ||
-    String(senderId) === String(botOpenId || '') ||
+    String(senderId) === String(botIdentity.appId || '') ||
+    String(senderId) === String(botIdentity.openId || '') ||
     String(senderId) === String(config.app_id || '') ||
     String(senderId) === String(config.bot_open_id || '')
   )) return;
@@ -1127,6 +1089,11 @@ async function handleMessage(data) {
 
   // Unified dedup check (both websocket and webhook modes)
   if (isDuplicate(messageId)) return;
+
+  // If the startup getBotInfo failed and no cached identity exists, the first
+  // received message triggers one bounded refetch before any mention check.
+  // This is the only place a message waits for the bot identity.
+  await botIdentity.ensureForMessage();
 
   const extracted = extractMessageContent(message);
   let { text } = extracted;
@@ -1149,6 +1116,9 @@ async function handleMessage(data) {
 
   // Build structured endpoint with routing metadata
   const endpoint = buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId });
+  // Remember DM vs group so a bare chat id (proactive send) maps to its
+  // session group without an API call (scripts/session-group.js).
+  recordChatType(chatId, chatType);
 
   // quotedContent is fetched lazily after routing eligibility checks
   let quotedContent = null;
@@ -1194,11 +1164,11 @@ async function handleMessage(data) {
     const senderName = await resolveUserName(senderUserId, senderOpenId);
     const cleanText = resolveMentions(text, mentions);
     const threadRootId = threadId ? rootId : null;
-    const rejectReply = (errMsg) => {
-      removeTypingIndicator(messageId);
-      sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
-        .catch(e => console.error('[feishu] reject reply failed:', e.message));
-    };
+    const rejectReply = createRejectReply({
+      removeTyping: () => removeTypingIndicator(messageId),
+      deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
+        .catch(e => console.error('[feishu] reject reply failed:', e.message))
+    });
 
     // Handle images (lazy download: only when message is being sent to C4)
     if (imageKeys.length > 0) {
@@ -1248,7 +1218,7 @@ async function handleMessage(data) {
 
   // Group chat handling
   if (chatType === 'group') {
-    const mentioned = isBotMentioned(mentions, botOpenId);
+    const mentioned = isBotMentioned(mentions, botIdentity.openId);
     const senderIsOwner = isOwner(senderUserId, senderOpenId);
     const groupPolicy = config.groupPolicy || 'allowlist';
     if (groupPolicy === 'disabled') {
@@ -1303,7 +1273,11 @@ async function handleMessage(data) {
     console.log(`[feishu] ${smart ? 'Smart group' : 'Bot @mentioned in'} group ${chatId}`);
     await preloadGroupMembers(chatId);
     const contextMessages = await getGroupContext(chatId, messageId);
-    updateCursor(chatId, messageId);
+    // The cursor moves only once Core confirms delivery (sent, or stored then
+    // rejected). TRY_LATER / MAYBE_LOST, a throw below, or a crash before Core
+    // answers leave it where it was, so the next @mention still carries this
+    // message as context.
+    const markCursorDelivered = createCursorMarker(() => updateCursor(chatId, messageId));
 
     // Smart mode without @mention may skip reply entirely ([SKIP]), so do not show typing.
     if (!smartNoMention) {
@@ -1327,17 +1301,18 @@ async function handleMessage(data) {
     const cleanText = resolveMentions(text, mentions);
     const cleanLogText = resolveMentions(logText, mentions);
     const threadRootId = threadId ? rootId : null;
-    const groupRejectReply = (errMsg) => {
-      removeTypingIndicator(messageId);
-      sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
-        .catch(e => console.error('[feishu] reject reply failed:', e.message));
-    };
+    const groupRejectReply = createRejectReply({
+      removeTyping: () => removeTypingIndicator(messageId),
+      onStored: markCursorDelivered,
+      deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
+        .catch(e => console.error('[feishu] reject reply failed:', e.message))
+    });
 
     // Handle images (lazy download: only for messages being sent to C4)
     if (imageKeys.length > 0) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || '[image]', contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
         return;
       }
 
@@ -1353,7 +1328,7 @@ async function handleMessage(data) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('group', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, contextMessages, mediaPaths[0], { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
       } else {
         removeTypingIndicator(messageId);
         sendThreadAwareMessage(chatId, 'Image download failed. Please resend the image.', { chatType, rootId, parentId, messageId })
@@ -1365,7 +1340,7 @@ async function handleMessage(data) {
     if (fileKey) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || `[file: ${fileName}]`, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
         return;
       }
 
@@ -1379,7 +1354,7 @@ async function handleMessage(data) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('group', senderName, `[file: ${fileName}]${cleanText ? ' ' + cleanText : ''}`, contextMessages, localPath, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
       } else {
         removeTypingIndicator(messageId);
         sendThreadAwareMessage(chatId, 'File download failed. Please resend the file.', { chatType, rootId, parentId, messageId })
@@ -1389,7 +1364,7 @@ async function handleMessage(data) {
     }
 
     const msg = formatMessage('group', senderName, cleanText || text, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: smartNoMention });
-    sendToC4('feishu', endpoint, msg, groupRejectReply);
+    sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
   }
 }
 
@@ -1403,14 +1378,14 @@ function startWebSocket(creds) {
     appSecret: creds.app_secret,
     domain: Lark.Domain.Feishu,
     loggerLevel: Lark.LoggerLevel.info,
-    logger: safeLogger,
+    logger: createRedactingLogger(),
     autoReconnect: true
   });
 
   console.log('[feishu] Connecting to Feishu via WebSocket...');
 
   wsClient.start({
-    eventDispatcher: new Lark.EventDispatcher({}).register({
+    eventDispatcher: new Lark.EventDispatcher({ logger: createRedactingLogger() }).register({
       'im.message.receive_v1': async (data) => {
         try {
           await handleMessage(data);
@@ -1497,7 +1472,8 @@ function startWebhook(creds) {
       status: 'ok',
       service: 'zylos-feishu',
       mode: 'webhook',
-      cursors: Object.keys(groupCursors).length
+      cursors: Object.keys(groupCursors).length,
+      botIdentity: botIdentity.status()
     });
   });
 
@@ -1513,8 +1489,8 @@ function startWebhook(creds) {
     const entry = {
       timestamp: new Date().toISOString(),
       message_id: messageId || `bot_${Date.now()}`,
-      user_id: botOpenId || 'bot',
-      user_name: botAppName || 'bot',
+      user_id: botIdentity.openId || 'bot',
+      user_name: botIdentity.appName || 'bot',
       text
     };
     // Thread messages go to thread only (context isolation)
@@ -1566,6 +1542,7 @@ function shutdown() {
   clearInterval(dedupCleanupInterval);
   clearInterval(typingCheckInterval);
   clearInterval(userCachePersistInterval);
+  botIdentity.stop();
 
   stopWatching();
   persistUserCache();
@@ -1604,37 +1581,7 @@ if (!creds.app_id || !creds.app_secret) {
 
 // Fetch bot identity, then start the selected transport
 (async () => {
-  try {
-    const client = new Lark.Client({
-      appId: creds.app_id,
-      appSecret: creds.app_secret,
-      appType: Lark.AppType.SelfBuild,
-      domain: Lark.Domain.Feishu,
-      logger: safeLogger
-    });
-
-    const res = await client.request({
-      method: 'GET',
-      url: '/open-apis/bot/v3/info',
-    });
-
-    if (res.code === 0 && res.bot) {
-      botOpenId = res.bot.open_id;
-      botAppName = res.bot.app_name || 'bot';
-      console.log(`[feishu] Bot identity: ${botAppName} (${botOpenId})`);
-    } else {
-      console.error(`[feishu] Warning: Could not fetch bot info: ${res.msg}`);
-    }
-  } catch (err) {
-    // Never echo an Axios error object: it can contain the auth request body.
-    safeLogger.error('[feishu] getBotInfo failed', err);
-  }
-
-  // Store app_id for exact bot message matching
-  try {
-    const creds2 = getCredentials();
-    botAppId = creds2.app_id || '';
-  } catch {}
+  await botIdentity.fetchAtStartup();
 
   // Start selected transport
   if (connectionMode === 'webhook') {
