@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-11-16
+
+### Fixed
+- **Group @mentions no longer stay silently ignored when the startup bot
+  identity fetch fails (#49).** Previously the bot info (`/bot/v3/info`) was
+  fetched once at startup; if it failed (e.g. the service started before the
+  network), the bot's `open_id` stayed empty and every group @mention was
+  treated as "not mentioned" until a manual restart. Now:
+  - the bot identity cached in `config.json` (`bot.open_id`) is used
+    immediately at startup when `bot.app_id` matches `FEISHU_APP_ID` (a cache
+    without `bot.app_id` is also used); a successful fetch writes back
+    `bot.open_id` + `bot.app_id`, and a fetched value replaces a different
+    cached one;
+  - if the startup fetch fails and there is no usable cached identity, the
+    first received message triggers exactly one more `getBotInfo` call,
+    awaited (up to 5s) before the mention check, so that message is not
+    missed. Concurrent messages share the request; it is never repeated,
+    whatever the result (at most 2 `getBotInfo` calls per process, no timed
+    retries);
+  - messages arriving while the startup call is still in flight share one
+    bounded (5s) wait for it. If startup is still pending after that, the
+    message is handled with the unknown identity (a group @mention counts as
+    "not mentioned") and the next message uses the one-shot refetch; if
+    startup fails within that wait, the same message uses the refetch right
+    away and waits up to 5s more. A message waits at most two 5s windows
+    (under 10s). `getBotInfo` itself is now bounded (10s timeout);
+  - all identity readers share one object, so a recovery applies without a
+    restart (`src/lib/bot-identity.js`). The startup fetch now uses
+    `getBotInfo` from `src/lib/client.js` instead of an inline client.
+  - Same defect and same fix as zylos-lark 0.4.2 (lark #102).
+
+### Added
+- While the bot identity is unknown, an error is logged every 10 minutes
+  (log only, no requests). In webhook mode `/health` reports
+  `botIdentity: { status: cached | fetched | unknown, since, attempts, refetchUsed }`
+  (websocket mode has no HTTP server; use the logs).
+- The SDK's `Cannot destructure property 'tenant_access_token'` error now
+  carries a hint (tenant token fetch failed: network unreachable or bad app
+  credentials).
+
 ## [0.3.6] - 2026-08-10
 
 ### Fixed
