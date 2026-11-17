@@ -25,6 +25,7 @@ import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
 import { installConsoleRedaction, registerSecrets } from '../src/lib/redact.js';
 import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
 import { shouldUseCard } from '../src/lib/card-decision.js';
+import { createReplyReceipts } from '../src/lib/reply-receipts.js';
 
 // Same log redaction as the service (src/lib/redact.js).
 installConsoleRedaction();
@@ -78,6 +79,10 @@ if (message.trim() === '[SKIP]') {
 
 // Check if component is enabled
 const config = getConfig();
+const receipts = createReplyReceipts({
+  enabled: config.c4?.replyReceipts,
+  token: process.env.ZYLOS_REPLY_RECEIPT_TOKEN
+});
 if (!config.enabled) {
   console.error('Error: feishu is disabled in config');
   process.exit(1);
@@ -241,10 +246,14 @@ async function sendText(endpoint, text) {
         for (let j = 0; j < subChunks.length; j++) {
           result = await sendPlainTextChunk(endpoint, subChunks[j], isFirstChunk && j === 0);
           if (!result.success) break;
+          receipts.collect(result);
         }
+      } else {
+        receipts.collect(result);
       }
     } else {
       result = await sendPlainTextChunk(endpoint, chunks[i], isFirstChunk);
+      if (result.success) receipts.collect(result);
     }
 
     if (!result.success) {
@@ -311,11 +320,11 @@ async function sendMedia(type, filePath) {
     if (replyTarget) {
       try {
         const result = await replyToMessage(replyTarget, JSON.stringify({ image_key: uploadResult.imageKey }), 'image');
-        if (result.success) return;
+        if (result.success) { receipts.collect(result); return; }
         console.log('[feishu] Image reply failed, falling back to sendImage:', result.message);
         if (parent && root && parent !== root) {
           const rootReply = await replyToMessage(root, JSON.stringify({ image_key: uploadResult.imageKey }), 'image');
-          if (rootReply.success) return;
+          if (rootReply.success) { receipts.collect(rootReply); return; }
           console.log('[feishu] Image root reply fallback failed, falling back to sendImage:', rootReply.message);
         }
       } catch (err) {
@@ -323,7 +332,7 @@ async function sendMedia(type, filePath) {
         if (parent && root && parent !== root) {
           try {
             const rootReply = await replyToMessage(root, JSON.stringify({ image_key: uploadResult.imageKey }), 'image');
-            if (rootReply.success) return;
+            if (rootReply.success) { receipts.collect(rootReply); return; }
           } catch {}
         }
       }
@@ -332,6 +341,7 @@ async function sendMedia(type, filePath) {
     if (!sendResult.success) {
       throw new Error(`Failed to send image: ${sendResult.message}`);
     }
+    receipts.collect(sendResult);
   } else if (type === 'file') {
     const uploadResult = await uploadFile(trimmedPath);
     if (!uploadResult.success) {
@@ -340,11 +350,11 @@ async function sendMedia(type, filePath) {
     if (replyTarget) {
       try {
         const result = await replyToMessage(replyTarget, JSON.stringify({ file_key: uploadResult.fileKey }), 'file');
-        if (result.success) return;
+        if (result.success) { receipts.collect(result); return; }
         console.log('[feishu] File reply failed, falling back to sendFile:', result.message);
         if (parent && root && parent !== root) {
           const rootReply = await replyToMessage(root, JSON.stringify({ file_key: uploadResult.fileKey }), 'file');
-          if (rootReply.success) return;
+          if (rootReply.success) { receipts.collect(rootReply); return; }
           console.log('[feishu] File root reply fallback failed, falling back to sendFile:', rootReply.message);
         }
       } catch (err) {
@@ -352,7 +362,7 @@ async function sendMedia(type, filePath) {
         if (parent && root && parent !== root) {
           try {
             const rootReply = await replyToMessage(root, JSON.stringify({ file_key: uploadResult.fileKey }), 'file');
-            if (rootReply.success) return;
+            if (rootReply.success) { receipts.collect(rootReply); return; }
           } catch {}
         }
       }
@@ -361,6 +371,7 @@ async function sendMedia(type, filePath) {
     if (!sendResult.success) {
       throw new Error(`Failed to send file: ${sendResult.message}`);
     }
+    receipts.collect(sendResult);
   } else {
     throw new Error(`Unsupported media type: ${type}`);
   }
@@ -434,6 +445,7 @@ async function send() {
         { ...parsedEndpoint, cardPath },
         { replyToMessage, sendMessage },
       );
+      receipts.collect(result);
       console.log(`[feishu] card sent message_id=${result.messageId} via=${result.via}`);
       await recordOutgoing(`[sent card] ${result.summary}`);
     } else if (mediaMatch) {
@@ -447,6 +459,7 @@ async function send() {
     // Mark the trigger message as replied (for typing indicator removal)
     markTypingDone(parsedEndpoint.msg);
     console.log('Message sent successfully');
+    receipts.emit();
     process.exit(0);
   } catch (err) {
     console.error(`Error: ${err.message}`);

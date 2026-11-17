@@ -57,11 +57,13 @@ export function c4ReceiveSupportsOption(name) {
  * @returns {string[]}
  */
 export function buildC4ReceiveArgs({ source, endpoint, content, sessionGroup,
-  supportsSessionGroup = c4ReceiveSupportsOption('--session-group') }) {
+  supportsSessionGroup = c4ReceiveSupportsOption('--session-group'),
+  silentStatus = false, supportsSilentStatus = c4ReceiveSupportsOption('--silent-status') }) {
   const args = ['--channel', source, '--endpoint', endpoint, '--json', '--content', content];
   if (sessionGroup != null && sessionGroup !== '' && supportsSessionGroup) {
     args.push('--session-group', sessionGroup);
   }
+  if (silentStatus === true && supportsSilentStatus) args.push('--silent-status');
   return args;
 }
 
@@ -123,7 +125,8 @@ function neverStarted(error) {
  * @param {function} [opts.execFileImpl] - Test hook: replaces child_process.execFile
  */
 export function sendToC4(source, endpoint, content, onReject, onSuccess,
-  { retryDelayMs = 2000, timeoutMs = C4_RECEIVE_TIMEOUT_MS, env, onDone, execFileImpl = execFile } = {}) {
+  { retryDelayMs = 2000, timeoutMs = C4_RECEIVE_TIMEOUT_MS, env, onDone,
+    silentStatus = false, execFileImpl = execFile } = {}) {
   const done = outcome => { if (onDone) onDone(outcome); };
   if (!content) {
     console.error('[feishu] sendToC4 called with empty content');
@@ -135,6 +138,13 @@ export function sendToC4(source, endpoint, content, onReject, onSuccess,
   // once derived it stays the same for the retry.
   let sessionGroup;
   const run = cb => {
+    const supportsSilentStatus = c4ReceiveSupportsOption('--silent-status');
+    if (silentStatus === true && !supportsSilentStatus) {
+      console.error('[feishu] C4 does not support --silent-status; silent message not forwarded');
+      if (onReject) onReject(TRY_LATER);
+      done('unsupported_silent_status');
+      return false;
+    }
     const supportsSessionGroup = c4ReceiveSupportsOption('--session-group');
     if (supportsSessionGroup && sessionGroup === undefined) {
       try {
@@ -148,7 +158,8 @@ export function sendToC4(source, endpoint, content, onReject, onSuccess,
       }
     }
     execFileImpl(process.execPath,
-      [getC4ReceivePath(), ...buildC4ReceiveArgs({ source, endpoint, content, sessionGroup, supportsSessionGroup })],
+      [getC4ReceivePath(), ...buildC4ReceiveArgs({ source, endpoint, content, sessionGroup,
+        supportsSessionGroup, silentStatus, supportsSilentStatus })],
       { encoding: 'utf8', timeout: timeoutMs, ...(env && { env }) }, cb);
     return true;
   };
@@ -205,20 +216,19 @@ export function sendToC4(source, endpoint, content, onReject, onSuccess,
  * Build the onReject callback used by the DM and group handlers.
  * - null (Core already stored the message): remove typing, call onStored, send nothing
  * - notice text: remove typing, deliver the notice into the conversation
- * Smart-mode messages without an @mention behave the same as mentioned ones.
  * @param {object} handlers
  * @param {function} handlers.removeTyping
  * @param {function} [handlers.onStored] - e.g. advance the group context cursor
  * @param {function} handlers.deliver - sends the notice text
  * @returns {(notice: string|null) => void}
  */
-export function createRejectReply({ removeTyping, onStored, deliver }) {
+export function createRejectReply({ removeTyping, onStored, deliver, silent = false }) {
   return notice => {
     if (removeTyping) removeTyping();
     if (notice == null) {
       if (onStored) onStored();
       return;
     }
-    deliver(notice);
+    if (silent !== true) deliver(notice);
   };
 }

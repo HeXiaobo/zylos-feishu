@@ -13,23 +13,36 @@ function record(name, args) {
   console.log(`ENTRY_CALL ${JSON.stringify({ name, args })}`);
 }
 
-function ok() {
-  return { ...result };
+let attempts = 0;
+function ok(name) {
+  attempts++;
+  if (process.env.CARD_ENTRY_CARD_FAIL === '1' && name.includes('Markdown')) {
+    return { success: false, message: 'card rejected' };
+  }
+  if (Number(process.env.CARD_ENTRY_FAIL_AT) === attempts) {
+    return { success: false, message: 'send rejected' };
+  }
+  if (process.env.CARD_ENTRY_REPLY_FAIL === '1' && name === 'replyToMessage') {
+    return { success: false, message: 'reply rejected' };
+  }
+  if (Number(process.env.CARD_ENTRY_MISSING_ID_AT) === attempts) return { success: true };
+  return { ...result, ...(process.env.CARD_ENTRY_UNIQUE_IDS === '1'
+    && result.success && { messageId: `om_entry_${attempts}` }) };
 }
 
 export async function sendMessage(...args) {
   record('sendMessage', args);
-  return ok();
+  return ok('sendMessage');
 }
 
 export async function replyToMessage(...args) {
   record('replyToMessage', args);
-  return ok();
+  return ok('replyToMessage');
 }
 
 export async function sendToGroup(...args) {
   record('sendToGroup', args);
-  return ok();
+  return ok('sendToGroup');
 }
 
 export async function uploadImage(...args) {
@@ -39,7 +52,7 @@ export async function uploadImage(...args) {
 
 export async function sendImage(...args) {
   record('sendImage', args);
-  return ok();
+  return ok('sendImage');
 }
 
 export async function uploadFile(...args) {
@@ -49,15 +62,15 @@ export async function uploadFile(...args) {
 
 export async function sendFile(...args) {
   record('sendFile', args);
-  return ok();
+  return ok('sendFile');
 }
 
 export async function sendMarkdownCard(...args) {
   record('sendMarkdownCard', args);
-  return ok();
+  return ok('sendMarkdownCard');
 }
 
 export async function replyMarkdownCard(...args) {
   record('replyMarkdownCard', args);
-  return ok();
+  return ok('replyMarkdownCard');
 }
