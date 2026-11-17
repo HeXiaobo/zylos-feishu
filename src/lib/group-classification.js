@@ -16,6 +16,19 @@
  *     drops "external sender" evidence collected under the old configuration);
  *   - a lookup failed, which never becomes internal and records why.
  *
+ * Issue #177 adds a second way to be internal: **by person**. The company has no
+ * Feishu tenant of its own (its bots live under 知外文化's) and some colleagues
+ * use personal Feishu accounts, each its own tenant. So `internalMembers` (a list
+ * of `open_id`s, the stable identity that also exists for personal accounts)
+ * names those colleagues:
+ *   - with a non-empty list the verdict comes from the roster: every *human*
+ *     member must be inside a tenant of `internalTenants` **or** named in
+ *     `internalMembers`; robot members do not take part; one unnamed human, an
+ *     unknown identity, an empty roster or a failed lookup → external;
+ *   - with an empty list nothing changes: the verdict is `chat.external` alone
+ *     and the member list is never queried (this is the #177 no-regression rule).
+ * The list is part of `configFingerprint()`, so editing it voids every verdict.
+ *
  * Ordering matters. A member event must take effect *before* it awaits anything,
  * and any classification that was already in flight must not write its older
  * answer afterwards. Both are handled by a per-chat epoch: the event bumps the
@@ -59,6 +72,9 @@ export function groupEvidence(group = {}) {
     reason: demoted?.reason || cached?.invalidatedReason || lastError?.reason || (retry ? 'refresh_failed' : null),
     demotedReason: demoted?.reason || null,
     lastKnownInternal: typeof cached?.lastKnownInternal === 'boolean' ? cached.lastKnownInternal : null,
+    // Issue #177: what the roster said, when the verdict came from the member
+    // list. Only counts and the ids that failed the rule, never message content.
+    members: cached?.members || null,
     lastError,
   };
 }
@@ -93,6 +109,50 @@ export function internalTenantKeys(config, botTenantKey) {
   return new Set(Array.isArray(config.internalTenants)
     ? config.internalTenants.filter(key => typeof key === 'string' && key)
     : [botTenantKey || config.bot?.tenant_key].filter(Boolean));
+}
+
+/**
+ * Colleagues an operator named by hand (issue #177).
+ *
+ * `open_id` is the identity to use: it exists for personal Feishu accounts too,
+ * which is exactly the case a tenant list cannot express. There is no allowlist
+ * bypass here — a named person adds one human to the "inside" side of the same
+ * rule, and every unnamed human still makes the group external.
+ */
+export function internalMemberIds(config) {
+  if (!Array.isArray(config?.internalMembers)) return new Set();
+  return new Set(config.internalMembers
+    .filter(id => typeof id === 'string' && id.trim())
+    .map(id => id.trim()));
+}
+
+/** The open_id of a person, from a roster row or from a member event's `users[]`. */
+function openIdOf(entry) {
+  const id = entry?.memberId
+    ?? entry?.open_id
+    ?? entry?.user_id?.open_id
+    ?? entry?.id?.open_id
+    ?? null;
+  return typeof id === 'string' && id ? id : null;
+}
+
+/**
+ * Robot members do not take part in the verdict (issue #177 item 2).
+ *
+ * A bot in the group is never a colleague and never an outsider; counting the
+ * app's own robot would make every group external. Three signals, any one enough:
+ *   - the roster marks the row as a bot (`member_id_type: 'app'`);
+ *   - the id is a Feishu app id (`cli_…`);
+ *   - the id is the bot that is asking, which `classify` knows from `botOpenId`.
+ */
+function isBotMember(entry, botIds = null) {
+  if (!entry || typeof entry !== 'object') return false;
+  if (entry.isBot === true) return true;
+  const type = String(entry.memberType || entry.member_id_type || entry.member_type || '');
+  if (/^(app|bot)$/i.test(type)) return true;
+  const id = String(entry.memberId || entry.member_id || entry.id?.open_id || '');
+  if (/^cli_/.test(id)) return true;
+  return Boolean(botIds && id && botIds.has(id));
 }
 
 /**
@@ -216,8 +276,9 @@ function describeFailure(result) {
   return { at: Date.now(), reason: 'refresh_failed', code: Number.isFinite(Number(result?.code)) ? Number(result.code) : null, scopes: [], detail };
 }
 
-export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now, timeoutMs = 5000, log = () => {} }) {
+export function createGroupClassifier({ getChatInfo, listChatMembers = null, getBotOpenId = null, saveConfig, now = Date.now, timeoutMs = 5000, log = () => {} }) {
   const pending = new Map();  // chatId -> { epoch, work }
+  const pendingMembers = new Map(); // chatId -> { epoch, work }
   const epochs = new Map();   // chatId -> number; survives config reloads
   // Fingerprint of the settings that decide what "internal" means. A change
   // invalidates every group's cached verdict, because a verdict recorded under
@@ -236,6 +297,12 @@ export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now,
       ? config.internalTenants.filter(key => typeof key === 'string' && key).slice().sort()
       : null,
     botTenant: config?.bot?.tenant_key || null,
+    // Issue #177: the person list changes what "internal" means just as much as
+    // the tenant list. Without it here, editing the list would leave every cached
+    // verdict standing and the change would only show up after the 24h TTL.
+    members: Array.isArray(config?.internalMembers)
+      ? config.internalMembers.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()).sort()
+      : null,
   });
 
   const query = (chatId, epoch = epochOf(chatId)) => {
@@ -251,6 +318,31 @@ export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now,
         if (pending.get(chatId)?.work === work) pending.delete(chatId);
       });
     pending.set(chatId, { epoch, work });
+    return work;
+  };
+
+  /**
+   * The group roster, asked only when `internalMembers` is non-empty.
+   *
+   * A thrown error, a rejection and a silent hang all become the same unusable
+   * answer, because all three mean "nobody can certify the humans here".
+   */
+  const queryMembers = (chatId, epoch = epochOf(chatId)) => {
+    if (typeof listChatMembers !== 'function') {
+      return Promise.resolve({ success: false, message: 'member lookup not available' });
+    }
+    const existing = pendingMembers.get(chatId);
+    if (existing && existing.epoch === epoch) return existing.work;
+    let timer;
+    const work = Promise.race([
+      Promise.resolve().then(() => listChatMembers(chatId, 'open_id')),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(Error('chat member list timeout')), timeoutMs); }),
+    ]).catch((error) => ({ success: false, message: error?.message, error }))
+      .finally(() => {
+        clearTimeout(timer);
+        if (pendingMembers.get(chatId)?.work === work) pendingMembers.delete(chatId);
+      });
+    pendingMembers.set(chatId, { epoch, work });
     return work;
   };
 
@@ -300,9 +392,74 @@ export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now,
   };
 
   /**
-   * Detect a change of `internalTenants` / `bot.tenant_key` and invalidate every
-   * group. Called on the message path, the member path and the config watcher,
-   * so a hot reload takes effect on the next message without a restart.
+   * The roster answers the question the tenant list cannot (issue #177).
+   *
+   * Every human member must be inside a tenant of `internalTenants` or named in
+   * `internalMembers`. Robots are skipped. Anything that is not a clean "all
+   * inside" — one unnamed human, a member with no identity, an empty roster, a
+   * failed/denied/timed-out call — leaves the group external and records why.
+   *
+   * @returns {{usable: boolean, internal: boolean, failure?: object, members?: object, outsiders?: string[]}}
+   */
+  const judgeMembers = (config, result, at, tenants, people, botIds = null) => {
+    const members = Array.isArray(result?.members) ? result.members : null;
+    if (!result?.success || !members) {
+      return { usable: false, internal: false, failure: describeFailure(result) };
+    }
+    const humans = members.filter(member => !isBotMember(member, botIds));
+    const outsiders = [];
+    let unknownIdentity = 0;
+    for (const member of humans) {
+      const openId = openIdOf(member);
+      if (!openId) { unknownIdentity++; continue; }
+      if (people.has(openId)) continue;
+      const tenant = typeof member.tenantKey === 'string' ? member.tenantKey : (typeof member.tenant_key === 'string' ? member.tenant_key : '');
+      if (!tenant) { unknownIdentity++; continue; }
+      if (!tenants.has(tenant)) outsiders.push(openId);
+    }
+    const record = {
+      at,
+      total: members.length,
+      humans: humans.length,
+      bots: members.length - humans.length,
+      named: humans.filter(member => people.has(openIdOf(member) || '')).length,
+      outsiders: outsiders.slice(0, 20),
+      unknownIdentity,
+    };
+    if (humans.length === 0) {
+      // A roster with nobody in it is not evidence of anything: every real group
+      // has humans, so an empty answer means the call did not really answer.
+      return { usable: false, internal: false, failure: { at, reason: 'members_empty', code: null, scopes: [], detail: 'chat member list returned no human member' }, members: record };
+    }
+    return { usable: true, internal: outsiders.length === 0 && unknownIdentity === 0, members: record, outsiders };
+  };
+
+  /** Write a roster verdict, keeping the persisted fields a single conclusion. */
+  const applyMemberVerdict = (group, judged, at, { lockExternal = false } = {}) => {
+    const previous = group.autoClassification;
+    const internal = judged.internal === true;
+    group.autoClassification = {
+      internal,
+      checkedAt: at,
+      retry: false,
+      source: 'member_list',
+      lastError: internal ? null : { at, reason: 'member_outside', code: null, scopes: [], detail: `${judged.outsiders?.length || 0} human member(s) outside internalTenants and internalMembers` },
+      members: judged.members ? { ...judged.members, outsiders: judged.outsiders || [] } : null,
+    };
+    if (previous?.invalidatedReason) {
+      group.autoClassification.lastInvalidation = { at: previous.invalidatedAt || null, reason: previous.invalidatedReason };
+    }
+    if (internal) restore(group);
+    else demote(group, lockExternal ? 'member_joined_external' : 'members_external', at);
+    return true;
+  };
+
+  /**
+   * Detect a change of `internalTenants` / `internalMembers` / `bot.tenant_key`
+   * and invalidate every group. Called on the message path, the member path and
+   * the config watcher, so a hot reload takes effect on the next message without
+   * a restart. Issue #177 item 3 rides on exactly this mechanism: naming one more
+   * colleague voids every cached verdict, and the next message re-judges it.
    */
   const syncConfig = (config) => {
     const next = configFingerprint(config);
@@ -317,8 +474,22 @@ export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now,
     // Persist immediately: a restart between the change and the next message must
     // not resurrect a verdict recorded under the previous tenant list.
     if (count > 0) saveConfig(config);
-    log(`internalTenants/bot tenant changed: invalidated ${count} group verdict(s), re-judging on the next message`);
+    log(`internal tenant/member list changed: invalidated ${count} group verdict(s), re-judging on the next message`);
     return true;
+  };
+
+  /**
+   * Ids that are this app's own robot, so the roster can skip it even when Feishu
+   * returns it without `member_id_type: app`. Read lazily through `getBotOpenId`
+   * because the value only exists after startup.
+   */
+  const botIdentity = (config, botOpenId = null) => {
+    let lazy = null;
+    if (!botOpenId && typeof getBotOpenId === 'function') {
+      try { lazy = getBotOpenId(); } catch { lazy = null; }
+    }
+    return new Set([botOpenId, lazy, config?.bot?.open_id, config?.bot_open_id]
+      .filter(id => typeof id === 'string' && id));
   };
 
   const classify = async ({ config, chatId, senderTenantKey, botTenantKey }) => {
@@ -326,12 +497,20 @@ export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now,
     const group = config.groups?.[chatId];
     if (!group) return false;
     group.chatId = chatId;
+    const at = now();
     const tenants = internalTenantKeys(config, botTenantKey);
-    // Missing own-tenant identity cannot certify any sender as internal.
-    const externalSender = Boolean(senderTenantKey && !tenants.has(senderTenantKey));
+    const people = internalMemberIds(config);
+    const botIds = botIdentity(config);
+    // Issue #177: with a person list configured, the verdict comes from the
+    // roster — the tenant flag alone would mark our own group external. With an
+    // empty list this stays null and the pre-#177 path below runs untouched.
+    const rosterMode = people.size > 0;
+    // Missing own-tenant identity cannot certify any sender as internal; a named
+    // colleague on a personal account is not an outside sender either.
+    const externalSender = !rosterMode
+      && Boolean(senderTenantKey && !tenants.has(senderTenantKey));
     let changed = false;
     const cached = group.autoClassification;
-    const at = now();
     if (externalSender) {
       const epoch = bumpEpoch(chatId);
       demote(group, 'external_sender', at);
@@ -355,6 +534,33 @@ export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now,
     // internal: that is how the component learns a group became external.
     const stale = !cached || cached.retry === true || at - cached.checkedAt >= GROUP_CLASSIFICATION_TTL_MS;
     if (stale) {
+      if (rosterMode) {
+        const roster = await queryMembers(chatId, epoch);
+        // A concurrent member event or config change wins.
+        if (epochOf(chatId) !== epoch) return effectiveInternal(group);
+        const judged = judgeMembers(config, roster, at, tenants, people, botIds);
+        if (judged.usable) {
+          applyMemberVerdict(group, judged, at);
+        } else {
+          // Nobody to ask: keep the roster for reporting, record why, stay
+          // external. This is the conservative direction the issue asks for.
+          const failure = judged.failure || { at, reason: 'refresh_failed', code: null, scopes: [], detail: 'member lookup failed' };
+          group.autoClassification = {
+            ...group.autoClassification,
+            internal: false,
+            checkedAt: cached?.checkedAt || 0,
+            retry: true,
+            source: 'member_list',
+            members: judged.members || cached?.members || null,
+            lastError: failure,
+          };
+          demote(group, failure.reason, at);
+          log(`group ${chatId} member verdict failed: ${failure.reason} ${failure.detail || ''} (treated as external)`.trim());
+        }
+        changed = true;
+        saveConfig(config);
+        return effectiveInternal(group);
+      }
       const result = await query(chatId, epoch);
       // A concurrent external-sender observation or member event wins.
       if (epochOf(chatId) !== epoch) return effectiveInternal(group);
@@ -386,8 +592,14 @@ export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now,
     group.chatId = chatId;
     const at = now();
     const tenants = internalTenantKeys(config, botTenantKey);
+    const people = internalMemberIds(config);
+    const botIds = botIdentity(config);
+    // Issue #177: with a person list configured the roster decides, so an event
+    // naming an outside tenant is only a hint — the person may be named. Without
+    // a list, the pre-#177 tenant rule applies unchanged.
+    const rosterMode = people.size > 0;
     const users = Array.isArray(event.users) ? event.users.filter(user => user && typeof user === 'object') : [];
-    const outside = users.filter(user => typeof user.tenant_key === 'string' && user.tenant_key && !tenants.has(user.tenant_key));
+    const outside = rosterMode ? [] : users.filter(user => typeof user.tenant_key === 'string' && user.tenant_key && !tenants.has(user.tenant_key));
     const unknown = users.filter(user => typeof user.tenant_key !== 'string' || !user.tenant_key);
     const joined = event.type === 'added';
     // --- synchronous conservative invalidation starts here, before any await ---
@@ -407,6 +619,34 @@ export function createGroupClassifier({ getChatInfo, saveConfig, now = Date.now,
       // A newer event or observation owns this group now; do not overwrite it.
       log(`group ${chatId} membership re-judge discarded (superseded by a newer event)`);
       return { chatId, handled: true, internal: effectiveInternal(group), rejudged: false };
+    }
+    if (rosterMode) {
+      // The full roster is the answer: someone who just joined on a personal
+      // account is internal exactly when she is named, and a stranger is not.
+      const roster = await queryMembers(chatId, epoch);
+      if (epochOf(chatId) !== epoch) {
+        log(`group ${chatId} roster re-judge discarded (superseded by a newer event)`);
+        return { chatId, handled: true, internal: effectiveInternal(group), rejudged: false };
+      }
+      const judged = judgeMembers(config, roster, at, tenants, people, botIds);
+      if (judged.usable) {
+        applyMemberVerdict(group, judged, at, { lockExternal: outsideJoined });
+      } else {
+        const failure = judged.failure || { at, reason: 'refresh_failed', code: null, scopes: [], detail: 'member lookup failed' };
+        group.autoClassification = {
+          ...group.autoClassification,
+          internal: false,
+          retry: true,
+          source: 'member_list',
+          members: judged.members || group.autoClassification.members || null,
+          lastError: failure,
+        };
+        demote(group, failure.reason, at);
+      }
+      saveConfig(config);
+      log(`group ${chatId} re-judged by the member roster after ${event.type}: internal=${effectiveInternal(group)} `
+        + `(humans=${judged.members?.humans ?? '?'}, outsiders=${judged.outsiders?.length ?? '?'})`.trim());
+      return { chatId, handled: true, internal: effectiveInternal(group), rejudged: true };
     }
     applyLookup(group, result, at, { allowRestore: !outsideJoined, lockExternal: outsideJoined });
     saveConfig(config);

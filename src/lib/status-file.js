@@ -52,6 +52,9 @@ export function buildStatus({ config, permission = null, groups = [], now = Date
     arch2: extra.arch2 === true,
     groupPolicy: config?.groupPolicy || null,
     internalTenants: Array.isArray(config?.internalTenants) ? config.internalTenants : null,
+    // Issue #177: shown so an operator can see who was named as internal, the
+    // same reason internalTenants is listed here.
+    internalMembers: Array.isArray(config?.internalMembers) ? config.internalMembers : null,
     bot_tenant_key: config?.bot?.tenant_key || null,
     permissions: permissionBlock(permission),
     groups,

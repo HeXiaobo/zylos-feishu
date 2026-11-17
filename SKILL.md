@@ -433,6 +433,11 @@ Groups are stored in a map keyed by `chat_id`:
   sender tenant outside `internalTenants`, a failed lookup).
 - `gateMode`: `off` | `observe` | `auto`. `auto` is only possible while the group
   is internal; a stricter value always survives.
+- Arch2 top-level `internalMembers` (`open_id` list, issue #177): names colleagues
+  whose Feishu account sits in another tenant (personal accounts). Non-empty → every
+  human member of a group must be in `internalTenants` or named here; robots are
+  skipped; one unnamed human → external. Empty/absent → only `chat.external` counts.
+  A failed, denied or empty roster → external with the reason recorded.
 - `autoClassification`: Written by the component, not by hand. Holds the current
   verdict (`internal`), its `source` (`chat_info`, `member_event`,
   `external_sender`), `retry`, `invalidatedReason` and `lastError`. A verdict is
@@ -445,7 +450,8 @@ Groups are stored in a map keyed by `chat_id`:
 |---|---|---|
 | outside tenant joined (`im.chat.member.user.added_v1`) | external at once, synchronous; a later `chat.external=false` cannot cancel it | logged as context only |
 | any other join / a departure (`...deleted_v1`, `...withdrawn_v1`) | cache void (`retry: true`), then `im.chat.get` decides | not delivered until the lookup succeeds |
-| `internalTenants` / `bot.tenant_key` changed | every group voided, next message judged by the new list | decided by the new list |
+| `internalTenants` / `internalMembers` / `bot.tenant_key` changed | every group voided, next message judged by the new list | decided by the new list |
+| `internalMembers` names a colleague | with a non-empty list the roster decides: every human member in `internalTenants` or named, robots skipped; one unnamed human → external; empty list → `chat.external` alone | internal only when every human is inside |
 | lookup failed | external; reason `permission_denied` or `refresh_failed` | logged as context only |
 
 Subscribe 消息与群组 → 用户进群 / 用户出群 / 撤销拉用户进群 for the three
