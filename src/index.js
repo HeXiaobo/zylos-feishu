@@ -1473,19 +1473,92 @@ async function handleMessage(data) {
 }
 
 // ============================================================
-// Group membership events (issue #162 item 1)
+// Group membership events (issue #162 item 1, R4 机器人进群事件)
 // ============================================================
 //
-// Feishu pushes these three when the bot is in the group and the app
-// subscribed "消息与群组" events (verified field shapes in the SDK types:
-// `im.chat.member.user.added_v1` / `.deleted_v1` / `.withdrawn_v1` carry
-// `chat_id` and `users[].tenant_key`). Missing subscription is not an error: the
-// group stays on the 24h cache, which is exactly the pre-fix behaviour.
+// Feishu pushes five membership events to a bot that is in the group (field
+// shapes verified in the SDK types, `node-sdk/types/index.d.ts`):
+//   - three about *people*: `im.chat.member.user.added_v1` / `.deleted_v1` /
+//     `.withdrawn_v1`, each carrying `chat_id` and `users[].tenant_key`;
+//   - two about *this bot*: `im.chat.member.bot.added_v1` (机器人进群) and
+//     `im.chat.member.bot.deleted_v1` (机器人被移出群), carrying `chat_id`,
+//     `operator_id`, `operator_tenant_key`, `name` and no `users`.
+//
+// The bot events are not member evidence. `bot.added` is how the component
+// learns about a group it has never seen (验收清单第 24 项: 拉进新群自动放行并开
+// smart), and `bot.deleted` is the moment to drop what we kept for that group.
+// Neither was wired before, so the SDK logged `no im.chat.member.bot.added_v1
+// handle` and a group added this way was only registered on its first received
+// message.
+//
+// Missing subscription is still not an error: the group stays on the 24h cache,
+// which is exactly the pre-fix behaviour.
 const MEMBER_EVENT_TYPES = {
   'im.chat.member.user.added_v1': 'added',
   'im.chat.member.user.deleted_v1': 'deleted',
   'im.chat.member.user.withdrawn_v1': 'withdrawn',
+  'im.chat.member.bot.added_v1': 'bot_added',
+  'im.chat.member.bot.deleted_v1': 'bot_deleted',
 };
+
+/**
+ * 机器人被拉进群（R4 / 验收清单第 24 项）。
+ *
+ * Two steps, both before the first message arrives:
+ *   1. register the group in the allowlist; a group that is already configured
+ *      keeps its settings, because an explicit `mode` / `allowFrom` / `internal`
+ *      is the operator's decision and this event repeats on every re-add;
+ *   2. judge internal/external right away through the same classifier the
+ *      message path uses, so an unmentioned message is not answered in a group
+ *      with outsiders while the verdict is still unknown.
+ */
+async function handleBotAddedToGroup(chatId) {
+  if ((config.groupPolicy || 'allowlist') === 'disabled') {
+    console.log(`[feishu] Bot added to group ${chatId}, but groupPolicy=disabled: not registering`);
+    return { chatId, handled: false };
+  }
+  if (!config.groups?.[chatId]) {
+    // Same rule as the message path's auto-registration further up: a group
+    // nobody configured is smart, a pre-upgrade allowlisted group keeps its
+    // mention-only behaviour instead of being widened to all messages.
+    const mode = isSmartGroup(chatId) ? 'smart' : 'mention';
+    config.groups = { ...config.groups, [chatId]: { mode } };
+    saveConfig(config);
+    console.log(`[feishu] Bot added to group ${chatId}: registered mode=${mode}`);
+  } else {
+    console.log(`[feishu] Bot added to group ${chatId}: already configured, keeping its settings`);
+  }
+  // Reuses the message path's classifier instead of judging here: no sender is
+  // known at add time, so the verdict comes from `im.chat.get` as usual, and a
+  // failed lookup leaves the group not-internal (retry), the conservative side.
+  const internal = await classifyGroup({ config, chatId, botTenantKey });
+  console.log(`[feishu] Bot added to group ${chatId}: internal=${internal} `
+    + `(source=${config.groups?.[chatId]?.autoClassification?.source || 'unavailable'}, `
+    + `reason=${groupEvidence(config.groups?.[chatId]).reason || 'none'})`);
+  return { chatId, handled: true, internal };
+}
+
+/**
+ * 机器人被移出群（R4）。
+ *
+ * Drops this one group's allowlist entry — `autoClassification`,
+ * `internalDemoted`, `chatId` and the operator's manual fields all live inside
+ * it — plus the classifier's per-chat state, so a verdict still in flight cannot
+ * leave a cache behind for a group we are no longer in. Sibling groups, the
+ * cursors and the message history are deliberately left alone.
+ */
+async function handleBotRemovedFromGroup(chatId) {
+  const removed = config.groups?.[chatId];
+  if (removed) {
+    const groups = { ...config.groups };
+    delete groups[chatId];
+    config.groups = groups;
+    saveConfig(config);
+  }
+  classifyGroup.forgetChat(chatId);
+  console.log(`[feishu] Bot removed from group ${chatId}: ${removed ? 'config and classification dropped' : 'no config to drop'}`);
+  return { chatId, handled: true, removed: Boolean(removed) };
+}
 
 async function handleMemberEvent(eventType, data) {
   const type = MEMBER_EVENT_TYPES[eventType];
@@ -1496,6 +1569,15 @@ async function handleMemberEvent(eventType, data) {
   const chatId = payload?.chat_id;
   if (!chatId) return;
   try {
+    // 机器人自己进群/移出群：不进 classifyGroup.handleMemberEvent，那条路要
+    // `users[]`（谁进来了），这里只有群和操作人。
+    if (type === 'bot_added' || type === 'bot_deleted') {
+      const result = type === 'bot_added'
+        ? await handleBotAddedToGroup(chatId)
+        : await handleBotRemovedFromGroup(chatId);
+      if (result.handled) scheduleStatus();
+      return;
+    }
     const result = await classifyGroup.handleMemberEvent({
       config,
       chatId,
