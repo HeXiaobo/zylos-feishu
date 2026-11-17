@@ -383,3 +383,97 @@ test('summary falls back to the header title, then to "card"', () => {
   assert.equal(cardSummary({ header: { title: 'Plain title' } }), 'Plain title');
   assert.equal(cardSummary({ body: {} }), 'card');
 });
+
+// 2026-11-17 生产 T11172125-6m6p：661/663 两张卡 `send_status=failed`、没有平台
+// 消息 id；666 用扁平按钮的同一条路径就发出去了。三张卡只差结构。此前
+// `readCardFile` 只看路径 / JSON / `schema` / `body` 是不是对象，从不往下看元素，
+// 于是一张必然被拒的卡一路发到飞书才失败——单元测试全绿、线上才失败，原因就在这里。
+//
+// 这里只断言「sendCard 会不会把这张卡发出去」。结构判定本身（哪几个 tag、
+// 嵌套多深）在 `card-structure.test.js`。
+const card2 = (elements) => ({ schema: '2.0', body: { elements } });
+const btn = (label) => ({ tag: 'button', text: { tag: 'plain_text', content: label }, value: { z: 'ask', a: 'ask_pick', t: 'T01010000-abcd' } });
+
+test('一张按钮包在 action 壳里的卡（生产上被拒的第一、二张）本地就拦住，不发给飞书', async (t) => {
+  const dir = tmpdir(t);
+  const rejected = writeCard(dir, card2([
+    { tag: 'markdown', content: '**走哪个方案？**' },
+    { tag: 'action', actions: [btn('甲'), btn('乙')] },
+  ]), 'with-action.card.json');
+
+  const { calls, deps } = makeDeps();
+  await expectError(() => sendCard({ chatId: CHAT, type: 'p2p', cardPath: rejected }, deps),
+    'ERR_CARD_STRUCTURE', /`action`/);
+  // 校验在 sendMessage/replyToMessage 之前：一个字节都没发出去。
+  assert.equal(calls.send.length, 0, '被拒的卡不许发出去');
+  assert.equal(calls.reply.length, 0, '也不许退成一次回复');
+  assertAllInteractive(calls);
+});
+
+test('一张带 note 的卡（生产上同样被拒）也拦住', async (t) => {
+  const dir = tmpdir(t);
+  const rejected = writeCard(dir, card2([
+    { tag: 'markdown', content: '**走哪个方案？**' },
+    { tag: 'note', elements: [{ tag: 'plain_text', content: '只有被问的你能点' }] },
+  ]), 'with-note.card.json');
+  const { calls, deps } = makeDeps();
+  await expectError(() => sendCard({ chatId: CHAT, type: 'p2p', cardPath: rejected }, deps),
+    'ERR_CARD_STRUCTURE', /`note`/);
+  assert.equal(calls.send.length, 0);
+});
+
+test('扁平按钮的卡照常放行：这是修复后生成器写的形状（生产上成功的那一张）', async (t) => {
+  const dir = tmpdir(t);
+  const good = writeCard(dir, card2([
+    { tag: 'markdown', content: '**走哪个方案？**' },
+    btn('甲'),
+    btn('乙'),
+    { tag: 'markdown', content: '点按钮或直接回复都行。' },
+  ]), 'flat.card.json');
+  const { calls, deps } = makeDeps();
+  const result = await sendCard({ chatId: CHAT, type: 'p2p', cardPath: good }, deps);
+  assert.equal(result.success, true);
+  assert.equal(calls.send.length, 1);
+  // 发出去的内容原样带着扁平按钮，没有被本地改写。
+  assert.equal(JSON.parse(calls.send[0].content).body.elements.filter((el) => el.tag === 'button').length, 2);
+});
+
+test('发送失败时每一次 attempt 的原因都带出来，不只最后一条', async (t) => {
+  const dir = tmpdir(t);
+  const cardPath = writeCard(dir, VALID_CARD);
+  const { deps } = makeDeps({
+    replyResults: [
+      { success: false, code: 230013, message: 'parent gone' },
+      { success: false, code: 230014, message: 'root gone' },
+    ],
+    sendResult: { success: false, code: 230020, message: 'bot not in chat' },
+  });
+
+  await assert.rejects(
+    () => sendCard({ chatId: CHAT, type: 'group', root: 'om_test_root', parent: 'om_test_parent', cardPath }, deps),
+    (err) => {
+      assert.equal(err.code, 'ERR_CARD_SEND');
+      // 只留最后一条 = 前面的失败原因全丢（生产上就是查不出 661/663 为什么被拒）。
+      assert.deepEqual(err.failures, [
+        { via: 'reply', code: 230013, message: 'parent gone' },
+        { via: 'reply-root', code: 230014, message: 'root gone' },
+        { via: 'send', code: 230020, message: 'bot not in chat' },
+      ]);
+      assert.deepEqual(err.attempts, ['reply', 'reply-root', 'send']);
+      // 原来的 message 不变，别的调用方还在按它断言。
+      assert.equal(err.message, 'ERR_CARD_SEND: 230020 bot not in chat');
+      return true;
+    },
+  );
+});
+
+test('抛异常的那一次 attempt 不中断后续尝试（via 保留）', async (t) => {
+  const dir = tmpdir(t);
+  const cardPath = writeCard(dir, VALID_CARD);
+  const { deps } = makeDeps({
+    replyResults: [Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })],
+    sendResult: { success: true, messageId: 'om_after_throw' },
+  });
+  const result = await sendCard({ chatId: CHAT, type: 'group', parent: 'om_parent', cardPath }, deps);
+  assert.equal(result.via, 'send');
+});

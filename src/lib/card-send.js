@@ -17,6 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chooseReplyTarget } from './reply-target.js';
+import { findUnsupportedStructure } from './card-structure.js';
 
 // Feishu docs (send message API): the request body of a card or rich-text
 // message must not exceed 30 KB. Count the body we actually send, in UTF-8
@@ -53,7 +54,8 @@ export function requestBodyBytes(body) {
  * @param {typeof fs.statSync} [deps.statFile]
  * @param {typeof fs.readFileSync} [deps.readFile]
  * @returns {{ card: object, content: string }}
- * @throws Error with code ERR_CARD_PATH / ERR_CARD_JSON / ERR_CARD_SCHEMA
+ * @throws Error with code ERR_CARD_PATH / ERR_CARD_JSON / ERR_CARD_SCHEMA /
+ *   ERR_CARD_STRUCTURE
  */
 export function readCardFile(filePath, { statFile = fs.statSync, readFile = fs.readFileSync } = {}) {
   const target = String(filePath ?? '').trim();
@@ -90,6 +92,14 @@ export function readCardFile(filePath, { statFile = fs.statSync, readFile = fs.r
   }
   if (!card.body || typeof card.body !== 'object' || Array.isArray(card.body)) {
     throw cardError('ERR_CARD_SCHEMA', `missing body object in ${target}`);
+  }
+  // 卡片的元素树也要看：飞书拒的不是 schema 声明，是里面的 1.0 遗留容器。
+  // 漏了这一条，一张必然被拒的卡会一路发出去、记 `send_status=failed`、没有
+  // 平台消息 id——生产上就是这么连着失败两次的（见 card-structure.js）。
+  const unsupported = findUnsupportedStructure(card);
+  if (unsupported) {
+    throw cardError('ERR_CARD_STRUCTURE',
+      `${target}: ${unsupported.path} is \`${unsupported.tag}\` — ${unsupported.reason}`);
   }
 
   return { card, content: JSON.stringify(card) };
@@ -131,7 +141,11 @@ export function cardSummary(card) {
  * @param {typeof readCardFile} [deps.readCard]
  * @returns {Promise<{ success: true, messageId?: string, via: 'reply'|'reply-root'|'send', summary: string, card: object }>}
  * @throws Error with code ERR_CARD_PATH / ERR_CARD_JSON / ERR_CARD_SCHEMA /
- *   ERR_CARD_TOO_LARGE / ERR_CARD_SEND
+ *   ERR_CARD_STRUCTURE / ERR_CARD_TOO_LARGE / ERR_CARD_SEND
+ *
+ * On failure, `err.failures` carries **every** attempt ({via, code, message})
+ * in order, so the caller can log what Feishu said each time instead of only
+ * the last one. `err.message` still ends with the last attempt, unchanged.
  */
 export async function sendCard(
   { chatId, type, root, parent, msg, cardPath } = {},
@@ -165,7 +179,7 @@ export async function sendCard(
         : await replyToMessage(attempt.target, content, 'interactive');
     } catch (err) {
       if (noFallbackOnThrow) throw err;
-      failures.push({ code: err?.code, message: err?.message });
+      failures.push({via: attempt.via, code: err?.code, message: err?.message});
       continue;
     }
 
@@ -178,9 +192,14 @@ export async function sendCard(
         card,
       };
     }
-    failures.push({ code: result?.code, message: result?.message });
+    failures.push({via: attempt.via, code: result?.code, message: result?.message});
   }
 
   const last = failures[failures.length - 1] || {};
-  throw cardError('ERR_CARD_SEND', `${last.code ?? 'unknown'} ${last.message ?? 'no send attempt succeeded'}`);
+  const err = cardError('ERR_CARD_SEND', `${last.code ?? 'unknown'} ${last.message ?? 'no send attempt succeeded'}`);
+  // 每一次 attempt 的 code/message 都带出去：只留最后一条，等于把前几次
+  // 飞书为什么拒的信息丢掉（生产上就是查不到 661/663 的原因）。
+  err.failures = failures;
+  err.attempts = attempts.map(attempt => attempt.via);
+  throw err;
 }

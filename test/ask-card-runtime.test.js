@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  answeredCard, checkActor, createAskCardRuntime, parseAskCardEvent, tapContent, tapOutcomeText,
+  answeredCard, checkActor, createAskCardRuntime, parseAskCardEvent, tapContent, tapOutcomeText, tapSourceId,
 } from '../src/lib/ask-card-runtime.js';
 
 // issue #171：拍板卡回调。这里不碰飞书、不碰数据库 —— 归单那一步是把一条
@@ -28,7 +28,22 @@ function event({action = 'ask_pick', label = '甲', index = 0, actor = OWNER, me
   };
 }
 
+// 生成器现在写的形状：2.0，按钮直接是 body.elements 的成员，没有 action 壳、
+// 没有 note（2026-11-17 生产 T11172125-6m6p 上飞书拒的就是那两个）。
 const CARD = {
+  schema: '2.0',
+  config: {update_multi: true, summary: {content: '需要你定'}},
+  header: {template: 'orange', title: {tag: 'plain_text', content: '需要你定：挑方案'}},
+  body: {elements: [
+    {tag: 'markdown', content: '**走哪个方案？**'},
+    {tag: 'button', text: {tag: 'plain_text', content: '甲'}, type: 'primary', value: {z: 'ask', a: 'ask_pick', t: TICKET}},
+    {tag: 'button', text: {tag: 'plain_text', content: '乙'}, type: 'primary', value: {z: 'ask', a: 'ask_pick', t: TICKET}},
+    {tag: 'markdown', content: '只有被问的你能点'},
+  ]},
+};
+
+/** 修复前生成器写出来的旧形状（带 action 壳和 note），用来测「回写也要拆干净」。 */
+const LEGACY_CARD = {
   schema: '2.0',
   config: {update_multi: true, summary: {content: '需要你定'}},
   header: {template: 'orange', title: {tag: 'plain_text', content: '需要你定：挑方案'}},
@@ -36,7 +51,6 @@ const CARD = {
     {tag: 'markdown', content: '**走哪个方案？**'},
     {tag: 'action', actions: [
       {tag: 'button', text: {tag: 'plain_text', content: '甲'}, value: {z: 'ask', a: 'ask_pick', t: TICKET}},
-      {tag: 'button', text: {tag: 'plain_text', content: '乙'}, value: {z: 'ask', a: 'ask_pick', t: TICKET}},
     ]},
     {tag: 'note', elements: [{tag: 'plain_text', content: '只有被问的你能点'}]},
   ]},
@@ -90,8 +104,23 @@ test('本人点了：投一条带单号的归单消息，并把原卡改成已�
   assert.equal(card.header.template, 'green');
   assert.match(card.header.title.content, /波总 已选：乙/);
   // 按钮必须全部去掉：还挂着按钮，人会以为没点上。
+  assert.equal(card.body.elements.some(element => element.tag === 'button'), false);
   assert.equal(card.body.elements.some(element => element.tag === 'action'), false);
+  // 回写的卡也必须是飞书认的 2.0：说明文字用 markdown，不是 note。
+  assert.equal(card.body.elements.some(element => element.tag === 'note'), false);
+  assert.match(JSON.stringify(card.body.elements.at(-1)), /已选：乙/);
   assert.equal(card.config.update_multi, true);
+});
+
+test('回写老卡（带 action 壳和 note）：按钮拆干净，note 不再出现，卡仍是 2.0', () => {
+  const card = answeredCard(LEGACY_CARD, {label: '甲', actorName: '波总', ticketId: TICKET, question: '走哪个方案？'});
+  assert.equal(card.header.template, 'green');
+  assert.match(card.header.title.content, /已选：甲/);
+  assert.equal(JSON.stringify(card).includes('"tag":"action"'), false);
+  assert.equal(JSON.stringify(card).includes('"tag":"note"'), false);
+  assert.equal(JSON.stringify(card).includes('"tag":"button"'), false);
+  // 问题正文还在，别把原卡内容也一起删掉。
+  assert.match(JSON.stringify(card), /走哪个方案/);
 });
 
 test('单子已经答过：不投单、不改卡，只提示', async () => {
@@ -157,6 +186,8 @@ test('读不回原卡时用按钮值里的问题拼一张最小卡，不发空�
   assert.match(card.header.title.content, /已选：甲/);
   assert.match(JSON.stringify(card), /走哪个方案/);
   assert.equal(card.body.elements.some(element => element.tag === 'action'), false);
+  assert.equal(card.body.elements.some(element => element.tag === 'note'), false);
+  assert.equal(card.body.elements.some(element => element.tag === 'button'), false);
 });
 
 test('鉴权：拿不到身份、卡里没记住问谁，都不采纳', () => {
@@ -165,4 +196,38 @@ test('鉴权：拿不到身份、卡里没记住问谁，都不采纳', () => {
   assert.equal(checkActor({actorId: OWNER, askee: OWNER}).ok, true);
   assert.equal(tapContent({action: 'ask_pick', label: '甲'}).includes('选：甲'), true);
   assert.equal(tapOutcomeText({action: 'ask_delegate'}), '要用文字说明交给谁');
+});
+
+// 审查 R6-1 抓到的真缺陷：同一张卡上先点「我自己写」、再改点某个选项，是常见
+// 操作。C4 按 `source_id` 判重复，而原来那个键只区分「哪张卡、哪个人」，于是
+// 第二次选择被当成重放静默丢掉——卡片还会改成「已选」并提示成功。
+test('同卡改选：两次点击的去重键必须不同，否则第二次会被当成重放', () => {
+  const pick = parseAskCardEvent({
+    operator: {open_id: 'ou_askee0001'},
+    token: 'tok_first',
+    action: {value: {z: 'ask', a: 'ask_write', t: 'T11172125-6m6p', u: 'ou_askee0001', q: 'q'}},
+    context: {open_message_id: 'om_card1'},
+  });
+  const changed = parseAskCardEvent({
+    operator: {open_id: 'ou_askee0001'},
+    token: 'tok_second',
+    action: {value: {z: 'ask', a: 'ask_pick', t: 'T11172125-6m6p', i: 1, u: 'ou_askee0001', q: 'q', l: 'no'}},
+    context: {open_message_id: 'om_card1'},
+  });
+  assert.notEqual(tapSourceId(pick), tapSourceId(changed), '不同点击必须有不同的去重键');
+  // 同一次点击的重投（token 不变）必须沿用原键，否则重试会变成重复归单。
+  const replay = parseAskCardEvent({
+    operator: {open_id: 'ou_askee0001'},
+    token: 'tok_second',
+    action: {value: {z: 'ask', a: 'ask_pick', t: 'T11172125-6m6p', i: 1, u: 'ou_askee0001', q: 'q', l: 'no'}},
+    context: {open_message_id: 'om_card1'},
+  });
+  assert.equal(tapSourceId(changed), tapSourceId(replay), '同一次点击的重投要沿用原键');
+});
+
+test('拿不到 token 时，动作与选项序号也要能把两次点击分开', () => {
+  const base = {operator: {open_id: 'ou_askee0001'}, context: {open_message_id: 'om_card1'}};
+  const a = parseAskCardEvent({...base, action: {value: {z: 'ask', a: 'ask_write', t: 'T11172125-6m6p'}}});
+  const b = parseAskCardEvent({...base, action: {value: {z: 'ask', a: 'ask_pick', t: 'T11172125-6m6p', i: 1}}});
+  assert.notEqual(tapSourceId(a), tapSourceId(b));
 });
