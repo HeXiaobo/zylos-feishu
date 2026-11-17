@@ -45,6 +45,7 @@ import { parseMessageItemText } from './lib/message-item-text.js';
 import { isDmAllowed as isDmAllowedByConfig, isOwner as isOwnerByConfig } from './lib/dm-policy.js';
 // issue #171：拍板卡回调。校验/路由在 lib，这里只做接线。
 import { createAskCardRuntime, parseAskCardEvent } from './lib/ask-card-runtime.js';
+import { originSession } from './lib/ask-card-origin.js';
 import { readCardContent, patchCardContent } from './lib/ask-card-message.js';
 
 // C4 receive interface path
@@ -1635,12 +1636,17 @@ function askCardRuntime() {
       }
       // 归单：复用 callback_ticket_id 这条路，`route-input` 会直接 `ticket input`。
       // endpoint 必须带 chat 段：归单后的回复要能回到这个会话。
-      const chatId = await ticketChatId(ticketId);
-      if (!chatId) throw new Error(`ticket ${ticketId} has no feishu origin to reply to`);
+      //
+      // #179-1：chat 段和 type 段都要从原单来。私聊（`|type:p2p`）的拍板卡现在
+      // 也会发，回调如果照旧写死 `type:group`，这条入站就会被 `c4-gate` 的
+      // `privateChat`、`auto-deliver` 的内部判定当成群消息——点按钮能回原单，
+      // 但语义判错。取不到 type 时退回 group，保持今天的行为。
+      const origin = await ticketOrigin(ticketId);
+      if (!origin.chatId) throw new Error(`ticket ${ticketId} has no feishu origin to reply to`);
       const response = await executeC4Receive([
         C4_RECEIVE,
         '--channel', 'feishu',
-        '--endpoint', `${chatId}|type:group|msg:${messageId}`,
+        '--endpoint', `${origin.chatId}|type:${origin.type}|msg:${messageId}`,
         '--callback-ticket-id', ticketId,
         '--source-id', `ask-card-${messageId}-${actorId}`,
         '--sender', actorId,
@@ -1665,17 +1671,13 @@ function executeTicketCli(args) {
   });
 }
 
-/** 这张单的来源会话 id（endpoint 的第一段）。读不到就返回 null。 */
-function ticketChatId(ticketId) {
+/** 读这张单的来源会话（chat 段 + type 段）。读不到就返回 `{chatId:null}`。 */
+function ticketOrigin(ticketId) {
   const script = path.join(process.env.HOME, 'zylos/.claude/skills/tickets/scripts/ticket.js');
   return new Promise(resolve => {
     execFile('node', [script, 'show', ticketId, '--json'], {encoding: 'utf8', timeout: 15000, env: process.env}, (error, stdout) => {
-      if (error) { resolve(null); return; }
-      try {
-        const ticket = JSON.parse(stdout);
-        const chatId = String(ticket.origin_endpoint || '').split('|')[0];
-        resolve(chatId || null);
-      } catch { resolve(null); }
+      if (error) { resolve({ chatId: null, type: 'group' }); return; }
+      try { resolve(originSession(JSON.parse(stdout))); } catch { resolve({ chatId: null, type: 'group' }); }
     });
   });
 }
