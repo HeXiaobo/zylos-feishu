@@ -16,6 +16,8 @@
  * 以及按钮值里由引擎写死的被问人 open_id —— 模型经手不到这个值。
  */
 
+import { withoutButtons } from './card-structure.js';
+
 export const ASK_CARD_MARKER = 'ask';
 export const ASK_PICK = 'ask_pick';
 export const ASK_WRITE = 'ask_write';
@@ -104,6 +106,11 @@ export function tapOutcomeText(parsed) {
  * 那两条路还要人打字，卡片留着问题更有用。读不回原卡时用按钮值里的 `q` 拼一张
  * 最小卡，不发空卡。
  *
+ * 回写的卡必须是飞书认的 2.0：按钮是 `body.elements` 的直接成员（不是
+ * `{tag:'action', actions:[…]}`），说明文字用 `markdown`（2.0 没有 `note`）。
+ * 旧版生成器写出的是带 `action` 壳的卡，所以这里**两种形状都要拆**——只过滤
+ * `action` 会把扁平按钮留在原卡上，人点了以为没点上。
+ *
  * @param {object|null} card 原卡片
  * @param {{label?:string, actorName?:string, ticketId:string, question?:string}} input
  */
@@ -111,7 +118,7 @@ export function answeredCard(card, {label, actorName, ticketId, question}) {
   const chosen = text(label, MAX_LABEL) || '已选';
   const who = text(actorName, 60);
   const summary = who ? `${who} 已选：${chosen}` : `已选：${chosen}`;
-  const tail = {tag: 'note', elements: [{tag: 'plain_text', content: `${summary}（这张不会再接受新的点击；要改请直接回复消息）`}]};
+  const tail = {tag: 'markdown', content: `${summary}（这张不会再接受新的点击；要改请直接回复消息）`};
   if (card && Array.isArray(card?.body?.elements)) {
     return {
       ...card,
@@ -123,10 +130,7 @@ export function answeredCard(card, {label, actorName, ticketId, question}) {
       },
       body: {
         ...card.body,
-        elements: [
-          ...(card.body.elements || []).filter(element => element?.tag !== 'action'),
-          tail,
-        ],
+        elements: [...withoutButtons(card.body.elements), tail],
       },
     };
   }

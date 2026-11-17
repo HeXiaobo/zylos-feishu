@@ -64,11 +64,12 @@ test('scripts/send.js routes every [MEDIA:card] input through card validation', 
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  function runSend(message, msgId) {
+  function runSend(message, msgId, { endpoint, env = {} } = {}) {
     return new Promise((resolve, reject) => {
       const child = spawn(
         process.execPath,
-        ['--no-warnings', '--experimental-loader', LOADER, SEND_JS, `oc_test_chat|type:p2p|msg:${msgId}`, message],
+        ['--no-warnings', '--experimental-loader', LOADER, SEND_JS,
+          endpoint ?? `oc_test_chat|type:p2p|msg:${msgId}`, message],
         {
           cwd: ROOT,
           env: {
@@ -78,6 +79,7 @@ test('scripts/send.js routes every [MEDIA:card] input through card validation', 
             FEISHU_APP_ID: '',
             FEISHU_APP_SECRET: '',
             FEISHU_INTERNAL_SECRET: 'test_entry_secret',
+            ...env,
           },
           timeout: 10000,
         },
@@ -156,5 +158,92 @@ test('scripts/send.js routes every [MEDIA:card] input through card validation', 
     assert.deepEqual(JSON.parse(calls[0].args[1]), CARD);
     assert.equal(history.at(-1).text, '[sent card] entry summary');
     assert.ok(fs.existsSync(typingFile('om_test_newline')));
+  });
+
+  // 波总 2026-11-17 点名要的这一条（生产上有过 660/662/665 先发「卡已发」、
+  // 661/663 紧接着发卡失败的账）：**发卡失败时，不许有任何含「卡已发」的出站。**
+  //
+  // 做法是把它做成结构性的，而不是靠一句提醒：这句话的唯一载体是卡片自己
+  // （`buildAskCard` 的最后一个 markdown 元素）。卡发不出去，人什么都收不到，
+  // 也就不存在假话。所以这里断言的不是「Error 里没有这句话」，而是**整次运行
+  // 里不存在任何一条出站（sendMessage / replyToMessage / 记录历史）带着它**。
+  const CLAIM = '卡已发';
+
+  function outboundTexts(result) {
+    const fromCalls = callsFrom(result.stdout).map((call) => String(call.args?.[1] ?? ''));
+    return { fromCalls, fromStdout: String(result.stdout), fromStderr: String(result.stderr) };
+  }
+
+  await t.test('a card that cannot be sent produces no outgoing message containing 卡已发', async () => {
+    // 三张卡：一张结构必被拒（action 壳）、一张路径不存在、一张飞书拒收。
+    const brokenStructure = path.join(cardsDir, 'broken.card.json');
+    fs.writeFileSync(brokenStructure, JSON.stringify({
+      schema: '2.0',
+      config: { summary: { content: '需要你定' } },
+      body: { elements: [
+        { tag: 'markdown', content: '**走哪个方案？**' },
+        { tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: '甲' }, value: { z: 'ask' } }] },
+        { tag: 'markdown', content: `${CLAIM}，点按钮或直接回复都行` },
+      ] },
+    }));
+    const missing = path.join(cardsDir, 'does-not-exist.card.json');
+
+    const cases = [
+      ['structure rejected before any send', brokenStructure],
+      ['file missing', missing],
+      ['feishu refuses the card', cardPath, { CARD_ENTRY_SEND_FAIL: '1' }],
+    ];
+
+    for (const [label, target, env] of cases) {
+      const historyBefore = history.length;
+      const result = await runSend(`[MEDIA:card]${target}`, `om_fail_${label.replace(/\W+/g, '_')}`, { env });
+
+      assert.equal(result.code, 1, `${label}: must exit non-zero`);
+      const { fromCalls, fromStdout, fromStderr } = outboundTexts(result);
+      // 一次发送尝试都没有：这是「什么都没发出去」的硬证据。
+      assert.equal(fromCalls.length, 0, `${label}: no send/reply call may happen`);
+      assert.equal(history.length, historyBefore, `${label}: no outgoing history may be recorded`);
+      // 而且这句话不许以任何形式出现在出站侧。
+      const outgoing = [...fromCalls, ...history.slice(historyBefore).map((entry) => String(entry?.text ?? ''))];
+      for (const text of outgoing) {
+        assert.equal(text.includes(CLAIM), false, `${label}: no outgoing text may claim the card was sent`);
+      }
+      assert.doesNotMatch(fromStdout, /card sent|Message sent successfully/, `${label}: no success line`);
+      // 失败必须明说，不能沉默。
+      assert.match(fromStderr, /Error: /, `${label}: the failure must be reported`);
+    }
+  });
+
+  await t.test('every failed send attempt writes its own line: via / code / message', async () => {
+    const result = await runSend(`[MEDIA:card]${cardPath}`, 'om_fail_attempts', { env: { CARD_ENTRY_SEND_FAIL: '1' } });
+    assert.equal(result.code, 1);
+    // 只打最后一条，等于把前几次飞书说的话丢掉：生产上就是因此查不出 661/663 被拒的原因。
+    assert.match(result.stderr, /\[feishu\] card attempt 1\/\d+ via=\S+ code=230020 message=/,
+      'the failing attempt must name its via, code and message');
+    assert.match(result.stderr, /Error: ERR_CARD_SEND: 230020/);
+    // 不记卡片正文：日志里不许出现卡片里的内容。
+    assert.equal(result.stderr.includes('entry summary'), false, 'the card body/summary must not be logged');
+  });
+
+  // 反向锁：卡片能发出去的时候，这句话在卡片里（人看得到），且仍然没有独立的
+  // 一句话出站——这样「说」和「发」永远是同一件事。
+  await t.test('a card that does send carries 卡已发 inside itself, never as a separate message', async () => {
+    const claimCard = path.join(cardsDir, 'claim.card.json');
+    fs.writeFileSync(claimCard, JSON.stringify({
+      schema: '2.0',
+      config: { summary: { content: '需要你定' } },
+      body: { elements: [{ tag: 'markdown', content: `${CLAIM}，点按钮或直接回复都行` }] },
+    }));
+    const historyBefore = history.length;
+    const result = await runSend(`[MEDIA:card]${claimCard}`, 'om_claim_ok');
+    assert.equal(result.code, 0, result.stderr);
+
+    const calls = callsFrom(result.stdout);
+    assert.equal(calls.length, 1, 'exactly one message leaves this run: the card');
+    assert.match(String(calls[0].args?.[1] ?? ''), new RegExp(CLAIM), 'the claim lives inside the card');
+    // 出站历史只有一行，而且是卡片记录，不是一句话。
+    assert.equal(history.length, historyBefore + 1);
+    assert.match(history.at(-1).text, /^\[sent card\] /);
+    assert.equal(history.at(-1).text.includes(CLAIM), false, 'the claim is not also sent as text');
   });
 });
