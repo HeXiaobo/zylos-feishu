@@ -194,7 +194,7 @@ test('scripts/send.js routes every [MEDIA:card] input through card validation', 
     const cases = [
       ['structure rejected before any send', brokenStructure, 0],
       ['file missing', missing, 0],
-      ['feishu refuses the card', cardPath, 1],
+      ['feishu refuses the card', cardPath, 1, { CARD_ENTRY_SEND_FAIL: '1' }],
     ];
 
     for (const [label, target, attempts, env] of cases) {
