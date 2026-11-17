@@ -783,9 +783,10 @@ function getGroupName(chatId) {
  * Send a message to the agent via C4 (src/lib/c4.js). c4-receive gets
  * FEISHU_INTERNAL_SECRET in its environment, as before.
  */
-function sendToC4(source, endpoint, content, onReject, onSuccess = null) {
+function sendToC4(source, endpoint, content, onReject, onSuccess = null, options = {}) {
   sendToC4Core(source, endpoint, content, onReject, onSuccess,
-    { env: { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET } });
+    { silentStatus: options.silentStatus === true,
+      env: { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET } });
 }
 
 // Params shared by every `im.message.get` call.
@@ -1302,7 +1303,9 @@ async function handleMessage(data) {
     const cleanText = resolveMentions(text, mentions);
     const cleanLogText = resolveMentions(logText, mentions);
     const threadRootId = threadId ? rootId : null;
+    const silentGroup = config.c4?.smartNoMentionSilent === true && smartNoMention;
     const groupRejectReply = createRejectReply({
+      silent: silentGroup,
       removeTyping: () => removeTypingIndicator(messageId),
       onStored: markCursorDelivered,
       deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
@@ -1313,7 +1316,7 @@ async function handleMessage(data) {
     if (imageKeys.length > 0) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || '[image]', contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered, { silentStatus: silentGroup });
         return;
       }
 
@@ -1329,7 +1332,7 @@ async function handleMessage(data) {
       if (mediaPaths.length > 0) {
         const mediaLabel = mediaPaths.length === 1 ? '[image]' : `[${mediaPaths.length} images]`;
         const msg = formatMessage('group', senderName, `${mediaLabel}${cleanText ? ' ' + cleanText : ''}`, contextMessages, mediaPaths[0], { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered, { silentStatus: silentGroup });
       } else {
         removeTypingIndicator(messageId);
         sendThreadAwareMessage(chatId, 'Image download failed. Please resend the image.', { chatType, rootId, parentId, messageId })
@@ -1341,7 +1344,7 @@ async function handleMessage(data) {
     if (fileKey) {
       if (smartNoMention) {
         const msg = formatMessage('group', senderName, cleanLogText || `[file: ${fileName}]`, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: true });
-        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered, { silentStatus: silentGroup });
         return;
       }
 
@@ -1355,7 +1358,7 @@ async function handleMessage(data) {
       const result = localPath ? await downloadFile(messageId, fileKey, localPath) : { success: false };
       if (result.success && localPath) {
         const msg = formatMessage('group', senderName, `[file: ${fileName}]${cleanText ? ' ' + cleanText : ''}`, contextMessages, localPath, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId) });
-        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
+        sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered, { silentStatus: silentGroup });
       } else {
         removeTypingIndicator(messageId);
         sendThreadAwareMessage(chatId, 'File download failed. Please resend the file.', { chatType, rootId, parentId, messageId })
@@ -1365,7 +1368,7 @@ async function handleMessage(data) {
     }
 
     const msg = formatMessage('group', senderName, cleanText || text, contextMessages, null, { quotedContent, threadContext, threadRootId, groupName: getGroupName(chatId), smartHint: smartNoMention });
-    sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
+    sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered, { silentStatus: silentGroup });
   }
 }
 

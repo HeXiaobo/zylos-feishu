@@ -308,7 +308,8 @@ describe('src/index.js wiring (source checks)', () => {
     assert.ok(ctx >= 0 && marker > ctx);
     const sends = groupBranch.match(/sendToC4\([^\n]*\);/g);
     assert.equal(sends.length, 5);
-    for (const s of sends) assert.equal(s, "sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);");
+    for (const statement of sends) assert.equal(statement,
+      "sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered, { silentStatus: silentGroup });");
     assert.match(groupBranch, /onStored: markCursorDelivered,/);
   });
 

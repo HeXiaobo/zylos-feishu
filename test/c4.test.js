@@ -446,8 +446,7 @@ describe('createRejectReply callback', () => {
     }
   });
 
-  test('smart-mode without @mention behaves exactly like a mentioned message (no special case)', async () => {
-    // index.js builds the same reject callback for both; end to end the user sees the notice.
+  test('default smart-mode without @mention delivers the same notice as a mentioned message', async () => {
     writeOptions(SG);
     script(reject('SESSION_GROUP_INVALID', []));
     const log = [];
@@ -466,7 +465,7 @@ describe('index.js wiring (source checks)', () => {
 
   test('every inbound call goes through the wrapper that passes FEISHU_INTERNAL_SECRET', () => {
     assert.match(src, /import \{ sendToC4 as sendToC4Core, createRejectReply \} from '\.\/lib\/c4\.js';/);
-    const wrapper = src.slice(src.indexOf('function sendToC4(source, endpoint, content, onReject, onSuccess = null) {'));
+    const wrapper = src.slice(src.indexOf('function sendToC4(source, endpoint, content, onReject, onSuccess = null, options = {}) {'));
     assert.ok(wrapper.length < src.length, 'local sendToC4 wrapper exists');
     const body = wrapper.slice(0, wrapper.indexOf('\n}\n'));
     assert.match(body, /sendToC4Core\(source, endpoint, content, onReject, onSuccess,/);
@@ -485,5 +484,58 @@ describe('index.js wiring (source checks)', () => {
     const [dm, group] = callbacks;
     assert.ok(!dm.includes('onStored'), 'DMs have no group cursor');
     assert.match(group, /onStored: markCursorDelivered,/);
+  });
+});
+
+describe('opt-in silent smart groups', () => {
+  test('default arguments remain unchanged; enabled and supported adds the flag', () => {
+    const base = { source: 'feishu', endpoint: TOPIC_EP, content: 'hi', supportsSessionGroup: false };
+    const defaults = buildC4ReceiveArgs(base);
+    assert.ok(!defaults.includes('--silent-status'));
+    assert.deepEqual(buildC4ReceiveArgs({ ...base, silentStatus: true, supportsSilentStatus: true }),
+      [...defaults, '--silent-status']);
+    assert.deepEqual(buildC4ReceiveArgs({ ...base, silentStatus: true, supportsSilentStatus: false }), defaults);
+  });
+
+  test('real Core subprocess receives silent flag without losing session grouping', async () => {
+    writeOptions({ ...SG, '--silent-status': { takesValue: false } });
+    script({ exit: 0 });
+    const outcome = await new Promise(resolve => sendToC4('feishu', TOPIC_EP, 'hi', null, null,
+      { silentStatus: true, onDone: resolve }));
+    assert.equal(outcome, 'sent');
+    assert.deepEqual(recorded(), [['--channel', 'feishu', '--endpoint', TOPIC_EP,
+      '--json', '--content', 'hi', '--session-group', TOPIC_GROUP, '--silent-status']]);
+  });
+
+  test('unsupported Core cannot accidentally post a status for a silent message', async () => {
+    writeOptions(SG);
+    let attempts = 0;
+    const notices = [];
+    const outcome = await new Promise(resolve => sendToC4('feishu', TOPIC_EP, 'hi',
+      notice => notices.push(notice), null,
+      { silentStatus: true, execFileImpl: () => { attempts++; }, onDone: resolve }));
+    assert.equal(outcome, 'unsupported_silent_status');
+    assert.equal(attempts, 0);
+    assert.deepEqual(notices, [TRY_LATER]);
+  });
+
+  test('silent rejects clear typing; only confirmed storage advances the cursor', () => {
+    for (const notice of [TRY_LATER, MAYBE_LOST, null]) {
+      const actions = [];
+      const rejectReply = createRejectReply({ silent: true,
+        removeTyping: () => actions.push('typing'), onStored: () => actions.push('cursor'),
+        deliver: () => assert.fail('silent message must not post a notice') });
+      rejectReply(notice);
+      assert.deepEqual(actions, notice === null ? ['typing', 'cursor'] : ['typing']);
+    }
+  });
+
+  test('only smart unmentioned group calls opt in; DM reject callback has no silent option', () => {
+    const source = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+    assert.match(source, /const silentGroup = config\.c4\?\.smartNoMentionSilent === true && smartNoMention;/);
+    assert.equal(source.match(/sendToC4\('feishu', endpoint, msg, groupRejectReply, markCursorDelivered, \{ silentStatus: silentGroup \}\)/g)?.length, 5);
+    const callbacks = source.match(/createRejectReply\(\{[\s\S]*?\n    \}\);/g);
+    assert.ok(!callbacks[0].includes('silent:'));
+    assert.match(callbacks[1], /silent: silentGroup,/);
   });
 });
