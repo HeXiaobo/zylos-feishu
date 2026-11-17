@@ -73,6 +73,9 @@ function harness({ arch2 = true, external = false, config: initial = null, chatI
     groupEvidence,
     saveConfig: () => { saves.push('handler'); return true; },
     scheduleStatus: () => {},
+    // Same helpers the component imports; the sandbox copies keep the tests
+    // independent of how `src/index.js` happens to name its local wrappers.
+    smartGroup: c4.smartGroup,
     isSmartGroup: chatId => c4.smartGroup(config, chatId, arch2),
     resolveGroupConfig: chatId => (config.groups || {})[chatId],
     console: { log() {}, warn() {}, error() {} },
@@ -80,11 +83,16 @@ function harness({ arch2 = true, external = false, config: initial = null, chatI
     JSON, Object, Array, Boolean, Date,
   };
   vm.createContext(context);
-  const names = ['resolveGroupConfig', 'isSmartGroup', 'handleBotAddedToGroup', 'handleBotRemovedFromGroup', 'handleMemberEvent'];
-  // Only the slices that exist are loaded. On the pre-fix component
-  // `handleMemberEvent` is the baseline one that knows three event types, so the
-  // missing bot helpers are never reached and the failure is the real one
-  // ("the group was never registered") instead of "a helper is absent".
+  // The slices run inside the sandbox, so a name they reference must be *in* the
+  // sandbox. Two things must not be sliced:
+  //   - `resolveGroupConfig` / `isSmartGroup` are leaf helpers over `config`; the
+  //     sandbox versions below delegate to `src/lib/c4-ingress.js`, the same code
+  //     the component calls. Slicing them here would shadow those working copies
+  //     with text that references module-level names (`smartGroup`) the sandbox
+  //     does not have.
+  //   - the bot helpers are the code under test; those *are* sliced, and both
+  //     `async`, so `await` lines up with the returned promise.
+  const names = ['handleBotAddedToGroup', 'handleBotRemovedFromGroup', 'handleMemberEvent'];
   const missing = names.filter(name => !sliceFunction(name));
   const found = names.filter(name => sliceFunction(name)).map(sliceFunction);
   const table = sliceConst('MEMBER_EVENT_TYPES');
