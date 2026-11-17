@@ -802,12 +802,21 @@ function parseC4Response(stdout) {
 }
 
 /**
- * Send message to Claude via C4 (with 1 retry on unexpected failure)
+ * 投一条入站消息给 C4，**等结果**。
+ *
+ * 这是唯一一份投递实现：`sendToC4()` 只是它的一层 fire-and-forget 包装。
+ * 分开的理由是两条调用方要的东西不同——普通入站只要投出去就行，拍板卡的回调
+ * 必须先知道「投没投出去」才能决定跟人说什么（说成功而其实没投出去，就是
+ * 2026-11-17 生产上「卡已发」那种假话的同一类错误）。
+ *
+ * @returns {Promise<{delivered:boolean, response:object|null, error:string|null, rejected:boolean}>}
+ *   `rejected` 是 C4 明确拒收（`ok:false` 带 error），与传输失败区别开：
+ *   前者重试也没用，后者 `sendToC4` 会再试一次。
  */
-function sendToC4(source, endpoint, content, onReject, metadata = {}) {
+function deliverToC4(source, endpoint, content, metadata = {}) {
   if (!content) {
-    console.error('[feishu] sendToC4 called with empty content');
-    return;
+    console.error('[feishu] deliverToC4 called with empty content');
+    return Promise.resolve({delivered: false, response: null, error: 'empty content', rejected: false});
   }
   const childEnv = { ...process.env, FEISHU_INTERNAL_SECRET: INTERNAL_SECRET };
   const args = [
@@ -818,34 +827,54 @@ function sendToC4(source, endpoint, content, onReject, metadata = {}) {
     '--content', content,
     ...arch2IngressArgs(ARCH2, metadata),
   ];
+  // 拍板卡的回调：把「这次点击答的是哪张单」一起带进去，`route-input` 靠它直接
+  // `ticket input`，不经前台。这不是闸的入参，所以不放在 `ingressArgs` 里
+  // （那个函数的四个参数是闸的契约，改它会影响全部入站）。
+  if (metadata.callbackTicketId) args.push('--callback-ticket-id', String(metadata.callbackTicketId));
+  const run = () => new Promise(resolve => {
+    execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
+      resolve({ error, stdout });
+    });
+  });
 
-  execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (error, stdout) => {
-    if (!error) {
-      console.log(`[feishu] Sent to C4: ${content.substring(0, 50)}...`);
+  return run().then(async (first) => {
+    if (!first.error) return { delivered: true, response: parseC4Response(first.stdout), error: null, rejected: false };
+    const rejected = parseC4Response(first.error.stdout || first.stdout);
+    if (rejected && rejected.ok === false && rejected.error?.message) {
+      return { delivered: false, response: rejected, error: rejected.error.message, rejected: true };
+    }
+    // 传输失败：与 `sendToC4` 一致，重试一次。
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    const second = await run();
+    if (!second.error) return { delivered: true, response: parseC4Response(second.stdout), error: null, rejected: false };
+    const retryRejected = parseC4Response(second.error.stdout || second.stdout);
+    return {
+      delivered: false,
+      response: retryRejected,
+      error: retryRejected?.error?.message || second.error.message,
+      rejected: Boolean(retryRejected && retryRejected.ok === false && retryRejected.error?.message),
+    };
+  });
+}
+
+/**
+ * Send message to Claude via C4 (with 1 retry on unexpected failure)
+ *
+ * Fire-and-forget: the caller gets nothing back. Use `deliverToC4()` when the
+ * answer to "did it go in" changes what a person is told.
+ */
+function sendToC4(source, endpoint, content, onReject, metadata = {}) {
+  deliverToC4(source, endpoint, content, metadata).then(result => {
+    if (result.delivered) {
+      console.log(`[feishu] Sent to C4: ${String(content).substring(0, 50)}...`);
       return;
     }
-    const response = parseC4Response(error.stdout || stdout);
-    if (response && response.ok === false && response.error?.message) {
-      console.warn(`[feishu] C4 rejected (${response.error.code}): ${response.error.message}`);
-      if (onReject) onReject(response.error.message);
+    if (result.rejected) {
+      console.warn(`[feishu] C4 rejected (${result.response?.error?.code}): ${result.error}`);
+      if (onReject) onReject(result.error);
       return;
     }
-    console.warn(`[feishu] C4 send failed, retrying in 2s: ${error.message}`);
-    setTimeout(() => {
-      execFile('node', args, { encoding: 'utf8', timeout: 35000, env: childEnv }, (retryError, retryStdout) => {
-        if (!retryError) {
-          console.log(`[feishu] Sent to C4 (retry): ${content.substring(0, 50)}...`);
-          return;
-        }
-        const retryResponse = parseC4Response(retryError.stdout || retryStdout);
-        if (retryResponse && retryResponse.ok === false && retryResponse.error?.message) {
-          console.error(`[feishu] C4 rejected after retry (${retryResponse.error.code}): ${retryResponse.error.message}`);
-          if (onReject) onReject(retryResponse.error.message);
-        } else {
-          console.error(`[feishu] C4 send failed after retry: ${retryError.message}`);
-        }
-      });
-    }, 2000);
+    console.error(`[feishu] C4 send failed after retry: ${result.error}`);
   });
 }
 
@@ -1643,18 +1672,31 @@ function askCardRuntime() {
       // 但语义判错。取不到 type 时退回 group，保持今天的行为。
       const origin = await ticketOrigin(ticketId);
       if (!origin.chatId) throw new Error(`ticket ${ticketId} has no feishu origin to reply to`);
-      const response = await executeC4Receive([
-        C4_RECEIVE,
-        '--channel', 'feishu',
-        '--endpoint', `${origin.chatId}|type:${origin.type}|msg:${messageId}`,
-        '--callback-ticket-id', ticketId,
-        '--source-id', `ask-card-${messageId}-${actorId}`,
-        '--sender', actorId,
-        '--mentioned', '1',
-        '--content', content,
-        '--json',
-      ]);
-      return response || {ok: true};
+      // 走上文唯一那份投递实现。原来这里调了一个**从未定义过**的
+      // `executeC4Receive`（`e210ee1` 把回调路径接进来时就带着它），于是每次点击
+      // 都抛 `ReferenceError`、被 `handle()` 的 catch 包成「这张单没接住这次点击，
+      // 请直接在聊天里回复」——生产上 21:26:46 / 21:26:52 / 21:28:09 / 21:56:09
+      // 四条 error.log 全是它。按钮功能因此从来没跑通过一次。
+      //
+      // 投递结果要真：`handle()` 拿它决定 toast 说什么。投不出去时必须报错，
+      // 不能让卡片改成「已选」而实际什么都没进去。
+      const delivery = await deliverToC4(
+        'feishu',
+        `${origin.chatId}|type:${origin.type}|msg:${messageId}`,
+        content,
+        {
+          sourceId: `ask-card-${messageId}-${actorId}`,
+          chatId: origin.chatId,
+          senderId: actorId,
+          mentioned: true,
+          needsGate: origin.type === 'group',
+          callbackTicketId: ticketId,
+        },
+      );
+      if (!delivery.delivered) {
+        throw new Error(`C4 did not accept the tap: ${delivery.error || 'unknown'}`);
+      }
+      return {ok: true, response: delivery.response};
     },
     onError: message => console.error(`[feishu] Ask card tap: ${message}`),
   });
