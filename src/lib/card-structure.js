@@ -65,9 +65,11 @@ export function findUnsupportedStructure(card) {
       if (reason) return {path: `${path}.tag`, tag: value.tag, reason};
     }
 
-    // 只往下走这些「装着元素」的字段名。别的字段（value / text / content /
-    // summary…）是数据，不是元素树，不必也不该翻。
-    for (const key of ['elements', 'columns', 'actions']) {
+    // 只往下走这些「装着元素」的字段名。`body` 是根节点上的那一层，漏了它就
+    // 只查了卡片顶层的 header/config，`body.elements` 一个字都没看;
+    // 别的字段（value / text / content / summary…）是数据，不是元素树，
+    // 不必也不该翻。
+    for (const key of ['body', 'elements', 'columns', 'actions']) {
       if (value[key] !== undefined) stack.push({value: value[key], path: `${path}.${key}`});
     }
   }

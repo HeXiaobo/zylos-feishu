@@ -108,8 +108,9 @@ export function tapOutcomeText(parsed) {
  *
  * 回写的卡必须是飞书认的 2.0：按钮是 `body.elements` 的直接成员（不是
  * `{tag:'action', actions:[…]}`），说明文字用 `markdown`（2.0 没有 `note`）。
- * 旧版生成器写出的是带 `action` 壳的卡，所以这里**两种形状都要拆**——只过滤
- * `action` 会把扁平按钮留在原卡上，人点了以为没点上。
+ * 旧版生成器写出的是带 `action` 壳和 `note` 的卡，所以这里**两种形状都要拆**：
+ * 只过滤 `action` 会把扁平按钮留在原卡上，人点了以为没点上；留着 `note` 则
+ * 这次 `message.patch` 会像卡片第一次发送那样被飞书拒掉。
  *
  * @param {object|null} card 原卡片
  * @param {{label?:string, actorName?:string, ticketId:string, question?:string}} input
@@ -120,6 +121,10 @@ export function answeredCard(card, {label, actorName, ticketId, question}) {
   const summary = who ? `${who} 已选：${chosen}` : `已选：${chosen}`;
   const tail = {tag: 'markdown', content: `${summary}（这张不会再接受新的点击；要改请直接回复消息）`};
   if (card && Array.isArray(card?.body?.elements)) {
+    // 旧卡里的 `note` 是 1.0 遗留：原来它承载「只有被问的你能点」这类说明，
+    // 现在这段说明已经写进卡片的最后一条 markdown，旧 note 的正文就重复了。
+    // 直接丢掉，不把它翻译成 markdown——否则同一句话会在卡上出现两次。
+    const kept = withoutButtons(card.body.elements).filter(element => element?.tag !== 'note');
     return {
       ...card,
       config: {...(card.config || {}), update_multi: true, summary: {content: summary}},
@@ -130,7 +135,7 @@ export function answeredCard(card, {label, actorName, ticketId, question}) {
       },
       body: {
         ...card.body,
-        elements: [...withoutButtons(card.body.elements), tail],
+        elements: [...kept, tail],
       },
     };
   }
