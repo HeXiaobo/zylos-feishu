@@ -25,7 +25,7 @@ import { ingressArgs, arch2IngressArgs, groupGatePolicy, smartGroup, receivedGro
 import { arch2Enabled } from './lib/arch2.js';
 
 import { getConfig, watchConfig, saveConfig, DATA_DIR, getCredentials, stopWatching } from './lib/config.js';
-import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages } from './lib/message.js';
+import { downloadImage, downloadFile, sendMessage, replyToMessage, extractPermissionError, addReaction, removeReaction, listMessages, MESSAGE_GET_PARAMS } from './lib/message.js';
 import { getUserInfo } from './lib/contact.js';
 import { listChatMembers, getChatInfo } from './lib/chat.js';
 import { createGroupClassifier, normalizeGroupEvidence, groupEvidence } from './lib/group-classification.js';
@@ -886,7 +886,6 @@ function buildEndpoint(chatId, { chatType, rootId, parentId, messageId, threadId
 //   body.elements) for interactive/card messages; without it the API returns
 //   the transformed form whose top-level elements[] has dropped the markdown
 //   body, and a card degrades to the generic "[interactive message]".
-const MESSAGE_GET_PARAMS = { user_id_type: 'open_id', card_msg_content_type: 'user_card_content' };
 
 /**
  * Fetch content of a quoted/replied message (best-effort).

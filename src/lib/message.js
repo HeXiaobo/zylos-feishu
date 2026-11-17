@@ -10,6 +10,20 @@ import { getClient } from './client.js';
 import { getCredentials, getProxyConfig } from './config.js';
 
 /**
+ * `im.message.get` 的参数。两个字段都有理由：
+ *   - `user_id_type:'open_id'` 跟组件其余地方用的身份一致；
+ *   - `card_msg_content_type:'user_card_content'` 才能拿回原始 Schema 2.0 卡片
+ *     JSON（带 `body.elements`）；不带它，API 返回的是转换后的形式，顶层
+ *     `elements[]` 丢了 markdown 正文，卡片会退化成 `[interactive message]`。
+ *
+ * issue #171 的拍板卡要靠这份原始 JSON 改写成「已选：某项」，所以它和
+ * `index.js` 的 `fetchQuotedMessage` 必须用同一份参数——以前它只在
+ * `index.js` 里定义，`ask-card-message.js` 却从本文件 import，进程起来就
+ * `SyntaxError: does not provide an export named 'MESSAGE_GET_PARAMS'`。
+ */
+export const MESSAGE_GET_PARAMS = Object.freeze({ user_id_type: 'open_id', card_msg_content_type: 'user_card_content' });
+
+/**
  * Get fresh access token for direct API calls
  */
 async function getAccessToken() {
