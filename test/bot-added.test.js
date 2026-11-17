@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import * as c4 from '../src/lib/c4-ingress.js';
+import { isGroupAllowed } from '../src/lib/feishu-group-policy.js';
 import { createGroupClassifier, groupEvidence, effectiveInternal } from '../src/lib/group-classification.js';
 
 const ROOT = new URL('../', import.meta.url);
@@ -126,7 +127,11 @@ test('bot added registers the group as smart and judges it right away', async ()
   assert.equal(h.config.groups.oc_new.mode, 'smart');
   // The allowlist gate and the smart gate are read by different helpers; both
   // have to agree or the group receives unmentioned messages nothing answers.
-  assert.equal(c4.receivedGroupAllowed(h.config, 'oc_new', true), true);
+  // `receivedGroupAllowed` only answers "may this row be taken in at all"
+  // (`enabled !== false`), so it is true even for a group nobody registered.
+  // The allowlist question is `isGroupAllowed`, which is what the message
+  // path uses (`index.js:741`).
+  assert.equal(isGroupAllowed(h.config, 'oc_new'), true);
   assert.equal(c4.smartGroup(h.config, 'oc_new', true), true);
 
   assert.deepEqual(h.calls, ['oc_new'], 'the classifier was asked exactly once');
@@ -206,7 +211,7 @@ test('bot removed drops that group only', async () => {
 
   assert.equal(h.config.groups.oc_gone, undefined, 'config and cached verdict are gone');
   assert.deepEqual(JSON.parse(JSON.stringify(h.config.groups.oc_kept)), keptBefore, 'other groups are untouched');
-  assert.equal(c4.receivedGroupAllowed(h.config, 'oc_gone', true), false, 'the removed group is no longer allowed');
+  assert.equal(isGroupAllowed(h.config, 'oc_gone'), false, 'the removed group is no longer allowed');
 });
 
 test('bot removed for a group we never configured is a no-op', async () => {
