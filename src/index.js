@@ -44,7 +44,7 @@ import { extractPostText, resolveMentions } from './lib/message-text.js';
 import { parseMessageItemText } from './lib/message-item-text.js';
 import { isDmAllowed as isDmAllowedByConfig, isOwner as isOwnerByConfig } from './lib/dm-policy.js';
 // issue #171：拍板卡回调。校验/路由在 lib，这里只做接线。
-import { createAskCardRuntime, parseAskCardEvent } from './lib/ask-card-runtime.js';
+import { createAskCardRuntime, parseAskCardEvent, tapSourceId } from './lib/ask-card-runtime.js';
 import { originSession } from './lib/ask-card-origin.js';
 import { readCardContent, patchCardContent } from './lib/ask-card-message.js';
 
@@ -1656,7 +1656,7 @@ function askCardRuntime() {
   return createAskCardRuntime({
     readCard: messageId => readCardContent({client: getClient(), messageId}),
     patchCard: (messageId, card) => patchCardContent({client: getClient(), messageId, card}),
-    receive: async ({ticketId, content, messageId, actorId}) => {
+    receive: async ({ticketId, content, messageId, actorId, sourceId}) => {
       // 先把「这次点击算不算」问引擎（纯读）：单子不在等人、卡是上一轮的、点
       // 的人不是被问的，都在这一步被拒，不往库里投任何东西。
       const verdict = await executeTicketCli(['asktap', ticketId, '--by', actorId, '--json']);
@@ -1685,7 +1685,8 @@ function askCardRuntime() {
         `${origin.chatId}|type:${origin.type}|msg:${messageId}`,
         content,
         {
-          sourceId: `ask-card-${messageId}-${actorId}`,
+          // 每次点击一个键：同卡改选不能被 C4 当成重放丢掉（见 tapSourceId）。
+          sourceId: sourceId || `ask-card-${messageId}-${actorId}`,
           chatId: origin.chatId,
           senderId: actorId,
           mentioned: true,

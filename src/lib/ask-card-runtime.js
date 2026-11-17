@@ -50,7 +50,7 @@ export function isAskCardAction(value) {
  * 别的按钮（比如以后加的）。
  *
  * @param {object} raw
- * @returns {{ticketId:string, action:string, actorId:string, messageId:string, label:string, question:string, askee:string}|null}
+ * @returns {{ticketId:string, action:string, index:number, actorId:string, messageId:string, eventId:string, label:string, question:string, askee:string}|null}
  */
 export function parseAskCardEvent(raw) {
   if (!raw || typeof raw !== 'object') return null;
@@ -60,15 +60,40 @@ export function parseAskCardEvent(raw) {
   const isV2 = Object.hasOwn(event, 'operator') || Object.hasOwn(event, 'context');
   const actorId = String((isV2 ? event.operator?.open_id : event.open_id) ?? '').trim();
   const messageId = String((isV2 ? event.context?.open_message_id : event.open_message_id) ?? '').trim();
+  // 这一次点击自己的标识。`token` 是飞书给每次回调的稳定随机串（同一次传输的
+  // 重投沿用它）；拿不到就退回空串，调用方用页面级兜底键。
+  const eventId = String(event.token ?? raw?.header?.event_id ?? raw?.event_id ?? '').trim();
+  const index = Number.isInteger(value.i) ? value.i : -1;
   return {
     ticketId: String(value.t),
     action: value.a,
+    index,
     actorId,
     messageId,
+    eventId,
     label: text(value.l, MAX_LABEL),
     question: text(value.q, MAX_QUESTION),
     askee: String(value.u ?? '').trim(),
   };
+}
+
+/**
+ * 这次点击的 C4 去重键（`--source-id`）。
+ *
+ * C4 按 `source_id` 判重复：键相同就只记一次、返回 `duplicate`。所以这个键
+ * **不能只区分「哪张卡、哪个人」**——同一张卡上先点「我自己写」再改点某个选项
+ * 是常见操作，用同一个键会把第二次选择静默丢掉，而卡片还会改成「已选」。
+ *
+ * 优先用飞书给这次回调的 `token`（同一次传输的重投沿用它，重试因此仍被正确
+ * 去重）；拿不到就按「动作 + 选项序号」兜底，最后再退化到卡片 + 人。
+ *
+ * @param {object} parsed `parseAskCardEvent()` 的返回值
+ * @returns {string}
+ */
+export function tapSourceId(parsed) {
+  const parts = ['ask-card', String(parsed?.messageId ?? ''), String(parsed?.actorId ?? '')];
+  if (parsed?.eventId) return [...parts, 'ev', parsed.eventId].join('-');
+  return [...parts, String(parsed?.action ?? '?'), String(parsed?.index ?? -1)].join('-');
 }
 
 /**
@@ -187,6 +212,8 @@ export function createAskCardRuntime({readCard, patchCard, receive, onError}) {
           content: tapContent(parsed),
           messageId: parsed.messageId,
           actorId: parsed.actorId,
+          // C4 的去重键：同一次点击的重试沿用，不同点击必须不同（见 tapSourceId）。
+          sourceId: tapSourceId(parsed),
         });
       } catch (error) {
         report(error.message);
