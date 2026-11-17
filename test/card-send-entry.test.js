@@ -188,22 +188,26 @@ test('scripts/send.js routes every [MEDIA:card] input through card validation', 
     }));
     const missing = path.join(cardsDir, 'does-not-exist.card.json');
 
+    // 前两种在本地就被拦住：一次发送尝试都不该有，什么都不会到人眼前。
+    // 第三种飞书真的拒了：那一次尝试会发生（这是「投递过但没成功」与「根本没投」
+    // 的区别），但同样不能有任何成功的记录，也不能有任何出站文本说卡已发。
     const cases = [
-      ['structure rejected before any send', brokenStructure],
-      ['file missing', missing],
-      ['feishu refuses the card', cardPath, { CARD_ENTRY_SEND_FAIL: '1' }],
+      ['structure rejected before any send', brokenStructure, 0],
+      ['file missing', missing, 0],
+      ['feishu refuses the card', cardPath, 1],
     ];
 
-    for (const [label, target, env] of cases) {
+    for (const [label, target, attempts, env] of cases) {
       const historyBefore = history.length;
       const result = await runSend(`[MEDIA:card]${target}`, `om_fail_${label.replace(/\W+/g, '_')}`, { env });
 
       assert.equal(result.code, 1, `${label}: must exit non-zero`);
       const { fromCalls, fromStdout, fromStderr } = outboundTexts(result);
-      // 一次发送尝试都没有：这是「什么都没发出去」的硬证据。
-      assert.equal(fromCalls.length, 0, `${label}: no send/reply call may happen`);
+      // 本地拦住的：一次发送尝试都没有。被飞书拒的：只有那一次尝试。
+      assert.equal(fromCalls.length, attempts, `${label}: unexpected number of send attempts`);
+      // 无论哪条路，都不能记下一条「发出去了」的历史。
       assert.equal(history.length, historyBefore, `${label}: no outgoing history may be recorded`);
-      // 而且这句话不许以任何形式出现在出站侧。
+      // 这句话不许以任何形式出现在出站侧——这是波总点名的那一条。
       const outgoing = [...fromCalls, ...history.slice(historyBefore).map((entry) => String(entry?.text ?? ''))];
       for (const text of outgoing) {
         assert.equal(text.includes(CLAIM), false, `${label}: no outgoing text may claim the card was sent`);
