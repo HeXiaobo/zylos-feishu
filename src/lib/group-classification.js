@@ -131,6 +131,7 @@ function openIdOf(entry) {
   const id = entry?.memberId
     ?? entry?.open_id
     ?? entry?.user_id?.open_id
+    ?? entry?.id?.open_id
     ?? null;
   return typeof id === 'string' && id ? id : null;
 }
@@ -139,15 +140,19 @@ function openIdOf(entry) {
  * Robot members do not take part in the verdict (issue #177 item 2).
  *
  * A bot in the group is never a colleague and never an outsider; counting the
- * app's own robot would make every group external. Two signals, either one
- * enough: the roster says so, or the id is a Feishu app id (`cli_…`).
+ * app's own robot would make every group external. Three signals, any one enough:
+ *   - the roster marks the row as a bot (`member_id_type: 'app'`);
+ *   - the id is a Feishu app id (`cli_…`);
+ *   - the id is the bot that is asking, which `classify` knows from `botOpenId`.
  */
-function isBotMember(entry) {
+function isBotMember(entry, botIds = null) {
   if (!entry || typeof entry !== 'object') return false;
   if (entry.isBot === true) return true;
   const type = String(entry.memberType || entry.member_id_type || entry.member_type || '');
   if (/^(app|bot)$/i.test(type)) return true;
-  return /^cli_/.test(String(entry.memberId || entry.member_id || ''));
+  const id = String(entry.memberId || entry.member_id || entry.id?.open_id || '');
+  if (/^cli_/.test(id)) return true;
+  return Boolean(botIds && id && botIds.has(id));
 }
 
 /**
@@ -396,12 +401,12 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
    *
    * @returns {{usable: boolean, internal: boolean, failure?: object, members?: object, outsiders?: string[]}}
    */
-  const judgeMembers = (config, result, at, tenants, people) => {
+  const judgeMembers = (config, result, at, tenants, people, botIds = null) => {
     const members = Array.isArray(result?.members) ? result.members : null;
     if (!result?.success || !members) {
       return { usable: false, internal: false, failure: describeFailure(result) };
     }
-    const humans = members.filter(member => !isBotMember(member));
+    const humans = members.filter(member => !isBotMember(member, botIds));
     const outsiders = [];
     let unknownIdentity = 0;
     for (const member of humans) {
@@ -473,7 +478,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
     return true;
   };
 
-  const classify = async ({ config, chatId, senderTenantKey, botTenantKey }) => {
+  const classify = async ({ config, chatId, senderTenantKey, botTenantKey, botOpenId = null }) => {
     syncConfig(config);
     const group = config.groups?.[chatId];
     if (!group) return false;
@@ -481,6 +486,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
     const at = now();
     const tenants = internalTenantKeys(config, botTenantKey);
     const people = internalMemberIds(config);
+    const botIds = new Set([botOpenId, config?.bot?.open_id, config?.bot_open_id].filter(id => typeof id === 'string' && id));
     // Issue #177: with a person list configured, the verdict comes from the
     // roster — the tenant flag alone would mark our own group external. With an
     // empty list this stays null and the pre-#177 path below runs untouched.
@@ -518,7 +524,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
         const roster = await queryMembers(chatId, epoch);
         // A concurrent member event or config change wins.
         if (epochOf(chatId) !== epoch) return effectiveInternal(group);
-        const judged = judgeMembers(config, roster, at, tenants, people);
+        const judged = judgeMembers(config, roster, at, tenants, people, botIds);
         if (judged.usable) {
           applyMemberVerdict(group, judged, at);
         } else {
@@ -565,7 +571,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
    *
    * @returns {Promise<{chatId: string, handled: boolean, internal: boolean, rejudged: boolean}>}
    */
-  classify.handleMemberEvent = async ({ config, chatId, event = {}, botTenantKey }) => {
+  classify.handleMemberEvent = async ({ config, chatId, event = {}, botTenantKey, botOpenId = null }) => {
     syncConfig(config);
     const group = chatId ? config.groups?.[chatId] : null;
     if (!group) return { chatId, handled: false, internal: false, rejudged: false };
@@ -573,6 +579,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
     const at = now();
     const tenants = internalTenantKeys(config, botTenantKey);
     const people = internalMemberIds(config);
+    const botIds = new Set([botOpenId, config?.bot?.open_id, config?.bot_open_id].filter(id => typeof id === 'string' && id));
     // Issue #177: with a person list configured the roster decides, so an event
     // naming an outside tenant is only a hint — the person may be named. Without
     // a list, the pre-#177 tenant rule applies unchanged.
@@ -607,7 +614,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
         log(`group ${chatId} roster re-judge discarded (superseded by a newer event)`);
         return { chatId, handled: true, internal: effectiveInternal(group), rejudged: false };
       }
-      const judged = judgeMembers(config, roster, at, tenants, people);
+      const judged = judgeMembers(config, roster, at, tenants, people, botIds);
       if (judged.usable) {
         applyMemberVerdict(group, judged, at, { lockExternal: outsideJoined });
       } else {

@@ -116,10 +116,47 @@ test('#177 a bot member never makes the group external', async () => {
     external: false,
     config: { internalMembers: ['ou_personal'] },
     members: [human('ou_own', 'own'), human('ou_personal', PERSONAL_ACCOUNT),
-      bot('ou_bot', 'own'), bot('cli_other_bot', 'vendor_tenant')],
+      bot('ou_bot', 'own'), bot('cli_other_bot', 'vendor_tenant'),
+      // The app's own robot as Feishu reports it: an app row with an open_id and a
+      // tenant of its own that nobody put in internalTenants.
+      { name: 'Zylos', tenantKey: 'app_tenant', memberId: 'ou_selfbot', memberType: 'app' }],
   });
+  f.config.bot = { tenant_key: 'own', open_id: 'ou_selfbot' };
   await f.run();
   assert.equal(f.policy().internal, true, 'robot members do not take part in the verdict');
+});
+
+test('#177 the bot itself is skipped even when only its id identifies it', async () => {
+  const cfg = { bot: { tenant_key: 'own' }, internalTenants: ['own'], internalMembers: ['ou_a'], groups: { oc_1: { mode: 'smart' } } };
+  const classify = createGroupClassifier({
+    getChatInfo: async () => ({ success: true, chat: { external: true } }),
+    listChatMembers: async () => ({ success: true, members: [
+      { memberId: 'ou_a', tenantKey: 'own' },
+      { memberId: 'ou_selfbot', tenantKey: 'app_tenant' },   // no memberType at all
+    ] }),
+    saveConfig() {}, now: () => 1_000_000,
+  });
+  await classify({ config: cfg, chatId: 'oc_1', senderTenantKey: 'own', botTenantKey: 'own', botOpenId: 'ou_selfbot' });
+  assert.equal(groupGatePolicy(cfg, 'oc_1').internal, true, 'the bot knows its own open_id');
+});
+
+test('#177 a member with no identity at all is not inside evidence', async () => {
+  const f = fixture({
+    external: false, config: { internalMembers: ['ou_personal'] },
+    members: [human('ou_personal', PERSONAL_ACCOUNT), { name: '无身份', tenantKey: 'own' }],
+  });
+  await f.run();
+  assert.equal(f.policy().internal, false, 'a human nobody can identify is not certified');
+  assert.equal(classification.groupEvidence(f.group()).members?.unknownIdentity, 1, 'and status says so');
+});
+
+test('#177 a named colleague on a personal account counts even with an unknown tenant', async () => {
+  const f = fixture({
+    external: true, config: { internalMembers: ['ou_personal'] },
+    members: [{ memberId: 'ou_personal', name: '个人号同事' }, human('ou_own', 'own')],
+  });
+  await f.run(PERSONAL_ACCOUNT);
+  assert.equal(f.policy().internal, true, 'a personal account has no tenant we can read; the name is enough');
 });
 
 test('#177 an empty human roster is not internal evidence', async () => {

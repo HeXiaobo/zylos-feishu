@@ -1321,7 +1321,7 @@ async function handleMessage(data) {
     if (ARCH2 && isGroupAllowed(chatId)) {
       // A change of verdict is persisted through the wrapped saveConfig above,
       // which is what refreshes status.json; no save means nothing to report.
-      await classifyGroup({ config, chatId, senderTenantKey: sender.tenant_key, botTenantKey });
+      await classifyGroup({ config, chatId, senderTenantKey: sender.tenant_key, botTenantKey, botOpenId });
     }
     const allowedGroup = isGroupAllowed(chatId);
     const smart = isSmartGroup(chatId);
@@ -1509,6 +1509,7 @@ async function handleMemberEvent(eventType, data) {
         operatorTenantKey: payload.operator_tenant_key || null,
       },
       botTenantKey,
+      botOpenId,
     });
     if (result.handled) scheduleStatus();
   } catch (err) {
