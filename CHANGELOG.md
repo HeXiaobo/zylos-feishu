@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-17
+
+### Added
+- Add a WebSocket `card.action.trigger` handler with an authenticated loopback bridge, explicit app/message/chat/operator allowlists, and validated toast responses; disabled by default (#112).
+- Add independent `c4.replyReceipts` and `c4.smartNoMentionSilent` configuration switches for native reply receipts and silent unmentioned smart-group messages; both disabled by default (#113).
+
 ### Added
 - **`[MEDIA:card]` sends a prepared Feishu card 2.0 file through C4.**
   `scripts/send.js` now accepts `[MEDIA:card]<absolute path>`, the third media
