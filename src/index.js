@@ -63,6 +63,11 @@ const classifyGroup = createGroupClassifier({
   // real call is `listChatMembers` (already used to preload sender names) with
   // `open_id`, the one identity a personal Feishu account also has.
   listChatMembers: (chatId, memberIdType = 'open_id') => listChatMembers(chatId, memberIdType),
+  // The bot's own open_id, read lazily: it is only known after startup, and the
+  // roster has to be able to skip this app even when Feishu returns it without a
+  // `member_id_type`. (Passing it per call would mean every caller and every
+  // test harness has to define the module variable.)
+  getBotOpenId: () => botOpenId,
   // Every verdict the classifier persists is also the reason status.json exists.
   saveConfig: nextConfig => { const saved = saveConfig(nextConfig); scheduleStatus(); return saved; },
   log: message => console.log(`[feishu] ${message}`),
@@ -1321,7 +1326,7 @@ async function handleMessage(data) {
     if (ARCH2 && isGroupAllowed(chatId)) {
       // A change of verdict is persisted through the wrapped saveConfig above,
       // which is what refreshes status.json; no save means nothing to report.
-      await classifyGroup({ config, chatId, senderTenantKey: sender.tenant_key, botTenantKey, botOpenId });
+      await classifyGroup({ config, chatId, senderTenantKey: sender.tenant_key, botTenantKey });
     }
     const allowedGroup = isGroupAllowed(chatId);
     const smart = isSmartGroup(chatId);
@@ -1509,7 +1514,6 @@ async function handleMemberEvent(eventType, data) {
         operatorTenantKey: payload.operator_tenant_key || null,
       },
       botTenantKey,
-      botOpenId,
     });
     if (result.handled) scheduleStatus();
   } catch (err) {

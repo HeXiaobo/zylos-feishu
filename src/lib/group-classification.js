@@ -276,7 +276,7 @@ function describeFailure(result) {
   return { at: Date.now(), reason: 'refresh_failed', code: Number.isFinite(Number(result?.code)) ? Number(result.code) : null, scopes: [], detail };
 }
 
-export function createGroupClassifier({ getChatInfo, listChatMembers = null, saveConfig, now = Date.now, timeoutMs = 5000, log = () => {} }) {
+export function createGroupClassifier({ getChatInfo, listChatMembers = null, getBotOpenId = null, saveConfig, now = Date.now, timeoutMs = 5000, log = () => {} }) {
   const pending = new Map();  // chatId -> { epoch, work }
   const pendingMembers = new Map(); // chatId -> { epoch, work }
   const epochs = new Map();   // chatId -> number; survives config reloads
@@ -478,7 +478,21 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
     return true;
   };
 
-  const classify = async ({ config, chatId, senderTenantKey, botTenantKey, botOpenId = null }) => {
+  /**
+   * Ids that are this app's own robot, so the roster can skip it even when Feishu
+   * returns it without `member_id_type: app`. Read lazily through `getBotOpenId`
+   * because the value only exists after startup.
+   */
+  const botIdentity = (config, botOpenId = null) => {
+    let lazy = null;
+    if (!botOpenId && typeof getBotOpenId === 'function') {
+      try { lazy = getBotOpenId(); } catch { lazy = null; }
+    }
+    return new Set([botOpenId, lazy, config?.bot?.open_id, config?.bot_open_id]
+      .filter(id => typeof id === 'string' && id));
+  };
+
+  const classify = async ({ config, chatId, senderTenantKey, botTenantKey }) => {
     syncConfig(config);
     const group = config.groups?.[chatId];
     if (!group) return false;
@@ -486,7 +500,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
     const at = now();
     const tenants = internalTenantKeys(config, botTenantKey);
     const people = internalMemberIds(config);
-    const botIds = new Set([botOpenId, config?.bot?.open_id, config?.bot_open_id].filter(id => typeof id === 'string' && id));
+    const botIds = botIdentity(config);
     // Issue #177: with a person list configured, the verdict comes from the
     // roster — the tenant flag alone would mark our own group external. With an
     // empty list this stays null and the pre-#177 path below runs untouched.
@@ -571,7 +585,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
    *
    * @returns {Promise<{chatId: string, handled: boolean, internal: boolean, rejudged: boolean}>}
    */
-  classify.handleMemberEvent = async ({ config, chatId, event = {}, botTenantKey, botOpenId = null }) => {
+  classify.handleMemberEvent = async ({ config, chatId, event = {}, botTenantKey }) => {
     syncConfig(config);
     const group = chatId ? config.groups?.[chatId] : null;
     if (!group) return { chatId, handled: false, internal: false, rejudged: false };
@@ -579,7 +593,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, sav
     const at = now();
     const tenants = internalTenantKeys(config, botTenantKey);
     const people = internalMemberIds(config);
-    const botIds = new Set([botOpenId, config?.bot?.open_id, config?.bot_open_id].filter(id => typeof id === 'string' && id));
+    const botIds = botIdentity(config);
     // Issue #177: with a person list configured the roster decides, so an event
     // naming an outside tenant is only a hint — the person may be named. Without
     // a list, the pre-#177 tenant rule applies unchanged.

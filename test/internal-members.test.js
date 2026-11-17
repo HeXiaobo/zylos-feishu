@@ -134,9 +134,10 @@ test('#177 the bot itself is skipped even when only its id identifies it', async
       { memberId: 'ou_a', tenantKey: 'own' },
       { memberId: 'ou_selfbot', tenantKey: 'app_tenant' },   // no memberType at all
     ] }),
+    getBotOpenId: () => 'ou_selfbot',
     saveConfig() {}, now: () => 1_000_000,
   });
-  await classify({ config: cfg, chatId: 'oc_1', senderTenantKey: 'own', botTenantKey: 'own', botOpenId: 'ou_selfbot' });
+  await classify({ config: cfg, chatId: 'oc_1', senderTenantKey: 'own', botTenantKey: 'own' });
   assert.equal(groupGatePolicy(cfg, 'oc_1').internal, true, 'the bot knows its own open_id');
 });
 
