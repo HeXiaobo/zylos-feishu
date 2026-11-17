@@ -29,6 +29,9 @@
  *     and the member list is never queried (this is the #177 no-regression rule).
  * The list is part of `configFingerprint()`, so editing it voids every verdict.
  *
+ * R4 adds `forgetChat`: when this bot is removed from a group its config is
+ * deleted, and a lookup that is still in flight must not write a verdict back.
+ *
  * Ordering matters. A member event must take effect *before* it awaits anything,
  * and any classification that was already in flight must not write its older
  * answer afterwards. Both are handled by a per-chat epoch: the event bumps the
@@ -657,6 +660,28 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, get
 
   /** Called from the config watcher so a hot reload invalidates immediately. */
   classify.syncConfig = syncConfig;
+
+  /**
+   * Forget everything cached about one chat: its in-flight lookup and its epoch.
+   *
+   * Used when this bot is removed from the group (R4 机器人被移出群): a lookup
+   * that is still waiting on `im.chat.get` must not write a verdict for a group
+   * whose config was just deleted. Other chats are untouched — this is per-chat
+   * state, not a table to clear.
+   *
+   * The epoch is bumped, not deleted: a lookup already in flight holds the old
+   * number, and the `epochOf() !== epoch` check after its `await` is what stops
+   * it. Deleting the counter would let the next use restart from 0 and match a
+   * stale holder.
+   *
+   * @returns {boolean} true when there was per-chat state to drop.
+   */
+  classify.forgetChat = (chatId) => {
+    const hadPending = pending.delete(chatId);
+    const hadEpoch = epochs.has(chatId);
+    epochs.set(chatId, epochOf(chatId) + 1);
+    return Boolean(hadPending || hadEpoch);
+  };
 
   return classify;
 }
