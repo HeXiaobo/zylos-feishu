@@ -283,6 +283,10 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, get
   const pending = new Map();  // chatId -> { epoch, work }
   const pendingMembers = new Map(); // chatId -> { epoch, work }
   const epochs = new Map();   // chatId -> number; survives config reloads
+  // Chats this classifier has judged at least once. `epochs` alone cannot answer
+  // that: a cached verdict is returned without bumping the epoch, so forgetChat
+  // would report "nothing to drop" for the most common case.
+  const known = new Set();
   // Fingerprint of the settings that decide what "internal" means. A change
   // invalidates every group's cached verdict, because a verdict recorded under
   // the old tenant list is evidence about a different question.
@@ -499,6 +503,7 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, get
     syncConfig(config);
     const group = config.groups?.[chatId];
     if (!group) return false;
+    known.add(chatId);
     group.chatId = chatId;
     const at = now();
     const tenants = internalTenantKeys(config, botTenantKey);
@@ -678,9 +683,16 @@ export function createGroupClassifier({ getChatInfo, listChatMembers = null, get
    */
   classify.forgetChat = (chatId) => {
     const hadPending = pending.delete(chatId);
+    const hadMembers = pendingMembers.delete(chatId);
+    // Bump the epoch even when nothing was pending: a lookup started before the
+    // bot was removed must not install a verdict afterwards, and `epochs` is how
+    // every writer knows it is stale. The return value answers "did this chat
+    // have state to drop", which is what a caller logs — an epoch bump alone is
+    // bookkeeping, not evidence that the group was known here.
     const hadEpoch = epochs.has(chatId);
+    const wasKnown = known.delete(chatId);
     epochs.set(chatId, epochOf(chatId) + 1);
-    return Boolean(hadPending || hadEpoch);
+    return Boolean(hadPending || hadMembers || hadEpoch || wasKnown);
   };
 
   return classify;
