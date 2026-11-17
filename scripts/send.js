@@ -486,6 +486,16 @@ async function send() {
     console.log('Message sent successfully');
     process.exit(0);
   } catch (err) {
+    // 每一次 attempt 怎么被拒的，逐条写一行到 stderr（PM2 的 error.log）。
+    // 只打最后一条（err.message）等于把前几次飞书说的话丢掉：生产上 661/663
+    // 两张卡失败后，日志里只剩 `ERR_CARD_SEND: 2300xx …`，看不出是结构问题。
+    // 只记 via/code/message——不记卡片内容，也不记任何 token。
+    if (isCardMessage && Array.isArray(err?.failures) && err.failures.length > 0) {
+      err.failures.forEach((failure, index) => {
+        console.error(`[feishu] card attempt ${index + 1}/${err.failures.length} via=${failure.via ?? '-'} `
+          + `code=${failure.code ?? '-'} message=${String(failure.message ?? '').slice(0, 300)}`);
+      });
+    }
     console.error(`Error: ${err.message}`);
     process.exit(1);
   }
