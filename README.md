@@ -81,6 +81,40 @@ Outbound text is sent as an interactive card when it contains markdown, provided
 **every** message as a card, including plain text (default: `false`, i.e. only
 markdown-bearing messages become cards).
 
+## WebSocket Card Submissions
+
+WebSocket card actions can be forwarded to an authenticated local receiver. This
+is disabled by default. Subscribe the application to `card.action.trigger` and
+set `card_actions` in the runtime config:
+
+```json
+{
+  "card_actions": {
+    "enabled": true,
+    "endpoint": "http://127.0.0.1:3379/callback",
+    "bearer_key_file": "/absolute/path/to/receiver.key",
+    "message_ids": ["om_example"],
+    "chat_ids": ["oc_example"],
+    "operator_ids": ["ou_example"],
+    "timeout_ms": 2000
+  }
+}
+```
+
+All three ID lists are required. Events must match the current application and
+one entry in each list. Other card actions are ignored. The endpoint must use
+HTTP with the numeric loopback address `127.0.0.1` or `[::1]`; redirects are
+rejected. Store the bearer key in a private file, outside the repository.
+
+The receiver gets a v2 envelope with `header.app_id`, `header.event_type`, and
+`event.action`, `event.operator.open_id`, `event.context`. Only action values,
+form values and the matched identifiers are forwarded; SDK tokens are omitted.
+It must return a JSON `toast` with `type` and `content` within two seconds.
+Only the toast is sent back to Feishu. Receiver errors return an unknown-result
+notice; the bridge does not retry submissions. The receiver owns business
+validation and duplicate handling. This setting does not enable HTTP webhook
+card actions.
+
 ## Documentation
 
 - [SKILL.md](./SKILL.md) — Component specification

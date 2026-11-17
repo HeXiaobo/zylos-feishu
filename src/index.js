@@ -34,6 +34,7 @@ import { getUserInfo } from './lib/contact.js';
 import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
+import { createCardActionHandler } from './lib/card-action.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 // 3ai-dedupe: one claim per message id, shared with the feishu-recovery poller.
 import { loadClaimStore } from './lib/dedupe-claim-loader.js';
@@ -1386,6 +1387,11 @@ function startWebSocket(creds) {
 
   wsClient.start({
     eventDispatcher: new Lark.EventDispatcher({ logger: createRedactingLogger() }).register({
+      'card.action.trigger': createCardActionHandler({
+        appId: creds.app_id,
+        getSettings: () => config.card_actions,
+        logger: createRedactingLogger()
+      }),
       'im.message.receive_v1': async (data) => {
         try {
           await handleMessage(data);
