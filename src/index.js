@@ -59,6 +59,10 @@ let botAppId = '';
 let botTenantKey = '';
 const classifyGroup = createGroupClassifier({
   getChatInfo,
+  // Issue #177: recognising colleagues by person needs the group roster. The
+  // real call is `listChatMembers` (already used to preload sender names) with
+  // `open_id`, the one identity a personal Feishu account also has.
+  listChatMembers: (chatId, memberIdType = 'open_id') => listChatMembers(chatId, memberIdType),
   // Every verdict the classifier persists is also the reason status.json exists.
   saveConfig: nextConfig => { const saved = saveConfig(nextConfig); scheduleStatus(); return saved; },
   log: message => console.log(`[feishu] ${message}`),

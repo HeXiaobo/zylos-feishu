@@ -119,6 +119,40 @@ from bot info or the authenticated tenant query and caches it as `bot.tenant_key
 If identity lookup is unavailable, an unknown sender tenant is treated as external.
 To add known internal tenants, configure `internalTenants: ["own_key", "other_key"]`.
 
+### Recognising colleagues by person (issue #177, `internalMembers`)
+
+The tenant rule alone cannot describe us: the bots live under 知外文化's tenant, and
+some colleagues use personal Feishu accounts, each of which is its own tenant. Such
+a group is external in Feishu and would stay external here, so unmentioned work in
+our own group would never be answered.
+
+`internalMembers` adds the missing half of the rule — a list of **people**:
+
+```json
+"internalMembers": ["ou_xxx", "ou_yyy"]
+```
+
+- Use the Feishu `open_id` (`ou_…`). It is the same stable identity for company
+  accounts and for personal accounts; `user_id` is not accepted, because a person
+  from another tenant does not have one in ours.
+- **Non-empty list → the roster decides.** Every *human* member of the group must be
+  either in an `internalTenants` tenant or named here. One unnamed human makes the
+  group external, and an @mention is again the only way in.
+- **Robot members do not take part.** A bot in the group (`cli_…` app id, or a
+  roster row marked as a bot) is skipped, so the bot itself never makes a group
+  external.
+- **Empty or absent list → nothing changes.** The verdict is `chat.external` alone,
+  exactly the pre-#177 behaviour, and the member list is never queried.
+- **No guesswork.** A failed, denied (missing `im:chat.members:readonly`), timed-out
+  or empty roster leaves the group external and records why (`refresh_failed`,
+  `permission_denied`, `members_empty`).
+- Editing the list voids **every** cached verdict (it is part of the config
+  fingerprint), so the next message re-judges the group; no restart, no manual
+  cache clear. `status.json` shows `internalMembers` and the roster counts.
+
+This is not a whitelist bypass: a named person only adds one human to the inside
+side of the same rule, and the group still needs *all* of its humans to be inside.
+
 Manual `groups[chat_id].internal` and `gateMode` settings take precedence over
 automatic evidence. Leave `internal` absent to enable automatic classification;
 remove it to return to automatic classification. `gateMode` supports `off`,
@@ -138,7 +172,7 @@ A cached verdict is not final. Three things void it and re-judge the group:
    voids the cache (`internal: false, retry: true`) until `im.chat.get` answers.
    A lookup that says `external: false` cannot cancel a newer outside-join event.
    Without the subscription nothing breaks; the group stays on the 24h cache.
-2. **`internalTenants` or `bot.tenant_key` changed.** The next message (and the
+2. **`internalTenants`, `internalMembers` or `bot.tenant_key` changed.** The next message (and the
    config watcher, on a hot reload) voids **every** group's verdict — not only
    the "external sender" evidence — and judges the group by the new list. No
    restart and no manual cache clear.

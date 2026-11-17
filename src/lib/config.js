@@ -54,6 +54,13 @@ export const DEFAULT_CONFIG = {
   groups: {},
   // Optional internal tenant allowlist. When absent, use bot.tenant_key only.
   // internalTenants: ['tenant_key'],
+  // Optional internal person list (issue #177). Feishu open_id values — the
+  // identity that also exists for colleagues on personal Feishu accounts, which
+  // is why a tenant list alone cannot mark our own group internal.
+  // Empty or absent: nothing changes, the verdict is chat.external alone.
+  // Non-empty: EVERY human member of a group must be in internalTenants or named
+  // here, otherwise the group is external. Robot members do not take part.
+  // internalMembers: ['ou_xxx'],
   // Legacy fields (kept for backward compatibility, migrated to groups on upgrade)
   // group_whitelist: { enabled: true },
   // allowed_groups: [],
