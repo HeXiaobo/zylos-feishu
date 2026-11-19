@@ -108,7 +108,7 @@ test('sendToC4 is the fire-and-forget wrapper over the same implementation', () 
 test('all current DM/group dispatch sites use captured ingress metadata', () => {
   const source = fs.readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
   const handler = source.slice(source.indexOf('async function handleMessage(data)'));
-  assert.equal((handler.match(/deliverToC4\('feishu'/g) || []).length, 11);
+  assert.equal((handler.match(/deliverToC4\('feishu'/g) || []).length, 10);
   assert.equal((handler.match(/sendToC4\('feishu'/g) || []).length, 0);
   assert.match(handler, /sourceId: messageId, chatId, senderId: senderOpenId/);
 });

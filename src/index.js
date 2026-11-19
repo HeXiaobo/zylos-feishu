@@ -236,7 +236,8 @@ function loadCursors() {
 function saveCursors(cursors) {
   const tmpPath = CURSORS_PATH + '.tmp';
   try {
-    fs.writeFileSync(tmpPath, JSON.stringify(cursors, null, 2));
+    fs.writeFileSync(tmpPath, JSON.stringify(cursors, null, 2), { mode: 0o600 });
+    fs.chmodSync(tmpPath, 0o600);
     fs.renameSync(tmpPath, CURSORS_PATH);
     return true;
   } catch (err) {
@@ -437,7 +438,8 @@ function persistUserCache() {
   }
   const tmpPath = USER_CACHE_PATH + '.tmp';
   try {
-    fs.writeFileSync(tmpPath, JSON.stringify(obj, null, 2));
+    fs.writeFileSync(tmpPath, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    fs.chmodSync(tmpPath, 0o600);
     fs.renameSync(tmpPath, USER_CACHE_PATH);
   } catch (err) {
     console.log(`[feishu] Failed to persist user cache: ${err.message}`);
@@ -693,7 +695,8 @@ async function logMessage(chatType, chatId, userId, openId, text, messageId, tim
     return;
   }
   try {
-    fs.appendFileSync(logFile, logLine);
+    fs.appendFileSync(logFile, logLine, { mode: 0o600 });
+    fs.chmodSync(logFile, 0o600);
   } catch (err) {
     console.error(`[feishu] Failed to write log: ${err.message}`);
   }
@@ -1400,13 +1403,11 @@ async function handleMessage(data) {
         console.log(`[feishu] Group message without @mention, logged only`);
         return;
       }
-    } else if (!mentioned && !smart) {
-      // Preserve mention-only context without producing replies or media side
-      // effects. Smart groups take the same path regardless of membership.
+    } else if (!mentioned && (!smart || groupGatePolicy(config, chatId).gateMode === 'off')) {
+      // Keep explicit mention-only context in the channel log. Do not send it
+      // to an older Core that might have its gate disabled and reply directly.
+      // Smart groups otherwise use the same path regardless of membership.
       await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
-      const senderName = await resolveUserName(senderUserId, senderOpenId);
-      const msg = formatMessage('group', senderName, resolveMentions(logText, mentions) || '[media]', [], null, { groupName: getGroupName(chatId), smartHint: true });
-      deliverToC4('feishu', endpoint, msg, null);
       return;
     }
 

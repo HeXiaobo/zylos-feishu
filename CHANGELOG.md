@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Enforce explicit mention-only settings before C4 delivery, including when an
+  older Core has no gate enabled. Context stays in the channel log.
+- Keep configuration, message logs, cursors and user-name caches owner-only.
+
 ### Changed
 - Group identity is informational. Internal, external and unclassified smart
   groups use the same contextual relevance judgement; explicit mention-only

@@ -145,7 +145,8 @@ export function getConfig() {
 export function saveConfig(newConfig) {
   const tmpPath = CONFIG_PATH + '.tmp';
   try {
-    fs.writeFileSync(tmpPath, JSON.stringify(newConfig, null, 2));
+    fs.writeFileSync(tmpPath, JSON.stringify(newConfig, null, 2), { mode: 0o600 });
+    fs.chmodSync(tmpPath, 0o600);
     fs.renameSync(tmpPath, CONFIG_PATH);
     config = newConfig;
     return true;

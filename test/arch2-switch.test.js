@@ -50,6 +50,7 @@ function sliceHandler(source) {
 function createHarness({ source, arch2, config, quoted = null, classifier = null }) {
   const calls = [];
   const replies = [];
+  const logs = [];
   const context = {
     config, arch2, ARCH2: arch2,
     botOpenId: 'ou_bot', botAppId: 'app_bot', botTenantKey: 'own_tenant',
@@ -73,7 +74,7 @@ function createHarness({ source, arch2, config, quoted = null, classifier = null
       cfg.groups[chatId] = { ...cfg.groups[chatId], internal: false };
       return false;
     }),
-    logMessage: async () => {},
+    logMessage: async (...args) => { logs.push(args); },
     resolveUserName: async () => '用户',
     resolveMentions: text => text,
     resolveMergeForwardText: async () => '合并转发',
@@ -104,7 +105,7 @@ function createHarness({ source, arch2, config, quoted = null, classifier = null
     .join('\n');
   vm.runInContext(`${policy}\n${sliceHandler(source)}`, context);
   return {
-    calls, replies, config,
+    calls, replies, logs, config,
     run: message => context.handleMessage(message),
   };
 }
@@ -167,6 +168,18 @@ test('external smart groups keep the same contextual delivery as internal groups
   assert.deepEqual(views[0], views[1]);
   assert.equal(c4.groupGatePolicy({ groups: { oc_1: { internal: false } } }, 'oc_1').gateMode, 'auto');
   assert.equal(c4.groupGatePolicy({ groups: { oc_1: { internal: false, mode: 'mention', gateMode: 'observe' } } }, 'oc_1').gateMode, 'off');
+});
+
+test('explicit mention-only context never reaches even an older Core without gate enforcement', async () => {
+  for (const group of [{ mode: 'mention' }, { requireMention: true }, { mode: 'smart', gateMode: 'off' }, { mode: 'mention', requireMention: false }]) {
+    const h = createHarness({ source: currentSource, arch2: true, config: { groups: { oc_1: group } }, classifier: async () => false });
+    await h.run(groupMessage());
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.logs.length, 1, 'context remains recorded in the channel');
+    assert.deepEqual(h.replies, []);
+    await h.run(groupMessage({ mentioned: true }));
+    assert.equal(h.calls.length, 1, 'a real mention still reaches the Core');
+  }
 });
 
 const POLICY_CASES = [
