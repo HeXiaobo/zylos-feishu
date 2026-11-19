@@ -126,10 +126,10 @@ test('explicit mention mode and legacy allowed lists take precedence', () => {
   assert.equal(smartGroup({ allowed_groups: [{ chat_id: 'oc_1' }] }, 'oc_1'), false);
   assert.equal(smartGroup({ smart_groups: [{ chat_id: 'oc_1' }] }, 'oc_1'), true);
 });
-test('external defaults observe, explicit internal defaults auto', () => {
-  assert.deepEqual(groupGatePolicy({}, 'oc_1'), { internal: false, gateMode: 'observe' });
+test('unknown, internal and external groups default to contextual model judgement', () => {
+  assert.deepEqual(groupGatePolicy({}, 'oc_1'), { internal: false, gateMode: 'auto' });
   assert.equal(groupGatePolicy({ groups: { oc_1: { internal: true } } }, 'oc_1').gateMode, 'auto');
-  assert.equal(groupGatePolicy({ groups: { oc_1: { gateMode: 'auto' } } }, 'oc_1').gateMode, 'observe');
+  assert.equal(groupGatePolicy({ groups: { oc_1: { internal: false, gateMode: 'auto' } } }, 'oc_1').gateMode, 'auto');
 });
 test('explicit off/observe and requireMention honored', () => {
   for (const gateMode of ['off', 'observe']) assert.equal(groupGatePolicy({ groups: { oc_1: { internal: true, gateMode } } }, 'oc_1').gateMode, gateMode);
@@ -155,17 +155,18 @@ test('actual handler retains external unmentioned message without replies or typ
     saveConfig: () => true, isSenderAllowedInGroup: () => true, groupGatePolicy,
     logMessage: async () => {}, resolveUserName: async () => '用户', resolveMentions: text => text,
     getGroupName: () => '新群', formatMessage: (_type, _name, text) => text,
+    preloadGroupMembers: async () => [], getGroupContext: async () => [], updateCursor: () => {},
     addTypingIndicator: () => replies.push('typing'), replyToMessage: () => { replies.push('reply'); return Promise.resolve(); },
   };
   vm.createContext(context);
   vm.runInContext(source.slice(start, end), context);
   await context.handleMessage({ message: { chat_type: 'group', chat_id: 'oc_new', message_id: 'om_new', mentions: [] }, sender: { sender_id: { open_id: 'ou_person' } } });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0][3], null, 'no rejection reply callback for external unmentioned');
+  assert.equal(typeof calls[0][3], 'function', 'external groups keep normal C4 delivery');
   assert.equal(calls[0][4].needsGate, true);
   assert.equal(calls[0][4].mentioned, false);
   assert.equal(context.config.groups.oc_new.mode, 'smart');
-  assert.equal(groupGatePolicy(context.config, 'oc_new').gateMode, 'observe');
+  assert.equal(groupGatePolicy(context.config, 'oc_new').gateMode, 'auto');
   context.config.groups.oc_new.internal = true;
   assert.equal(groupGatePolicy(context.config, 'oc_new').gateMode, 'auto');
   assert.deepEqual(replies, []);

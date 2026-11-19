@@ -20,29 +20,29 @@ test('internal group automatically uses auto from chat external=false and persis
   assert.equal(f.config.groups.oc_1.autoClassification.source, 'chat_info');
   assert.ok(f.saves() > 0);
 });
-test('external group automatically uses observe from chat external=true', async () => {
+test('external identity still uses contextual model judgement', async () => {
   const f = fixture({ external: true }); await f.run();
-  assert.deepEqual(f.policy(), { internal: false, gateMode: 'observe' });
+  assert.deepEqual(f.policy(), { internal: false, gateMode: 'auto' });
 });
-test('external sender immediately downgrades cached internal group to observe', async () => {
+test('external sender updates identity while preserving model judgement', async () => {
   const f = fixture(); await f.run(); await f.run('other_tenant');
-  assert.deepEqual(f.policy(), { internal: false, gateMode: 'observe' });
+  assert.deepEqual(f.policy(), { internal: false, gateMode: 'auto' });
   assert.equal(f.config.groups.oc_1.autoClassification.source, 'external_sender');
   assert.equal(f.calls(), 1, 'fresh cache does not delay sender fallback with a query');
-  await f.run(); assert.equal(f.policy().gateMode, 'observe');
+  await f.run(); assert.equal(f.policy().gateMode, 'auto');
 });
 test('query failure without cache stays external and retries on next message', async () => {
   const f = fixture({ result: { success: false } }); await f.run();
-  assert.equal(f.policy().gateMode, 'observe'); assert.equal(f.calls(), 1);
+  assert.equal(f.policy().gateMode, 'auto'); assert.equal(f.calls(), 1);
   f.response({ success: true, chat: { external: false } }); await f.run();
   assert.equal(f.calls(), 2); assert.equal(f.policy().gateMode, 'auto');
 });
 test('successful cache refreshes after 24 hours; a failed refresh degrades instead of trusting the cache', async () => {
   // Card F / R1 item 9 changed this expectation: an expired cache whose refresh
-  // fails must degrade to observe, so stale evidence cannot keep a group open.
+  // fails must invalidate identity; relevance judgement remains enabled.
   const f = fixture(); await f.run(); await f.run(); assert.equal(f.calls(), 1);
   f.advance(GROUP_CLASSIFICATION_TTL_MS); f.response({ success: false }); await f.run();
-  assert.equal(f.calls(), 2); assert.equal(f.policy().gateMode, 'observe');
+  assert.equal(f.calls(), 2); assert.equal(f.policy().gateMode, 'auto');
   f.response({ success: true, chat: { external: false } }); await f.run();
   assert.equal(f.calls(), 3); assert.equal(f.policy().gateMode, 'auto', 'a successful refresh restores auto');
 });
@@ -55,18 +55,18 @@ test('manual internal and gateMode can only make a group more conservative', asy
   await f.run('outside'); assert.equal(f.calls(), 1);
   assert.deepEqual(f.policy(), { internal: false, gateMode: 'off' });
   const manualExternal = fixture({ group: { internal: false } }); await manualExternal.run();
-  assert.equal(manualExternal.calls(), 1, 'a manual false still refreshes, it just never opens the group'); assert.equal(manualExternal.policy().gateMode, 'observe');
+  assert.equal(manualExternal.calls(), 1, 'a manual false still refreshes, it just never opens the group'); assert.equal(manualExternal.policy().gateMode, 'auto');
   const observe = fixture({ group: { gateMode: 'observe' } }); await observe.run();
   assert.deepEqual(observe.policy(), { internal: true, gateMode: 'observe' });
 });
 test('internalTenants defaults to own tenant and explicit list can include partner tenants', async () => {
   const f = fixture(); f.config.internalTenants = ['our_tenant', 'partner'];
   await f.run('partner'); assert.equal(f.policy().gateMode, 'auto');
-  await f.run('unknown'); assert.equal(f.policy().gateMode, 'observe');
+  await f.run('unknown'); assert.equal(f.policy().gateMode, 'auto');
 });
 test('missing external field is a failed classification rather than assuming internal', async () => {
   const f = fixture({ result: { success: true, chat: {} } }); await f.run();
-  assert.equal(f.policy().gateMode, 'observe'); assert.equal(f.config.groups.oc_1.autoClassification.retry, true);
+  assert.equal(f.policy().gateMode, 'auto'); assert.equal(f.config.groups.oc_1.autoClassification.retry, true);
 });
 test('external sender evidence wins over concurrent optimistic chat lookup', async () => {
   const config = { bot: { tenant_key: 'own' }, groups: { oc_1: {} } };
@@ -75,9 +75,9 @@ test('external sender evidence wins over concurrent optimistic chat lookup', asy
   const classify = createGroupClassifier({ getChatInfo: () => result, saveConfig() {} });
   const first = classify({ config, chatId: 'oc_1', senderTenantKey: 'own' });
   const external = classify({ config, chatId: 'oc_1', senderTenantKey: 'outside' });
-  assert.equal(groupGatePolicy(config, 'oc_1').gateMode, 'observe');
+  assert.equal(groupGatePolicy(config, 'oc_1').gateMode, 'auto');
   finish({ success: true, chat: { external: false } }); await Promise.all([first, external]);
-  assert.equal(groupGatePolicy(config, 'oc_1').gateMode, 'observe');
+  assert.equal(groupGatePolicy(config, 'oc_1').gateMode, 'auto');
 });
 test('chat adapter uses existing client im.chat.get and preserves external boolean', async () => {
   const source = fs.readFileSync(new URL('../src/lib/chat.js', import.meta.url), 'utf8').replace(/^import .*;$/gm, '').replace(/^export /gm, '');

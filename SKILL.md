@@ -431,8 +431,11 @@ Groups are stored in a map keyed by `chat_id`:
 - `internal`: Optional manual claim, arch2 only. Caution is free: `false` always wins;
   a `true` is re-verified and demoted by outside evidence (an outside member, a
   sender tenant outside `internalTenants`, a failed lookup).
-- `gateMode`: `off` | `observe` | `auto`. `auto` is only possible while the group
-  is internal; a stricter value always survives.
+- `gateMode`: `off` | `observe` | `auto`. In arch2, internal, external and
+  unclassified groups all default to `auto`. The model judges relevance from
+  context, including same-name humans and whether an unanswered employee request
+  needs help. Explicit mention-only settings override `observe`.
+  Classification runs in the background and never delays message intake.
 - Arch2 top-level `internalMembers` (`open_id` list, issue #177): names colleagues
   whose Feishu account sits in another tenant (personal accounts). Non-empty → every
   human member of a group must be in `internalTenants` or named here; robots are
@@ -448,11 +451,11 @@ Groups are stored in a map keyed by `chat_id`:
 
 | What happened | Effect on the group | Effect on an unmentioned message |
 |---|---|---|
-| outside tenant joined (`im.chat.member.user.added_v1`) | external at once, synchronous; a later `chat.external=false` cannot cancel it | logged as context only |
-| any other join / a departure (`...deleted_v1`, `...withdrawn_v1`) | cache void (`retry: true`), then `im.chat.get` decides | not delivered until the lookup succeeds |
-| `internalTenants` / `internalMembers` / `bot.tenant_key` changed | every group voided, next message judged by the new list | decided by the new list |
-| `internalMembers` names a colleague | with a non-empty list the roster decides: every human member in `internalTenants` or named, robots skipped; one unnamed human → external; empty list → `chat.external` alone | internal only when every human is inside |
-| lookup failed | external; reason `permission_denied` or `refresh_failed` | logged as context only |
+| outside tenant joined (`im.chat.member.user.added_v1`) | external at once; later lookup cannot erase the evidence | model judges relevance; no wait |
+| any other join / a departure (`...deleted_v1`, `...withdrawn_v1`) | cache void (`retry: true`), then `im.chat.get` decides | model judges relevance; no wait |
+| `internalTenants` / `internalMembers` / `bot.tenant_key` changed | every group cache voided | model judges relevance; no wait |
+| `internalMembers` names a colleague | roster updates the group identity record | model judges relevance; no wait |
+| lookup failed | unknown/degraded identity with the failure recorded | model judges relevance; no wait |
 
 Subscribe 消息与群组 → 用户进群 / 用户出群 / 撤销拉用户进群 for the three
 membership events. Without the subscription the 24h cache still applies.

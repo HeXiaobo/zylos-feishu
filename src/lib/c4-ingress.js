@@ -52,9 +52,8 @@ export function legacySmartGroup(config = {}, chatId) {
 export function groupGatePolicy(config, chatId) {
   const group = config.groups?.[chatId] || {};
   const internal = effectiveInternal(group);
-  let gateMode = group.gateMode || (internal ? 'auto' : 'observe');
-  if (!['off', 'observe', 'auto'].includes(gateMode)) gateMode = 'observe';
-  if (!internal && gateMode === 'auto') gateMode = 'observe';
+  let gateMode = group.gateMode || 'auto';
+  if (!['off', 'observe', 'auto'].includes(gateMode)) gateMode = 'off';
   if (group.mode === 'mention' || group.requireMention === true) gateMode = 'off';
   return { internal, gateMode };
 }

@@ -47,7 +47,7 @@ function sliceHandler(source) {
 
 // Run the real handleMessage with the real policy helpers. arch2 is injected
 // exactly like the component does, so the same source runs both paths.
-function createHarness({ source, arch2, config, quoted = null }) {
+function createHarness({ source, arch2, config, quoted = null, classifier = null }) {
   const calls = [];
   const replies = [];
   const context = {
@@ -69,10 +69,10 @@ function createHarness({ source, arch2, config, quoted = null }) {
     isOwner: () => false,
     isSenderAllowedInGroup: () => true,
     saveConfig: () => true,
-    classifyGroup: async ({ config: cfg, chatId }) => {
+    classifyGroup: classifier || (async ({ config: cfg, chatId }) => {
       cfg.groups[chatId] = { ...cfg.groups[chatId], internal: false };
       return false;
-    },
+    }),
     logMessage: async () => {},
     resolveUserName: async () => '用户',
     resolveMentions: text => text,
@@ -138,6 +138,37 @@ function observable(harness) {
 // ---------------------------------------------------------------------------
 // 1. Group allowance / smart mode / legacy allowlist.
 // ---------------------------------------------------------------------------
+test('#178: a hung group classifier cannot delay C4 delivery', async () => {
+  const h = createHarness({ source: currentSource, arch2: true, config: {},
+    classifier: async () => new Promise(() => {}) });
+  let timer;
+  try {
+    await Promise.race([h.run(groupMessage()), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Error('intake waited for classification')), 200);
+    })]);
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls[0][4].needsGate, true);
+    assert.equal(h.calls[0][4].mentioned, false);
+    assert.deepEqual(h.replies, []);
+  } finally { clearTimeout(timer); }
+});
+
+test('external smart groups keep the same contextual delivery as internal groups', async () => {
+  const views = [];
+  for (const internal of [true, false]) {
+    const config = { groups: { oc_1: { mode: 'smart', internal } } };
+    const h = createHarness({ source: currentSource, arch2: true, config,
+      classifier: async () => internal });
+    await h.run(groupMessage());
+    assert.equal(h.calls.length, 1);
+    assert.deepEqual(h.replies, []);
+    views.push(JSON.parse(JSON.stringify(h.calls.map(args => args.map(v => typeof v === 'function' ? 'fn' : v)))));
+  }
+  assert.deepEqual(views[0], views[1]);
+  assert.equal(c4.groupGatePolicy({ groups: { oc_1: { internal: false } } }, 'oc_1').gateMode, 'auto');
+  assert.equal(c4.groupGatePolicy({ groups: { oc_1: { internal: false, mode: 'mention', gateMode: 'observe' } } }, 'oc_1').gateMode, 'off');
+});
+
 const POLICY_CASES = [
   ['empty config', {}],
   ['open policy', { groupPolicy: 'open' }],
@@ -169,7 +200,7 @@ test('group allowance and smart mode equal baseline 8c0a3e2 with the switch off'
   }
 });
 
-test('arch2 policy keeps automatic group registration and conservative gate defaults', () => {
+test('arch2 policy keeps automatic group registration and group permissions', () => {
   assert.equal(c4.receivedGroupAllowed({}, 'oc_new', true), true);
   assert.equal(c4.smartGroup({}, 'oc_new', true), true);
   assert.equal(c4.receivedGroupAllowed({}, 'oc_new', false), false);
@@ -439,5 +470,5 @@ test('switch off performs no extra config writes at startup', () => {
   assert.match(source, /if \(ARCH2 && !config\.groups\?\.\[chatId\] && isGroupAllowed\(chatId\)\) \{/);
   // The two automatic ones (classification and tenant identity) are guarded.
   assert.match(source, /if \(ARCH2 && normalizeGroupEvidence\(config\)\) saveConfig\(config\);/);
-  assert.match(source, /if \(ARCH2 && botTenantKey && config\.bot\?\.tenant_key !== botTenantKey\)/);
+  assert.match(source, /if \(ARCH2 && \(\(botTenantKey/);
 });

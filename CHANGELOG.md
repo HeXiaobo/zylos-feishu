@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Group identity is informational. Internal, external and unclassified smart
+  groups use the same contextual relevance judgement; explicit mention-only
+  settings remain in force.
+- Run group classification in the background so slow lookups cannot hold intake
+  (#178). Preserve the full context path for external smart groups.
+- Ask the front desk to distinguish human namesakes and help with unanswered
+  employee requests when context warrants it; greetings to the bot are valid.
+
 ### Added
 - **A group's internal/external verdict is re-judged when something changes
   (issue #162).** Three triggers no longer wait for the 24h cache:

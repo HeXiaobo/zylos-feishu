@@ -49,11 +49,7 @@ function fixture({ chatId = 'oc_1', external = false, group = {}, tenants = ['ow
     member: (type, users) => classify.handleMemberEvent({ config, chatId, event: { type, users }, botTenantKey: 'own' }),
     policy: () => groupGatePolicy(config, chatId),
     group: () => config.groups[chatId],
-    // What the front desk actually does with an unmentioned message.
-    unmentionedDelivers: () => {
-      const { internal, gateMode } = groupGatePolicy(config, chatId);
-      return internal === true && gateMode === 'auto';
-    },
+    reportsInternal: () => groupGatePolicy(config, chatId).internal,
     mentionedDelivers: () => {
       // An @mention reaches the gate regardless of internal/external.
       groupGatePolicy(config, chatId);
@@ -79,26 +75,26 @@ test('an outside member joining voids the cached internal verdict before anythin
   const event = f.member('added', [outsideUser]);
   // Right here — synchronously, with the lookup still in flight — a message
   // arriving behind the event must already be treated as external.
-  assert.equal(f.unmentionedDelivers(), false, 'the verdict must change before the async re-judge finishes');
+  assert.equal(f.reportsInternal(), false, 'the verdict must change before the async re-judge finishes');
   assert.equal(f.policy().internal, false);
   assert.match(String(groupEvidence(f.group()).reason), /member_joined_external/);
 
   finish({ success: true, chat: { external: false } });
   await event;
   assert.equal(f.policy().internal, false, 'chat.external=false cannot cancel a newer outside-join event');
-  assert.equal(f.unmentionedDelivers(), false);
+  assert.equal(f.reportsInternal(), false);
 });
 
-test('a message right behind the outside join is not delivered, an @mention still is', async () => {
+test('identity behind an outside join remains external without disabling model judgement', async () => {
   const f = fixture({ external: false });
   await f.run();
   f.state.response = { success: true, chat: { external: false } };
   await f.member('added', [outsideUser]);
   // The next unmentioned message runs the classifier exactly like the handler does.
   await f.run('own');
-  assert.equal(f.unmentionedDelivers(), false, 'unmentioned work in a group with an outside member must not be delivered');
+  assert.equal(f.reportsInternal(), false, 'outside member evidence remains visible');
   assert.equal(f.mentionedDelivers(), true, 'an @mention is still answered in an external group');
-  assert.equal(f.policy().gateMode, 'observe');
+  assert.equal(f.policy().gateMode, 'auto');
 });
 
 test('an outside member joining a group the operator marked internal still demotes it', async () => {
@@ -125,7 +121,7 @@ test('an outside member leaving restores the internal verdict without a restart'
   assert.equal(result.handled, true);
   assert.equal(f.policy().internal, true, 'a successful re-judge after the departure restores auto');
   assert.equal(f.policy().gateMode, 'auto');
-  assert.equal(f.unmentionedDelivers(), true);
+  assert.equal(f.reportsInternal(), true);
 });
 
 test('an inside member joining leaves the group internal after the re-judge', async () => {
@@ -147,7 +143,7 @@ test('a member with no tenant_key is treated conservatively until the re-judge',
   const f = fixture({ external: false });
   await f.run();
   const event = f.member('added', [{ name: '未知', user_id: { open_id: 'ou_x' } }]);
-  assert.equal(f.unmentionedDelivers(), false, 'an unknown tenant is not inside evidence');
+  assert.equal(f.reportsInternal(), false, 'an unknown tenant is not inside evidence');
   assert.equal(groupEvidence(f.group()).reason, 'member_tenant_unknown', 'the reason is visible while the verdict is void');
   f.state.response = { success: true, chat: { external: false } };
   await event;
@@ -380,11 +376,11 @@ test('a second message after the invalidation re-judges under the new configurat
 function corePolicyFor() {
   const core = process.env.ARCH2_CORE_DIR;
   if (!core) return null;
-  const source = fs.readFileSync(`${core}/skills/comm-bridge/scripts/c4-gate.js`, 'utf8');
-  const start = source.indexOf('export function policyFor');
-  const end = source.indexOf('\n}\n', start) + 3;
+  const source = fs.readFileSync(`${core}/skills/comm-bridge/scripts/gate-policy.js`, 'utf8');
+  const start = source.indexOf('export function explicitMentionOnly');
+  const end = source.indexOf('\n}\n', source.indexOf('export function policyFor')) + 3;
   const ctx = vm.createContext({ env: {} });
-  vm.runInContext(`${source.slice(start, end).replace('export ', '')}\nthis.policyFor = policyFor;`, ctx);
+  vm.runInContext(`${source.slice(start, end).replaceAll('export ', '')}\nthis.policyFor = policyFor;`, ctx);
   return ctx.policyFor;
 }
 
@@ -400,15 +396,15 @@ test('a manual internal=true is conservative for the core gate for the whole asy
   const event = f.member('added', [insideUser]);   // any membership change voids
   assert.equal(f.group().internal, false, 'group.internal must be false while re-judging (core reads it first)');
   assert.equal(f.policy().internal, false);
-  assert.equal(f.policy().gateMode, 'observe');
+  assert.equal(f.policy().gateMode, 'auto');
   assert.equal(f.group().internalDemoted.reason, 'member_joined', 'the manual intent is kept for restore');
 
   const policy = corePolicyFor();
   if (policy) {
     const core = policy({ chat_id: 'oc_1', endpoint_id: 'oc_1|type=group', sender_id: 'ou_person', content: 'hi' },
       { groups: { oc_1: f.group() } }, {});
-    assert.equal(core.internal, false, 'core policyFor must agree with the component');
-    assert.equal(core.mode, 'observe', 'an unmentioned queued message must not be answered');
+    assert.equal(core.shadow, false, 'membership never enables shadow delivery');
+    assert.equal(core.mode, 'auto', 'queued messages still use model judgement');
   }
 
   f.state.pending = null;
@@ -430,8 +426,8 @@ test('a config change is conservative for the core gate and for effectiveInterna
   if (policy) {
     const core = policy({ chat_id: 'oc_1', endpoint_id: 'oc_1|type=group', sender_id: 'ou_person', content: 'x' },
       { groups: { oc_1: f.group() } }, {});
-    assert.equal(core.internal, false);
-    assert.equal(core.mode, 'observe');
+    assert.equal(core.shadow, false);
+    assert.equal(core.mode, 'auto');
   }
 });
 

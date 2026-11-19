@@ -1050,12 +1050,12 @@ function formatMessage(
 
   if (smartHint) {
     parts.push(`<smart-mode>
-Decide whether to respond. Do NOT reply if: the message is unrelated to you,
-just casual chat, or doesn't need your input. Only reply when:
-1) someone asks a question you can help with,
-2) discussing technical topics you know well,
-3) someone clearly needs assistance.
-When uncertain, prefer NOT to reply. Reply with exactly [SKIP] to stay silent.
+Use the context to decide whether the message addresses you or needs your help.
+Respond to greetings, jokes, questions and tasks addressed to you.
+A name can refer to a human with the same name; judge the intended recipient from context.
+If an employee appears busy and has not responded for some time, you may help when appropriate.
+Do not assume silence from a single message. Stay silent when no help is needed.
+Reply with exactly [SKIP] to stay silent.
 </smart-mode>\n\n`);
   }
 
@@ -1355,7 +1355,9 @@ async function handleMessage(data) {
     if (ARCH2 && isGroupAllowed(chatId)) {
       // A change of verdict is persisted through the wrapped saveConfig above,
       // which is what refreshes status.json; no save means nothing to report.
-      await classifyGroup({ config, chatId, senderTenantKey: sender.tenant_key, botTenantKey });
+      // Membership is diagnostic, never a prerequisite for durable intake.
+      Promise.resolve().then(() => classifyGroup({ config, chatId, senderTenantKey: sender.tenant_key, botTenantKey }))
+        .catch(() => console.warn('[feishu] Background group classification failed; intake continues'));
     }
     const allowedGroup = isGroupAllowed(chatId);
     const smart = isSmartGroup(chatId);
@@ -1398,18 +1400,14 @@ async function handleMessage(data) {
         console.log(`[feishu] Group message without @mention, logged only`);
         return;
       }
-    } else {
-      // Send every permitted message to durable gating, including observe/off
-      // messages, so filtered context remains available. Never emit rejection
-      // replies or typing indicators for unmentioned messages in external groups.
-      const gatePolicy = groupGatePolicy(config, chatId);
-      if (!mentioned && (!smart || !gatePolicy.internal || gatePolicy.gateMode !== 'auto')) {
-        await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
-        const senderName = await resolveUserName(senderUserId, senderOpenId);
-        const msg = formatMessage('group', senderName, resolveMentions(logText, mentions) || '[media]', [], null, { groupName: getGroupName(chatId), smartHint: true });
-        deliverToC4('feishu', endpoint, msg, null);
-        return;
-      }
+    } else if (!mentioned && !smart) {
+      // Preserve mention-only context without producing replies or media side
+      // effects. Smart groups take the same path regardless of membership.
+      await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
+      const senderName = await resolveUserName(senderUserId, senderOpenId);
+      const msg = formatMessage('group', senderName, resolveMentions(logText, mentions) || '[media]', [], null, { groupName: getGroupName(chatId), smartHint: true });
+      deliverToC4('feishu', endpoint, msg, null);
+      return;
     }
 
     // Group user access is controlled by groupPolicy + groups config + per-group allowFrom.
@@ -1418,7 +1416,13 @@ async function handleMessage(data) {
     await logMessage(chatType, chatId, senderUserId, senderOpenId, logText, messageId, data._timestamp || null, mentions, threadId);
 
     console.log(`[feishu] ${smart ? 'Smart group' : 'Bot @mentioned in'} group ${chatId}`);
-    await preloadGroupMembers(chatId);
+    if (ARCH2) {
+      // Member-name enrichment is not allowed to hold message intake.
+      Promise.resolve().then(() => preloadGroupMembers(chatId))
+        .catch(() => console.warn('[feishu] Background member preload failed; intake continues'));
+    } else {
+      await preloadGroupMembers(chatId);
+    }
     const contextMessages = await getGroupContext(chatId, messageId);
     updateCursor(chatId, messageId);
 
@@ -1445,6 +1449,7 @@ async function handleMessage(data) {
     const cleanLogText = resolveMentions(logText, mentions);
     const threadRootId = threadId ? rootId : null;
     const groupRejectReply = (errMsg) => {
+      if (!mentioned) return;
       removeTypingIndicator(messageId);
       sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
         .catch(e => console.error('[feishu] reject reply failed:', e.message));
@@ -2043,8 +2048,11 @@ if (!creds.app_id || !creds.app_secret) {
       console[level](`[feishu] Scope ${check.scope} ${check.status} (${check.why}): ${check.reason}`);
     }
   }
-  if (ARCH2 && botTenantKey && config.bot?.tenant_key !== botTenantKey) {
-    config.bot = { ...config.bot, tenant_key: botTenantKey };
+  if (ARCH2 && ((botTenantKey && config.bot?.tenant_key !== botTenantKey)
+      || (botAppName && botAppName !== 'bot' && !config.bot?.name))) {
+    config.bot = { ...config.bot,
+      ...(botTenantKey ? { tenant_key: botTenantKey } : {}),
+      ...(!config.bot?.name && botAppName && botAppName !== 'bot' ? { name: botAppName } : {}) };
     saveConfig(config);
   }
 

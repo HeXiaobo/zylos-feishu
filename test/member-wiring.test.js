@@ -120,7 +120,7 @@ function groupGatePolicy(config, chatId) {
   return c4.groupGatePolicy(config, chatId);
 }
 
-test('after an outside member joins, the next unmentioned message is context only and an @mention still works', async () => {
+test('after an outside member joins, contextual delivery and @mentions still work', async () => {
   const h = harness({ external: false });
   await h.run(false);
   assert.equal(h.lastActionable(), true, 'an internal group delivers unmentioned work');
@@ -129,18 +129,18 @@ test('after an outside member joins, the next unmentioned message is context onl
   h.setChatInfo({ success: true, chat: { external: false } });  // Feishu still says not external
 
   await h.run(false);
-  assert.equal(h.lastActionable(), false, 'unmentioned work must not be delivered after an outside member joined');
+  assert.equal(h.lastActionable(), true, 'outside membership does not suppress relevance judgement');
 
   await h.run(true);
   assert.equal(h.lastActionable(), true, '@mention is still answered in an external group');
   assert.ok(h.replies.includes('typing'), 'the @mention path still shows the typing indicator');
 });
 
-test('after the outside member leaves, unmentioned work is delivered again without a restart', async () => {
+test('contextual delivery continues across outside member joins and departures', async () => {
   const h = harness({ external: false });
   await h.member('added', [{ tenant_key: 'outside', user_id: { open_id: 'ou_outside' } }]);
   await h.run(false);
-  assert.equal(h.lastActionable(), false);
+  assert.equal(h.lastActionable(), true);
 
   h.setChatInfo({ success: true, chat: { external: false } });
   await h.member('deleted', [{ tenant_key: 'outside', user_id: { open_id: 'ou_outside' } }]);
@@ -158,7 +158,7 @@ test('a member event arriving mid-flight cannot be undone by the message in flig
   release({ success: true, chat: { external: false } });
   await Promise.all([inflight, event]);
   await h.run(false);
-  assert.equal(h.lastActionable(), false, 'the older in-flight verdict stays dead');
+  assert.equal(h.lastActionable(), true, 'membership races cannot suppress contextual message delivery');
 });
 
 test('both transports subscribe to the three member events and write status at startup', () => {
