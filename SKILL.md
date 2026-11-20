@@ -429,6 +429,29 @@ Groups are stored in a map keyed by `chat_id`:
 - `allowFrom`: Optional list of user_id/open_id. Empty = all group members allowed. `"*"` = wildcard.
 - `historyLimit`: Optional per-group context message limit (overrides `message.context_messages`)
 
+#### `defaultGroupMode` (this distribution only)
+
+Top-level key. `"smart"` makes **every group without its own mode** smart, so a
+new group receives all messages without being registered first. Absent — the
+official behaviour — a group is mention-only until someone runs
+`admin.js add-group <chat_id> <name> smart` (or adds it to `smart_groups`).
+
+```json
+{
+  "groupPolicy": "open",
+  "defaultGroupMode": "smart",
+  "groups": {}
+}
+```
+
+- Only the literal string `"smart"` has an effect. Anything else (`true`,
+  `"SMART"`, a trailing space) keeps the official behaviour.
+- An explicit `mode` or `requireMention` on a group always wins, so one group
+  can still be pinned back to mention-only.
+- `groupPolicy: "disabled"` still drops everything, and with
+  `groupPolicy: "allowlist"` an unlisted group is still not allowed at all —
+  registration is what gets it through, and then it is smart.
+
 ### Markdown Card
 
 Outgoing messages can be rendered as interactive cards with proper markdown formatting (code blocks, tables, headers, etc.):

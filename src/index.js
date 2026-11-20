@@ -23,6 +23,8 @@ import { getUserInfo } from './lib/contact.js';
 import { listChatMembers } from './lib/chat.js';
 import { sendThreadAware } from './lib/reply-send.js';
 import { extractInteractiveText } from './lib/card-text.js';
+// smart-default: one extra config key decides the mode of an unregistered group.
+import { isSmartGroup as isSmartGroupByMode } from './lib/group-mode.js';
 import { renderMergeForward, itemsFromResponse } from './lib/merge-forward.js';
 import { sendToC4 as sendToC4Core, createRejectReply } from './lib/c4.js';
 import { buildEndpoint } from './lib/endpoint.js';
@@ -687,14 +689,9 @@ function isGroupAllowed(chatId) {
  * Check if a group is in "smart" mode (receives all messages without @mention).
  */
 function isSmartGroup(chatId) {
-  const normalizedChatId = chatId === undefined || chatId === null ? '' : String(chatId);
-  if ((config.groupPolicy || 'allowlist') === 'disabled') return false;
-  const groupConfig = resolveGroupConfig(normalizedChatId);
-  if (groupConfig) {
-    return groupConfig.mode === 'smart' || groupConfig.requireMention === false;
-  }
-  // Legacy fallback
-  return (config.smart_groups || []).some(g => String(g.chat_id) === normalizedChatId);
+  // Rules live in lib/group-mode.js so both switch states are testable without
+  // starting the service (this file connects to Feishu on import).
+  return isSmartGroupByMode(config, chatId);
 }
 
 /**
