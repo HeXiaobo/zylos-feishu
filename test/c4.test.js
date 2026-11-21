@@ -479,7 +479,7 @@ describe('index.js wiring (source checks)', () => {
     assert.equal(callbacks.length, 2);
     for (const cb of callbacks) {
       assert.match(cb, /removeTyping: \(\) => removeTypingIndicator\(messageId\)/);
-      assert.match(cb, /deliver: \(errMsg\) => sendThreadAwareMessage\(chatId, errMsg, \{ chatType, rootId, parentId, messageId \}\)/);
+      assert.match(cb, /deliver: \(errMsg\) => sendThreadAwareMessage\(chatId, errMsg, \{ chatType, rootId, parentId, messageId, threadId \}\)/);
     }
     const [dm, group] = callbacks;
     assert.ok(!dm.includes('onStored'), 'DMs have no group cursor');
