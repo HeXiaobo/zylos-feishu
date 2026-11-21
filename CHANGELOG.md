@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Replies to a DM sent inside a topic thread now land in that thread.**
+  Previously every p2p reply was a base send, so when a user opened a topic
+  thread in the DM and asked there, the answer showed up in the main DM view
+  instead of the thread. When the endpoint carries `thread:`, text, card,
+  image and file replies now go to `parent || root` with
+  `reply_in_thread: true`. DMs without `thread:` are unchanged (base send).
+  Same fix as zylos-lark#118.
+
 ## [0.4.0] - 2026-11-16
 
 ### Added
