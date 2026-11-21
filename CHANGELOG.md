@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reply_in_thread: true`. DMs without `thread:` are unchanged (base send).
   Group replies whose endpoint carries `thread:` now also send
   `reply_in_thread: true` (they already target a message in that thread).
+  Reject and media-download error notices for a message sent inside a DM
+  topic also go into that topic (DMs without a topic still base-send).
   Same fix as zylos-lark#118.
 
 ## [0.4.0] - 2026-11-16
