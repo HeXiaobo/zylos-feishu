@@ -83,7 +83,7 @@ export async function sendMessage(receiveId, content, receiveIdType = 'chat_id',
  * Reply to a specific message (used for thread/topic routing and reply threading).
  * Uses the im.message.reply API to create a reply in the same thread.
  */
-export async function replyToMessage(messageId, content, msgType = 'text') {
+export async function replyToMessage(messageId, content, msgType = 'text', { replyInThread = false } = {}) {
   const client = getClient();
 
   let messageContent;
@@ -99,6 +99,7 @@ export async function replyToMessage(messageId, content, msgType = 'text') {
       data: {
         msg_type: msgType,
         content: messageContent,
+        ...(replyInThread ? { reply_in_thread: true } : {}),
       },
     });
 
@@ -401,7 +402,7 @@ export async function sendMarkdownCard(receiveId, text, receiveIdType = 'chat_id
 /**
  * Reply to a message with a markdown card.
  */
-export async function replyMarkdownCard(messageId, text) {
+export async function replyMarkdownCard(messageId, text, { replyInThread = false } = {}) {
   const client = getClient();
   const card = buildMarkdownCard(text);
 
@@ -411,6 +412,7 @@ export async function replyMarkdownCard(messageId, text) {
       data: {
         msg_type: 'interactive',
         content: JSON.stringify(card),
+        ...(replyInThread ? { reply_in_thread: true } : {}),
       },
     });
 

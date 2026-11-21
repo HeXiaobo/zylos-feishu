@@ -97,3 +97,28 @@ test('unknown/undefined chat type base-sends (safe default)', async () => {
   assert.equal(calls.reply.length, 0);
   assert.equal(calls.send.length, 1);
 });
+
+test('p2p topic thread reject reply goes to parent||root with replyInThread', async () => {
+  const calls = [];
+  const replyToMessage = async (target, text, msgType, opts) => {
+    calls.push({ target, text, msgType, opts });
+    return { success: true };
+  };
+  const sendMessage = async () => { throw new Error('base send must not run'); };
+  const ok = await sendThreadAware(
+    { chatId: 'oc_p2p', text: 'error', chatType: 'p2p', rootId: 'om_root', parentId: 'om_parent', messageId: 'om_msg', threadId: 'omt_1' },
+    { replyToMessage, sendMessage },
+  );
+  assert.equal(ok, true);
+  assert.deepEqual(calls, [{ target: 'om_parent', text: 'error', msgType: 'text', opts: { replyInThread: true } }]);
+});
+
+test('p2p quote reply without a topic thread still base-sends', async () => {
+  const { calls, deps } = spies();
+  await sendThreadAware(
+    { chatId: 'oc_p2p', text: 'x', chatType: 'p2p', rootId: 'om_root', parentId: 'om_parent', messageId: 'om_msg', threadId: null },
+    deps,
+  );
+  assert.equal(calls.reply.length, 0);
+  assert.deepEqual(calls.send, [{ chatId: 'oc_p2p', text: 'x' }]);
+});

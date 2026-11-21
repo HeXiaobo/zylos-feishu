@@ -1135,14 +1135,15 @@ function isDmAllowed(userId, openId) {
     (normalizedOpenId && allowFrom.includes(normalizedOpenId));
 }
 
-// Reply-to (threaded/quoted) sends only make sense in group chats. In a p2p DM
-// they silently drop (Feishu returns code:0 but the reply is not surfaced in the
-// main view), so this must be chat-type-aware — hence chatType is required.
+// Reply-to (threaded/quoted) sends only make sense in group chats and p2p topic
+// threads. In a p2p DM outside a thread they silently drop (Feishu returns code:0
+// but the reply is not surfaced in the main view), so this must be chat-type- and
+// thread-aware — hence chatType (and threadId when present) are passed.
 // Delegates the target decision to chooseReplyTarget (via sendThreadAware) so it
 // stays consistent with the outbound send routing.
-async function sendThreadAwareMessage(chatId, text, { chatType, rootId, parentId, messageId } = {}) {
+async function sendThreadAwareMessage(chatId, text, { chatType, rootId, parentId, messageId, threadId } = {}) {
   return sendThreadAware(
-    { chatId, text, chatType, rootId, parentId, messageId },
+    { chatId, text, chatType, rootId, parentId, messageId, threadId },
     { replyToMessage, sendMessage },
   );
 }
@@ -1258,7 +1259,7 @@ async function handleMessage(data) {
     const threadRootId = threadId ? rootId : null;
     const rejectReply = createRejectReply({
       removeTyping: () => removeTypingIndicator(messageId),
-      deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
+      deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId, threadId })
         .catch(e => console.error('[feishu] reject reply failed:', e.message))
     });
 
@@ -1396,7 +1397,7 @@ async function handleMessage(data) {
     const groupRejectReply = createRejectReply({
       removeTyping: () => removeTypingIndicator(messageId),
       onStored: markCursorDelivered,
-      deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId })
+      deliver: (errMsg) => sendThreadAwareMessage(chatId, errMsg, { chatType, rootId, parentId, messageId, threadId })
         .catch(e => console.error('[feishu] reject reply failed:', e.message))
     });
 
@@ -1423,7 +1424,7 @@ async function handleMessage(data) {
         sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
       } else {
         removeTypingIndicator(messageId);
-        sendThreadAwareMessage(chatId, 'Image download failed. Please resend the image.', { chatType, rootId, parentId, messageId })
+        sendThreadAwareMessage(chatId, 'Image download failed. Please resend the image.', { chatType, rootId, parentId, messageId, threadId })
           .catch(e => console.error('[feishu] image error reply failed:', e.message));
       }
       return;
@@ -1449,7 +1450,7 @@ async function handleMessage(data) {
         sendToC4('feishu', endpoint, msg, groupRejectReply, markCursorDelivered);
       } else {
         removeTypingIndicator(messageId);
-        sendThreadAwareMessage(chatId, 'File download failed. Please resend the file.', { chatType, rootId, parentId, messageId })
+        sendThreadAwareMessage(chatId, 'File download failed. Please resend the file.', { chatType, rootId, parentId, messageId, threadId })
           .catch(e => console.error('[feishu] file error reply failed:', e.message));
       }
       return;
