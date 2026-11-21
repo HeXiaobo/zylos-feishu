@@ -6,11 +6,13 @@
  * line that Feishu does NOT surface in the main DM view — the API still returns
  * `code:0` (success), so the recipient silently never sees the message.
  *
- * Therefore: for p2p DMs (and any non-group chat) the reply target is null, forcing callers down the base send path (sendMessage/sendImage/sendFile
+ * Therefore: for p2p DMs (and any non-group chat) the reply target is null,
+ * forcing callers down the base send path (sendMessage/sendImage/sendFile
  * to the chatId), which is delivered normally. Groups keep their reply-to
  * behavior for @mention/thread continuation.
  *
- * Exception: a p2p message that arrived inside a Feishu topic thread (the
+ * Exception: a non-group message (in practice p2p) that arrived inside a
+ * Feishu topic thread (the
  * endpoint carries `thread:`). The user is reading that thread, so the reply
  * goes to parent||root with `reply_in_thread: true` and lands in the thread;
  * a base send would land in the main DM view, outside the thread.
