@@ -13,9 +13,9 @@
  *
  * Exception: a non-group message (in practice p2p) that arrived inside a
  * Feishu topic thread (the endpoint carries `thread:`). The user is reading
- * that thread, so the reply
- * goes to parent||root with `reply_in_thread: true` and lands in the thread;
- * a base send would land in the main DM view, outside the thread.
+ * that thread, so the reply goes to parent||root with `reply_in_thread: true`
+ * and lands in the thread; a base send would land in the main DM view,
+ * outside the thread.
  *
  * @param {object} endpoint - Parsed endpoint fields.
  * @param {string} [endpoint.type] - Chat type ('p2p' | 'group').
