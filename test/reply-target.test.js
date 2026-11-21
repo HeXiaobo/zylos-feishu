@@ -74,3 +74,11 @@ test('unknown/undefined chat type never replies (safe default = base send)', () 
   assert.equal(chooseReplyTarget({}), null);
   assert.equal(chooseReplyTarget(), null);
 });
+
+test('p2p inside a topic thread replies into the thread; p2p without thread still base-sends', () => {
+  assert.equal(chooseReplyTarget({ type: 'p2p', root: 'om_r', parent: 'om_p', msg: 'om_m', thread: 'omt_1' }), 'om_p');
+  assert.equal(chooseReplyTarget({ type: 'p2p', root: 'om_r', msg: 'om_m', thread: 'omt_1' }), 'om_r');
+  assert.equal(chooseReplyTarget({ type: 'p2p', thread: 'omt_1' }), null);
+  assert.equal(chooseReplyTarget({ type: 'p2p', root: 'om_r', parent: 'om_p', msg: 'om_m' }), null);
+  assert.equal(chooseReplyTarget({ type: 'p2p', msg: 'om_m' }), null);
+});
