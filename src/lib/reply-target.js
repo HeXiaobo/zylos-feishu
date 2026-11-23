@@ -6,11 +6,10 @@
  * line that Feishu does NOT surface in the main DM view — the API still returns
  * `code:0` (success), so the recipient silently never sees the message.
  *
- * Therefore: for p2p DMs (and any non-group chat) the reply target is null
- * unless the message arrived inside a topic thread, forcing callers down the
- * base send path (sendMessage/sendImage/sendFile to the chatId), which is
- * delivered normally. Groups keep their reply-to behavior for @mention/thread
- * continuation.
+ * Therefore: for p2p DMs (and any non-group chat) the reply target is null,
+ * forcing callers down the base send path (sendMessage/sendImage/sendFile
+ * to the chatId), which is delivered normally. Groups keep their reply-to
+ * behavior for @mention/thread continuation.
  *
  * Exception: a non-group message (in practice p2p) that arrived inside a
  * Feishu topic thread (the endpoint carries `thread:`). The user is reading
@@ -20,11 +19,10 @@
  *
  * @param {object} endpoint - Parsed endpoint fields.
  * @param {string} [endpoint.type] - Chat type ('p2p' | 'group').
- * @param {string} [endpoint.thread] - Feishu thread id when the message came
- *   from a topic thread.
  * @param {string} [endpoint.root] - Root message id of a topic/thread.
  * @param {string} [endpoint.parent] - Parent message id within a thread.
  * @param {string} [endpoint.msg] - Triggering message id (@mention reply).
+ * @param {string} [endpoint.thread] - Feishu thread id when the message came from a topic thread.
  * @param {object} [opts]
  * @param {boolean} [opts.isFirstChunk=true] - Whether this is the first chunk;
  *   @mention replies (msg without root) only apply to the first chunk.
