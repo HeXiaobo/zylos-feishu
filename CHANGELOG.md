@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **C4 回执（#117）**: 发送成功后打印 `C4_RECEIPT`，`platformMessageId` 取第一条分片的 `message_id`；多段回复只记一次回执。
+
 ### Added
 - **`[MEDIA:card]` sends a prepared Feishu card 2.0 file through C4.**
   `scripts/send.js` now accepts `[MEDIA:card]<absolute path>`, the third media

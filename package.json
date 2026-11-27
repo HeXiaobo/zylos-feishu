@@ -1,6 +1,6 @@
 {
   "name": "zylos-feishu",
-  "version": "0.3.6",
+  "version": "0.3.6-3ai.1",
   "description": "Feishu communication channel",
   "type": "module",
   "main": "src/index.js",
