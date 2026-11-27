@@ -22,7 +22,30 @@ import { getConfig, DATA_DIR } from '../src/lib/config.js';
 import { chooseReplyTarget } from '../src/lib/reply-target.js';
 import { sendCard } from '../src/lib/card-send.js';
 import { convertAtMentionsForCard } from '../src/lib/at-mention.js';
-import { sendToGroup, sendMessage, uploadImage, sendImage, uploadFile, sendFile, replyToMessage, sendMarkdownCard, replyMarkdownCard } from '../src/lib/message.js';
+import {
+  sendToGroup as baseSendToGroup,
+  sendMessage as baseSendMessage,
+  uploadImage,
+  sendImage as baseSendImage,
+  uploadFile,
+  sendFile as baseSendFile,
+  replyToMessage as baseReplyToMessage,
+  sendMarkdownCard as baseSendMarkdownCard,
+  replyMarkdownCard as baseReplyMarkdownCard,
+} from '../src/lib/message.js';
+import { createReplyReceipt } from '../src/lib/c4-receipt.js';
+
+// c4-send mints this token for every reply. Printing C4_RECEIPT is the proof
+// the bridge needs; without it a delivered Feishu reply is recorded as
+// `delivery_unconfirmed` and the reply guard reports a missing answer.
+const receipts = createReplyReceipt({ token: process.env.ZYLOS_REPLY_RECEIPT_TOKEN || '' });
+const sendToGroup = receipts.wrap(baseSendToGroup);
+const sendMessage = receipts.wrap(baseSendMessage);
+const sendImage = receipts.wrap(baseSendImage);
+const sendFile = receipts.wrap(baseSendFile);
+const replyToMessage = receipts.wrap(baseReplyToMessage);
+const sendMarkdownCard = receipts.wrap(baseSendMarkdownCard);
+const replyMarkdownCard = receipts.wrap(baseReplyMarkdownCard);
 
 const TYPING_DIR = path.join(DATA_DIR, 'typing');
 
@@ -456,6 +479,7 @@ async function send() {
     }
     // Mark the trigger message as replied (for typing indicator removal)
     markTypingDone(parsedEndpoint.msg);
+    receipts.emit();
     console.log('Message sent successfully');
     process.exit(0);
   } catch (err) {
